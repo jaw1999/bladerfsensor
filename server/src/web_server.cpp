@@ -1,0 +1,10253 @@
+// Lightweight HTTP web server for waterfall spectrum visualization
+// Implements a real-time waterfall display using the Mongoose embedded web server
+// Provides interactive controls for frequency gain and display parameters
+
+#include "web_server.h"
+#include "bladerf_sensor.h"
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+#include <cstring>
+#include <string>
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <fstream>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+// PNG image writer (single-header library)
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+// Mongoose embedded web server library
+// Download from https://github.com/cesanta/mongoose
+// Place mongoose.h and mongoose.c in server/src/
+#ifdef USE_MONGOOSE
+extern "C" {
+#include "mongoose.h"
+}
+#else
+// Stubs when mongoose is not available
+struct mg_mgr { int dummy; };
+struct mg_connection { int dummy; };
+struct mg_http_message {
+    struct mg_str { const char* ptr; size_t len; } uri, query, body;
+};
+void mg_mgr_init(struct mg_mgr *mgr) { (void)mgr; }
+void mg_mgr_free(struct mg_mgr *mgr) { (void)mgr; }
+struct mg_connection *mg_http_listen(struct mg_mgr *mgr, const char *url,
+                                     void (*fn)(struct mg_connection *, int, void *), void *fn_data) {
+    (void)mgr; (void)url; (void)fn; (void)fn_data; return nullptr;
+}
+void mg_mgr_poll(struct mg_mgr *mgr, int ms) { (void)mgr; (void)ms; }
+void mg_http_reply(struct mg_connection *c, int code, const char *headers, const char *fmt, ...) {
+    (void)c; (void)code; (void)headers; (void)fmt;
+}
+#define MG_EV_HTTP_MSG 6
+#endif
+
+// Global state for web server operation
+WaterfallBuffer g_waterfall;                         // Waterfall spectrum history buffer
+IQBuffer g_iq_data;                                  // IQ constellation data buffer
+XCorrBuffer g_xcorr_data;                            // Cross-correlation data buffer
+LinkQuality g_link_quality;                          // Link quality metrics buffer
+DoAResult g_doa_result;                              // Direction of Arrival result buffer
+ScannerState g_scanner;                              // Frequency scanner state
+static std::atomic<bool> g_web_running{false};       // Web server thread running flag
+static std::thread g_web_thread;                     // Web server worker thread
+static std::atomic<uint64_t> g_http_bytes_sent{0};   // Actual HTTP bytes sent counter
+
+#ifdef USE_MONGOOSE
+static struct mg_mgr g_mgr;                          // Mongoose event manager
+#endif
+
+// External globals from main.cpp (shared state with RF processing)
+extern std::atomic<uint64_t> g_center_freq;
+extern std::atomic<uint32_t> g_sample_rate;
+extern std::atomic<uint32_t> g_bandwidth;
+extern std::atomic<uint32_t> g_gain_rx1;
+extern std::atomic<uint32_t> g_gain_rx2;
+extern std::atomic<bool> g_params_changed;
+extern std::mutex g_config_mutex;
+
+// Recording functions from main.cpp
+extern bool start_recording(const std::string& filename);
+extern void stop_recording();
+extern RecordingState g_recording;
+extern std::mutex g_recording_mutex;
+
+// Perceptually uniform color mapping for waterfall display
+struct RGB {
+    uint8_t r, g, b;
+};
+
+// Convert a normalized magnitude value to RGB color using Viridis colormap
+// This is a perceptually uniform colormap that maps signal strength to color
+// dark purple (low) to blue to cyan to green to yellow (high)
+// Args
+//   value Normalized magnitude (0.0 to 1.0)
+// Returns
+//   RGB color structure with 8-bit components
+RGB viridis_colormap(float value) {
+    // Clamp input to valid range
+    value = std::max(0.0f, std::min(1.0f, value));
+
+    RGB color;
+    if (value < 0.25f) {
+        // Dark purple to blue
+        float t = value / 0.25f;
+        color.r = static_cast<uint8_t>(68 + t * (59 - 68));
+        color.g = static_cast<uint8_t>(1 + t * (82 - 1));
+        color.b = static_cast<uint8_t>(84 + t * (139 - 84));
+    } else if (value < 0.5f) {
+        // Blue to teal/cyan
+        float t = (value - 0.25f) / 0.25f;
+        color.r = static_cast<uint8_t>(59 + t * (33 - 59));
+        color.g = static_cast<uint8_t>(82 + t * (145 - 82));
+        color.b = static_cast<uint8_t>(139 + t * (140 - 139));
+    } else if (value < 0.75f) {
+        // Cyan to green
+        float t = (value - 0.5f) / 0.25f;
+        color.r = static_cast<uint8_t>(33 + t * (94 - 33));
+        color.g = static_cast<uint8_t>(145 + t * (201 - 145));
+        color.b = static_cast<uint8_t>(140 + t * (98 - 140));
+    } else {
+        // Green to bright yellow
+        float t = (value - 0.75f) / 0.25f;
+        color.r = static_cast<uint8_t>(94 + t * (253 - 94));
+        color.g = static_cast<uint8_t>(201 + t * (231 - 201));
+        color.b = static_cast<uint8_t>(98 + t * (37 - 98));
+    }
+
+    return color;
+}
+
+// Update waterfall buffer with new FFT magnitude data
+// Thread-safe function that adds new spectrum data to the circular buffer
+// Args
+//   ch1_mag Channel 1 FFT magnitude data (8-bit quantized)
+//   ch2_mag Channel 2 FFT magnitude data (8-bit quantized)
+//   fft_size Number of FFT bins in input arrays
+void update_waterfall(const uint8_t* ch1_mag, const uint8_t* ch2_mag, size_t fft_size) {
+    std::lock_guard<std::mutex> lock(g_waterfall.mutex);
+
+    // Copy FFT magnitude to waterfall buffer (up to maximum width)
+    size_t copy_size = std::min(fft_size, static_cast<size_t>(WATERFALL_WIDTH));
+    std::copy(ch1_mag, ch1_mag + copy_size, g_waterfall.ch1_history[g_waterfall.write_index].begin());
+    std::copy(ch2_mag, ch2_mag + copy_size, g_waterfall.ch2_history[g_waterfall.write_index].begin());
+
+    // Advance write index in circular buffer
+    g_waterfall.write_index = (g_waterfall.write_index + 1) % WATERFALL_HEIGHT;
+}
+
+// Update IQ constellation data for both channels
+// Thread-safe function that stores decimated IQ samples for scatter plot display
+// Args
+//   ch1_iq Channel 1 IQ samples as interleaved I Q pairs
+//   ch2_iq Channel 2 IQ samples as interleaved I Q pairs
+//   count Number of IQ pairs to copy (should be IQ_SAMPLES)
+void update_iq_data(const int16_t* ch1_iq, const int16_t* ch2_iq, size_t count) {
+    std::lock_guard<std::mutex> lock(g_iq_data.mutex);
+
+    // Copy IQ samples up to buffer size
+    size_t copy_count = std::min(count, static_cast<size_t>(IQ_SAMPLES));
+
+    for (size_t i = 0; i < copy_count; i++) {
+        g_iq_data.ch1_i[i] = ch1_iq[i * 2];      // Extract I samples
+        g_iq_data.ch1_q[i] = ch1_iq[i * 2 + 1];  // Extract Q samples
+        g_iq_data.ch2_i[i] = ch2_iq[i * 2];
+        g_iq_data.ch2_q[i] = ch2_iq[i * 2 + 1];
+    }
+}
+
+// Update cross-correlation data with rate limiting
+// Thread-safe function that stores magnitude and phase arrays for direction finding
+// Args
+//   magnitude Cross-correlation magnitude array
+//   phase Cross-correlation phase array in radians
+//   size Array size (should match FFT size)
+void update_xcorr_data(const float* magnitude, const float* phase, size_t size) {
+    // Rate limit to 2 Hz using atomic counter
+    // This prevents excessive bandwidth usage on tactical links
+    uint32_t counter = g_xcorr_data.update_counter.fetch_add(1);
+    if (counter % 5 != 0) {  // Only update every 5th call (10 Hz / 5 = 2 Hz)
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_xcorr_data.mutex);
+
+    // Resize vectors if needed and copy data
+    size_t copy_size = std::min(size, static_cast<size_t>(WATERFALL_WIDTH));
+    if (g_xcorr_data.magnitude.size() < copy_size) {
+        g_xcorr_data.magnitude.resize(copy_size);
+        g_xcorr_data.phase.resize(copy_size);
+    }
+
+    std::copy(magnitude, magnitude + copy_size, g_xcorr_data.magnitude.begin());
+    std::copy(phase, phase + copy_size, g_xcorr_data.phase.begin());
+}
+
+// Update link quality metrics with current performance data
+// Thread-safe function that tracks FPS and bandwidth for adaptive streaming
+// Args
+//   fps Current frames per second achieved
+//   bytes Bytes sent in last measurement period
+void update_link_quality(float fps, uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(g_link_quality.mutex);
+
+    auto now = std::chrono::steady_clock::now();
+
+    // Update FPS
+    g_link_quality.fps.store(fps);
+
+    // Store bytes for this period (not cumulative)
+    g_link_quality.bytes_sent.store(bytes);
+
+    // Update timestamp
+    g_link_quality.last_update = now;
+}
+
+// Update Direction of Arrival result from phase-based interferometry
+void update_doa_result(float azimuth, float back_azimuth, float phase_diff,
+                       float phase_std, float confidence, float snr, float coherence) {
+    std::lock_guard<std::mutex> lock(g_doa_result.mutex);
+
+    g_doa_result.azimuth = azimuth;
+    g_doa_result.back_azimuth = back_azimuth;
+    g_doa_result.phase_diff_deg = phase_diff;
+    g_doa_result.phase_std_deg = phase_std;
+    g_doa_result.confidence = confidence;
+    g_doa_result.snr_db = snr;
+    g_doa_result.coherence = coherence;
+    g_doa_result.has_ambiguity = true;  // Always true for 2-channel systems
+}
+
+// Get and reset HTTP bytes sent counter
+// Returns the number of bytes sent since last call and resets counter to zero
+uint64_t get_and_reset_http_bytes() {
+    return g_http_bytes_sent.exchange(0);
+}
+
+// Generate PNG image from waterfall buffer history
+// Converts the circular buffer of FFT magnitudes into a color-mapped PNG image
+// Args
+//   channel Channel to render (1 or 2)
+// Returns
+//   Vector containing PNG-encoded image data (empty on error)
+std::vector<uint8_t> generate_waterfall_png(int channel) {
+    std::lock_guard<std::mutex> lock(g_waterfall.mutex);
+
+    const auto& history = (channel == 1) ? g_waterfall.ch1_history : g_waterfall.ch2_history;
+
+    // Create RGB image data
+    std::vector<uint8_t> pixels(WATERFALL_WIDTH * WATERFALL_HEIGHT * 3);
+
+    // Fill pixels (top to bottom newest at bottom)
+    for (int y = 0; y < WATERFALL_HEIGHT; y++) {
+        // Calculate actual row index (accounting for circular buffer)
+        int row_idx = (g_waterfall.write_index + y) % WATERFALL_HEIGHT;
+
+        for (int x = 0; x < WATERFALL_WIDTH; x++) {
+            float value = history[row_idx][x] / 255.0f;
+            RGB color = viridis_colormap(value);
+
+            int idx = (y * WATERFALL_WIDTH + x) * 3;
+            pixels[idx + 0] = color.r;
+            pixels[idx + 1] = color.g;
+            pixels[idx + 2] = color.b;
+        }
+    }
+
+    // Write PNG to memory
+    int png_size = 0;
+    unsigned char* png_data = stbi_write_png_to_mem(
+        pixels.data(),
+        WATERFALL_WIDTH * 3,  // stride
+        WATERFALL_WIDTH,
+        WATERFALL_HEIGHT,
+        3,  // channels
+        &png_size
+    );
+
+    if (!png_data || png_size == 0) {
+        std::cerr << "PNG generation failed" << std::endl;
+        return std::vector<uint8_t>();  // Return empty vector on error
+    }
+
+    // Copy to vector and free stbi memory
+    std::vector<uint8_t> result(png_data, png_data + png_size);
+    STBIW_FREE(png_data);  // Use STBIW_FREE instead of free
+
+    return result;
+}
+
+// HTML page - Flowing waterfall display with Canvas
+const char* html_page = R"HTMLDELIM(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>bladeRF Waterfall</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: #000;
+            color: #fff;
+            overflow: hidden;
+        }
+        .header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(0, 0, 0, 0.9);
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 1002;
+            border-bottom: 1px solid #333;
+        }
+        .title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #0ff;
+            letter-spacing: 1px;
+        }
+        .status-info {
+            display: flex;
+            gap: 15px;
+            font-size: 12px;
+            color: #888;
+        }
+        .status-value {
+            color: #0ff;
+            font-weight: 500;
+        }
+        .controls {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            justify-content: space-between;
+            width: 100%;
+        }
+        .workspace-tabs {
+            display: flex;
+            gap: 0;
+        }
+        .workspace-tab {
+            padding: 8px 20px;
+            background: rgba(30, 30, 30, 0.5);
+            border: 1px solid #333;
+            border-bottom: none;
+            color: #888;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            user-select: none;
+            border-radius: 6px 6px 0 0;
+            margin-right: -1px;
+        }
+        .workspace-tab:hover {
+            background: rgba(40, 40, 40, 0.8);
+            color: #0ff;
+        }
+        .workspace-tab.active {
+            background: rgba(0, 255, 255, 0.15);
+            border-color: #0ff;
+            color: #0ff;
+            box-shadow: 0 -2px 0 #0ff inset;
+        }
+        .header-right-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .channel-switch, .spectrum-toggle {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 5px 10px;
+            color: #fff;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .channel-switch:hover, .spectrum-toggle:hover {
+            border-color: #0ff;
+        }
+        .spectrum-toggle.active {
+            background: rgba(0, 255, 255, 0.2);
+            border-color: #0ff;
+            color: #0ff;
+        }
+        #workspace-container {
+            position: absolute;
+            top: 50px;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            overflow: hidden;
+        }
+        .workspace-content {
+            display: none;
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+        }
+        .workspace-content.active {
+            display: block;
+        }
+        .workspace-panel-slot {
+            background: rgba(10, 10, 10, 0.5);
+            border: 1px solid #222;
+            border-radius: 5px;
+            overflow: hidden;
+            min-height: 0;
+        }
+        .workspace-panel-slot::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        .workspace-panel-slot::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .workspace-panel-slot::-webkit-scrollbar-thumb {
+            background: rgba(0, 255, 255, 0.3);
+            border-radius: 4px;
+        }
+        .workspace-panel-slot::-webkit-scrollbar-thumb:hover {
+            background: rgba(0, 255, 255, 0.5);
+        }
+        .draggable-panel {
+            position: fixed;
+            background: rgba(10, 10, 10, 0.95);
+            border: 1px solid #333;
+            border-radius: 4px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.5);
+            z-index: 100;
+            resize: both;
+            overflow: hidden;
+        }
+        .draggable-panel.active {
+            border-color: #0ff;
+            z-index: 200;
+        }
+        .meas-tab {
+            flex: 1;
+            padding: 8px 12px;
+            text-align: center;
+            cursor: pointer;
+            font-size: 11px;
+            color: #888;
+            border-right: 1px solid #222;
+            transition: all 0.2s;
+            user-select: none;
+        }
+        .meas-tab:last-child {
+            border-right: none;
+        }
+        .meas-tab:hover {
+            background: #1a1a1a;
+            color: #0ff;
+        }
+        .meas-tab.active {
+            background: #0a3a3a;
+            color: #0ff;
+            border-bottom: 2px solid #0ff;
+        }
+        .meas-content {
+            animation: fadeIn 0.2s;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .panel-header {
+            background: rgba(20, 20, 20, 0.9);
+            border-bottom: 1px solid #333;
+            padding: 6px 10px;
+            cursor: move;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        .workspace-panel-slot .panel-header {
+            cursor: default;
+        }
+        .workspace-panel-slot .draggable-panel {
+            position: relative !important;
+            width: 100% !important;
+            height: 100% !important;
+            top: auto !important;
+            left: auto !important;
+            right: auto !important;
+            bottom: auto !important;
+            border-radius: 0;
+            border: none;
+            box-shadow: none;
+            display: flex;
+            flex-direction: column;
+        }
+        .workspace-panel-slot .draggable-panel > div:not(.panel-header) {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            min-height: 0;
+        }
+        .draggable-panel > div:not(.panel-header) {
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        .draggable-panel {
+            overflow: hidden;
+        }
+        .draggable-panel:not(.workspace-panel-slot *) {
+            resize: both;
+        }
+        .panel-title {
+            color: #0ff;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .panel-close {
+            color: #888;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1;
+            padding: 0 4px;
+        }
+        .panel-close:hover {
+            color: #f00;
+        }
+        .panel-detach {
+            color: #888;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1;
+            padding: 0 6px;
+            margin-right: 5px;
+            display: none;
+        }
+        .panel-detach:hover {
+            color: #0ff;
+        }
+        .workspace-panel-slot .panel-detach {
+            display: inline-block;
+        }
+        #spectrum {
+            position: fixed;
+            top: 50px;
+            left: 50px;
+            width: calc(100% - 60px);
+            height: 200px;
+            display: none;
+            box-sizing: border-box;
+            border: none;
+            padding: 0;
+            margin: 0;
+        }
+        .display-label {
+            position: fixed;
+            background: rgba(0, 0, 0, 0.7);
+            color: #0ff;
+            font-size: 10px;
+            font-weight: bold;
+            padding: 2px 8px;
+            border-radius: 3px;
+            z-index: 1001;
+            border: 1px solid rgba(0, 255, 255, 0.3);
+        }
+        #spectrum-label {
+            top: 52px;
+            right: 12px;
+        }
+        #waterfall-label, #waterfall-label-ch1, #waterfall-label-ch2 {
+            display: none;
+        }
+        #waterfall-label {
+            top: 252px;
+            right: 12px;
+        }
+        #waterfall-label-ch1 {
+            top: 252px;
+            left: calc(50% - 100px);
+        }
+        #waterfall-label-ch2 {
+            top: 252px;
+            right: 12px;
+        }
+        #iq_constellation {
+            top: 60px;
+            right: 20px;
+            width: 320px;
+            height: 340px;
+            display: none;
+        }
+        #xcorr_display {
+            bottom: 40px;
+            left: 80px;
+            width: 600px;
+            height: 240px;
+            display: none;
+        }
+        #waterfall, #waterfall2 {
+            position: fixed;
+            top: 50px;
+            left: 50px;
+            width: calc(100% - 60px);
+            height: calc(100% - 80px);
+            image-rendering: pixelated;
+            box-sizing: border-box;
+            border: none;
+            padding: 0;
+            margin: 0;
+        }
+        #waterfall2 {
+            display: none;
+        }
+        /* Visual separator between dual channels */
+        #channel-divider {
+            position: fixed;
+            top: 50px;
+            width: 2px;
+            height: calc(100% - 80px);
+            background: linear-gradient(to bottom,
+                rgba(0, 255, 255, 0.6) 0%,
+                rgba(0, 255, 255, 0.8) 50%,
+                rgba(0, 255, 255, 0.6) 100%);
+            box-shadow: 0 0 10px rgba(0, 255, 255, 0.8);
+            z-index: 1002;
+            display: none;
+            pointer-events: none;
+        }
+        .fps {
+            position: fixed;
+            top: 55px;
+            left: 10px;
+            font-size: 11px;
+            color: #0ff;
+            opacity: 0.7;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 4px 8px;
+            border-radius: 3px;
+            z-index: 1001;
+        }
+        .resolution-info {
+            position: fixed;
+            top: 80px;
+            left: 10px;
+            font-size: 10px;
+            color: #888;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 3px 6px;
+            border-radius: 3px;
+            z-index: 1001;
+        }
+        .control-panel {
+            position: fixed;
+            top: 110px;
+            left: 10px;
+            bottom: 40px;
+            background: rgba(0, 0, 0, 0.85);
+            border: 1px solid #333;
+            border-radius: 5px;
+            padding: 10px;
+            padding-right: 5px;
+            z-index: 1001;
+            font-size: 12px;
+            max-width: 280px;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        .control-panel::-webkit-scrollbar {
+            width: 8px;
+        }
+        .control-panel::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 4px;
+        }
+        .control-panel::-webkit-scrollbar-thumb {
+            background: rgba(0, 255, 255, 0.3);
+            border-radius: 4px;
+        }
+        .control-panel::-webkit-scrollbar-thumb:hover {
+            background: rgba(0, 255, 255, 0.5);
+        }
+        .control-panel h3 {
+            margin: 0 0 10px 0;
+            font-size: 13px;
+            color: #0ff;
+            border-bottom: 1px solid #333;
+            padding-bottom: 5px;
+        }
+        .control-group {
+            margin-bottom: 8px;
+        }
+        .control-group label {
+            display: block;
+            color: #888;
+            font-size: 10px;
+            margin-bottom: 3px;
+        }
+        .control-group input {
+            width: calc(100% - 60px);
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid #444;
+            border-radius: 3px;
+            padding: 4px 6px;
+            color: #fff;
+            font-size: 11px;
+        }
+        .control-group input:focus {
+            outline: none;
+            border-color: #0ff;
+        }
+        .control-group button {
+            width: 50px;
+            margin-left: 5px;
+            background: rgba(0, 255, 255, 0.2);
+            border: 1px solid #0ff;
+            border-radius: 3px;
+            padding: 4px;
+            color: #0ff;
+            font-size: 10px;
+            cursor: pointer;
+        }
+        .control-group button:hover {
+            background: rgba(0, 255, 255, 0.3);
+        }
+        .toggle-controls {
+            position: fixed;
+            top: 110px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            border: 1px solid #333;
+            border-radius: 3px;
+            padding: 4px 8px;
+            color: #0ff;
+            font-size: 11px;
+            cursor: pointer;
+            z-index: 1000;
+        }
+        .toggle-controls:hover {
+            background: rgba(0, 0, 0, 0.8);
+        }
+        .axis-label {
+            position: fixed;
+            font-size: 10px;
+            color: #888;
+            font-family: monospace;
+        }
+        .freq-axis {
+            bottom: 5px;
+            left: 60px;
+            right: 10px;
+            height: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .time-axis {
+            top: 50px;
+            left: 0;
+            width: 55px;
+            bottom: 30px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            align-items: flex-end;
+            padding-right: 5px;
+            transition: top 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">bladeRF SPECTRUM WATERFALL</div>
+        <div class="status-info">
+            <span>FREQ: <span class="status-value" id="freq">---</span></span>
+            <span>SR: <span class="status-value" id="sr">---</span></span>
+            <span>RES: <span class="status-value" id="resolution">---</span></span>
+            <span id="zoom_indicator" style="display: none;">ZOOM: <span class="status-value" id="zoom_level">1x</span></span>
+            <span>GAIN: <span class="status-value" id="gain">---</span></span>
+            <span style="color: #888; margin-left: 10px;">|</span>
+            <span>LINK: <span class="status-value" id="link_quality_bar">●●●●●</span></span>
+            <span>RTT: <span class="status-value" id="rtt">--</span></span>
+            <span>BW: <span class="status-value" id="bandwidth">--</span></span>
+        </div>
+        <div class="controls">
+            <div class="workspace-tabs">
+                <div class="workspace-tab active" data-tab="live">LIVE</div>
+                <div class="workspace-tab" data-tab="measurements">MEASUREMENTS</div>
+                <div class="workspace-tab" data-tab="demod">DEMOD</div>
+                <div class="workspace-tab" data-tab="direction">DIRECTION</div>
+                <div class="workspace-tab" data-tab="scanner">SCANNER</div>
+            </div>
+            <div class="header-right-controls">
+                <button id="spectrum_toggle" class="spectrum-toggle active">Spectrum</button>
+                <button id="cursor_toggle" class="spectrum-toggle">Cursor</button>
+                <button id="recorder_toggle" class="spectrum-toggle" onclick="toggleRecorder()">Record</button>
+                <select id="channel_select" class="channel-switch">
+                    <option value="1">RX1</option>
+                    <option value="2">RX2</option>
+                    <option value="both">Both</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- Workspace Content Areas -->
+    <div id="workspace-container">
+
+        <!-- TAB 1: LIVE ANALYSIS -->
+        <div class="workspace-content active" id="workspace-live">
+            <!-- Main Waterfall Display -->
+            <canvas id="spectrum"></canvas>
+            <canvas id="waterfall"></canvas>
+            <canvas id="waterfall2"></canvas>
+
+            <!-- Display labels -->
+            <div id="spectrum-label" class="display-label" style="display: none;">SPECTRUM</div>
+            <div id="waterfall-label" class="display-label">WATERFALL</div>
+            <div id="waterfall-label-ch1" class="display-label">RX1 WATERFALL</div>
+            <div id="waterfall-label-ch2" class="display-label">RX2 WATERFALL</div>
+
+            <!-- Channel divider for dual-channel mode -->
+            <div id="channel-divider"></div>
+
+            <!-- Live Stats Overlay -->
+            <div style="position: fixed; bottom: 20px; right: 20px; background: rgba(0,0,0,0.85); padding: 12px; border: 1px solid #0ff; border-radius: 4px; font-size: 11px; z-index: 50; min-width: 200px;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 8px; border-bottom: 1px solid #333; padding-bottom: 5px;">LIVE STATS</div>
+                <div style="color: #888; font-family: monospace;">
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                        <span>Peak:</span>
+                        <span style="color: #0f0;" id="live_peak_power">-- dBm</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                        <span>Avg:</span>
+                        <span style="color: #ff0;" id="live_avg_power">-- dBm</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                        <span>Floor:</span>
+                        <span style="color: #888;" id="live_noise_floor">-- dBm</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0; padding-top: 3px; border-top: 1px solid #222;">
+                        <span>FPS:</span>
+                        <span style="color: #0ff;" id="live_fps_display">--</span>
+                    </div>
+                </div>
+            </div>
+
+        </div> <!-- End workspace-live -->
+
+        <!-- TAB 2: MEASUREMENTS -->
+        <div class="workspace-content" id="workspace-measurements">
+            <!-- Two-section layout: Live view on top, panels below -->
+            <div style="display: flex; flex-direction: column; height: 100%; overflow: hidden;">
+                <!-- Top: Live Spectrum Display with Overlays -->
+                <div style="flex: 0 0 60%; position: relative; background: #000; border-bottom: 2px solid #0ff;">
+                    <canvas id="measurements_spectrum" style="width: 100%; height: 100%; display: block;"></canvas>
+                    <div style="position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.8); padding: 10px; border: 1px solid #0ff; border-radius: 4px; font-size: 11px;">
+                        <div style="color: #0ff; font-weight: bold; margin-bottom: 5px;">LIVE SPECTRUM VIEW</div>
+                        <div style="color: #888; font-family: monospace;">
+                            <div>Peak: <span style="color: #0f0;" id="meas_peak_display">-- MHz @ -- dBm</span></div>
+                            <div>Avg: <span style="color: #ff0;" id="meas_avg_display">-- dBm</span></div>
+                            <div>Markers: <span style="color: #0ff;" id="meas_marker_count">0</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bottom: Measurement Panels in Grid -->
+                <div style="flex: 1; display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; padding: 10px; overflow: auto; min-height: 0;">
+                    <div id="measurements-slot-1" class="workspace-panel-slot"></div>
+                    <div id="measurements-slot-2" class="workspace-panel-slot"></div>
+                    <div id="measurements-slot-3" class="workspace-panel-slot"></div>
+                    <div id="measurements-slot-4" class="workspace-panel-slot"></div>
+                </div>
+            </div>
+        </div> <!-- End workspace-measurements -->
+
+        <!-- TAB 3: DEMOD -->
+        <div class="workspace-content" id="workspace-demod">
+            <div style="display: flex; flex-direction: column; height: 100%; overflow: hidden;">
+
+                <!-- Top Control Bar: Demodulation Mode Selection -->
+                <div style="flex: 0 0 auto; background: #111; padding: 12px; border-bottom: 2px solid #0ff; display: flex; flex-direction: column; gap: 8px;">
+                    <!-- Row 1: Mode Selection + Presets -->
+                    <div style="display: flex; gap: 15px; align-items: center; justify-content: space-between;">
+                        <!-- Left: Mode Selection -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <div style="color: #0ff; font-weight: bold; font-size: 11px;">MODE:</div>
+                            <button id="mode_am" onclick="quickSelectMode('am')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">AM</button>
+                            <button id="mode_fm" onclick="quickSelectMode('fm')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">NFM</button>
+                            <button id="mode_wfm" onclick="quickSelectMode('wfm')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">WFM</button>
+                            <button id="mode_usb" onclick="quickSelectMode('usb')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">USB</button>
+                            <button id="mode_lsb" onclick="quickSelectMode('lsb')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">LSB</button>
+                            <button id="mode_fsk" onclick="quickSelectMode('fsk')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">FSK</button>
+                            <button id="mode_psk" onclick="quickSelectMode('psk')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">PSK</button>
+                        </div>
+
+                        <!-- Center: Presets -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <div style="color: #888; font-size: 10px; font-weight: bold;">PRESETS:</div>
+                            <button onclick="loadPreset('broadcast_fm')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">FM Broadcast</button>
+                            <button onclick="loadPreset('aircraft')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">Aircraft</button>
+                            <button onclick="loadPreset('marine')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">Marine VHF</button>
+                            <button onclick="loadPreset('weather')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">Weather</button>
+                        </div>
+
+                        <!-- Right: Start/Stop Control -->
+                        <div style="display: flex; gap: 10px; align-items: center;">
+                            <div id="demod_status_indicator" style="width: 12px; height: 12px; border-radius: 50%; background: #666; border: 1px solid #888;"></div>
+                            <button id="demod_start_stop" onclick="toggleDemodulation()" style="padding: 8px 20px; background: #0a5; border: 2px solid #0f0; color: #fff; cursor: pointer; border-radius: 5px; font-size: 11px; font-weight: bold;">START</button>
+                        </div>
+                    </div>
+
+                    <!-- Row 2: Volume, AFC, Record -->
+                    <div style="display: flex; gap: 20px; align-items: center;">
+                        <!-- Volume Control -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <div style="color: #888; font-size: 10px;">VOL:</div>
+                            <input type="range" id="demod_volume_slider" min="0" max="100" value="50" style="width: 100px;">
+                            <span id="demod_volume_value" style="color: #0f0; font-family: monospace; font-size: 10px; min-width: 30px;">50%</span>
+                        </div>
+
+                        <!-- AFC Toggle -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;">
+                                <input type="checkbox" id="afc_enable" onchange="toggleAFC()" style="cursor: pointer;">
+                                <span style="color: #888; font-size: 10px;">AFC (Auto Frequency Control)</span>
+                            </label>
+                        </div>
+
+                        <!-- Audio Recording -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <button id="audio_record_btn" onclick="toggleAudioRecording()" style="padding: 5px 12px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">⏺ Record Audio</button>
+                            <span id="audio_record_time" style="color: #f00; font-family: monospace; font-size: 10px; display: none;">00:00</span>
+                        </div>
+
+                        <!-- Export Button -->
+                        <button onclick="exportDecodedData()" style="padding: 5px 12px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">📥 Export Data</button>
+                    </div>
+                </div>
+
+                <!-- Middle: Live Displays (50%) -->
+                <div style="flex: 0 0 50%; display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr auto; gap: 10px; padding: 10px; background: #0a0a0a; border-bottom: 1px solid #333;">
+                    <!-- Spectrum Display with Signal Selection (spans top row, left 2 columns) -->
+                    <div style="grid-column: span 2; background: #000; border: 1px solid #0ff; border-radius: 4px; position: relative;">
+                        <canvas id="demod_spectrum" style="width: 100%; height: 100%; display: block; cursor: crosshair;"></canvas>
+                        <div style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.9); padding: 6px; border: 1px solid #0ff; border-radius: 3px; font-size: 10px;">
+                            <div style="color: #0ff; font-weight: bold; margin-bottom: 3px;">SPECTRUM - CLICK TO TUNE</div>
+                            <div style="color: #888; font-family: monospace; font-size: 9px;">
+                                <div>Tuned: <span style="color: #0f0;" id="demod_tuned_freq">-- MHz</span></div>
+                                <div>BW: <span style="color: #ff0;" id="demod_bandwidth">15 kHz</span></div>
+                                <div>Signal: <span style="color: #0ff;" id="demod_signal_power">-- dBm</span></div>
+                            </div>
+                        </div>
+                        <!-- Selection marker -->
+                        <div id="demod_tune_marker" style="position: absolute; top: 0; bottom: 0; width: 2px; background: #0f0; box-shadow: 0 0 8px #0f0; display: none; pointer-events: none;"></div>
+                    </div>
+
+                    <!-- S-Meter (top right) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; padding: 8px; display: flex; flex-direction: column; gap: 5px;">
+                        <div style="color: #0ff; font-size: 9px; font-weight: bold;">SIGNAL STRENGTH</div>
+                        <canvas id="s_meter_canvas" style="width: 100%; height: 80px;"></canvas>
+                        <div style="display: flex; justify-content: space-between; font-family: monospace; font-size: 8px; color: #888;">
+                            <span>S1</span>
+                            <span>S5</span>
+                            <span>S9</span>
+                            <span>+20</span>
+                        </div>
+                        <div style="text-align: center;">
+                            <span style="color: #0f0; font-family: monospace; font-size: 14px; font-weight: bold;" id="s_meter_value">S0</span>
+                        </div>
+                    </div>
+
+                    <!-- IQ Constellation (bottom left) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; position: relative;">
+                        <canvas id="demod_iq_live" style="width: 100%; height: 100%; display: block;"></canvas>
+                        <div style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.9); padding: 4px; border: 1px solid #0ff; border-radius: 3px; font-size: 9px;">
+                            <div style="color: #0ff; font-weight: bold; margin-bottom: 2px;">IQ CONSTELLATION</div>
+                            <div style="color: #888; font-family: monospace; font-size: 8px;">
+                                <div>EVM: <span style="color: #0f0;" id="demod_evm_live">--%</span></div>
+                                <div>SNR: <span style="color: #0ff;" id="demod_snr_live">-- dB</span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Audio Level + Controls (bottom center) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; padding: 8px; display: flex; flex-direction: column; gap: 8px;">
+                        <div>
+                            <div style="color: #0ff; font-size: 9px; font-weight: bold; margin-bottom: 4px;">AUDIO LEVEL</div>
+                            <div style="display: flex; gap: 5px; align-items: center;">
+                                <div style="flex: 1; background: #111; height: 20px; border: 1px solid #333; border-radius: 2px; position: relative; overflow: hidden;">
+                                    <div id="audio_level_bar" style="height: 100%; background: linear-gradient(to right, #0f0, #ff0, #f00); width: 0%; transition: width 0.1s;"></div>
+                                    <div style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; color: #fff; font-weight: bold; text-shadow: 1px 1px 2px #000;" id="audio_level_text">0%</div>
+                                </div>
+                            </div>
+                            <div style="text-align: center; margin-top: 2px;">
+                                <span style="color: #888; font-size: 8px;">AGC: </span>
+                                <span style="color: #0f0; font-family: monospace; font-size: 9px;" id="agc_gain_display">1.0x</span>
+                            </div>
+                        </div>
+                        <div>
+                            <div style="color: #0ff; font-size: 9px; font-weight: bold; margin-bottom: 4px;">SQUELCH</div>
+                            <input type="range" id="squelch_slider" min="-100" max="-20" value="-100" style="width: 100%;">
+                            <div style="text-align: center; margin-top: 2px;">
+                                <span style="color: #ff0; font-family: monospace; font-size: 9px;" id="squelch_value">OFF</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Time Domain + Info (bottom right) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; position: relative;">
+                        <canvas id="demod_waveform" style="width: 100%; height: 100%; display: block;"></canvas>
+                        <div style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.9); padding: 4px; border: 1px solid #0ff; border-radius: 3px; font-size: 9px;">
+                            <div style="color: #0ff; font-weight: bold; margin-bottom: 2px;">TIME DOMAIN</div>
+                            <div style="color: #888; font-family: monospace; font-size: 8px;">
+                                <div>Mode: <span style="color: #0f0;" id="demod_mode_display">OFF</span></div>
+                                <div>AFC: <span style="color: #ff0;" id="afc_status">OFF</span></div>
+                                <div id="demod_status_text" style="margin-top: 4px; color: #888;">Ready</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bottom: Analysis Panels (50%) -->
+                <div style="flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 10px; padding: 10px; overflow: auto; min-height: 0;">
+                    <!-- Signal Tracker Panel -->
+                    <div id="demod-slot-tracker" class="workspace-panel-slot" style="grid-row: span 2;"></div>
+
+                    <!-- Interference Analysis Panel -->
+                    <div id="demod-slot-interference" class="workspace-panel-slot"></div>
+
+                    <!-- Protocol Decoder Output Panel -->
+                    <div id="demod-slot-decoder" class="workspace-panel-slot"></div>
+                </div>
+            </div>
+        </div> <!-- End workspace-demod -->
+
+        <!-- TAB 4: DIRECTION FINDING -->
+        <div class="workspace-content" id="workspace-direction">
+            <div style="display: flex; flex-direction: column; height: 100%; gap: 8px;">
+
+                <!-- Top 55%: Spectrum Display with Controls -->
+                <div style="flex: 0 0 55%; display: flex; flex-direction: column; background: #000; border: 2px solid #0ff; border-radius: 5px; overflow: hidden;">
+                    <!-- Spectrum Controls Bar -->
+                    <div style="background: #111; padding: 8px; border-bottom: 1px solid #0ff; display: flex; justify-content: space-between; align-items: center; gap: 15px;">
+                        <div style="display: flex; align-items: center; gap: 15px; flex: 1;">
+                            <div style="color: #0ff; font-weight: bold; font-size: 11px;">SPECTRUM SELECTION</div>
+                            <div style="font-size: 10px;">
+                                <span>Center: <span style="color: #0f0; font-weight: bold;" id="doa_sel_center">-- MHz</span></span>
+                                <span style="margin-left: 15px;">BW: <span style="color: #ff0; font-weight: bold;" id="doa_sel_bw">-- kHz</span></span>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 5px; align-items: center;">
+                            <span style="font-size: 10px; color: #888;">Vertical Offset:</span>
+                            <button onclick="adjustSpectrumOffset(10)" style="padding: 2px 8px; font-size: 10px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">▲</button>
+                            <button onclick="resetSpectrumOffset()" style="padding: 2px 8px; font-size: 10px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">Reset</button>
+                            <button onclick="adjustSpectrumOffset(-10)" style="padding: 2px 8px; font-size: 10px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">▼</button>
+                        </div>
+                    </div>
+
+                    <!-- Spectrum Canvas Container -->
+                    <div style="flex: 1; position: relative; background: #000;">
+                        <canvas id="direction_spectrum" style="width: 100%; height: 100%; display: block;"></canvas>
+
+                        <!-- Selection Cursors Overlay -->
+                        <div id="doa_selection_overlay" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;">
+                            <div id="doa_cursor_left" style="position: absolute; width: 3px; height: 100%; background: #0ff; box-shadow: 0 0 10px #0ff; display: none; pointer-events: auto; cursor: ew-resize;"></div>
+                            <div id="doa_cursor_right" style="position: absolute; width: 3px; height: 100%; background: #0ff; box-shadow: 0 0 10px #0ff; display: none; pointer-events: auto; cursor: ew-resize;"></div>
+                        </div>
+
+                        <!-- Instructions Overlay (shows when no selection) -->
+                        <div id="doa_instructions" style="position: absolute; top: 10px; right: 10px; background: rgba(0, 0, 0, 0.85); padding: 10px 15px; border: 1px solid #0ff; border-radius: 4px; pointer-events: none; max-width: 300px;">
+                            <div style="color: #0ff; font-size: 11px; font-weight: bold; margin-bottom: 6px;">📍 SELECT SIGNAL</div>
+                            <div style="font-size: 9px; color: #aaa; line-height: 1.5;">
+                                Click & drag to select → Adjust cursors → Start DF
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bottom 45%: Analysis Displays -->
+                <div style="flex: 1; display: grid; grid-template-columns: 1.2fr 0.8fr 1fr; grid-template-rows: 1fr 1fr; gap: 8px; min-height: 0;">
+
+                    <!-- Polar DoA Display (spans 2 rows) -->
+                    <div class="workspace-panel-slot" style="grid-row: 1 / 3; grid-column: 1; overflow-y: auto;">
+                        <div style="padding: 12px; display: flex; flex-direction: column; min-height: 100%; gap: 8px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <strong style="color: #0ff; font-size: 13px;">AZIMUTH</strong>
+                                <div style="font-size: 10px; font-family: monospace;">
+                                    <span style="color: #0f0; font-weight: bold; font-size: 16px;" id="doa_azimuth_main">--</span><span style="color: #888;">°</span>
+                                </div>
+                            </div>
+                            <canvas id="doa_polar_main" style="flex: 1; min-height: 200px; background: #0a0a0a; border: 1px solid #333; border-radius: 3px;"></canvas>
+                            <div style="font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                                <div>Confidence: <span style="color: #ff0;" id="doa_confidence_main">--%</span></div>
+                                <div>SNR: <span style="color: #0f0;" id="doa_snr">-- dB</span></div>
+                                <div>Coherence: <span style="color: #0f0;" id="doa_coherence_mag">--</span></div>
+                                <div>Quality: <span style="color: #ff0;" id="doa_quality">--</span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Configuration Panel -->
+                    <div class="workspace-panel-slot" style="grid-row: 1; grid-column: 2;">
+                        <div style="padding: 12px; font-size: 11px; height: 100%; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;">
+                            <strong style="color: #0ff; font-size: 12px;">CONFIG</strong>
+
+                            <div>
+                                <label style="font-size: 10px; color: #888;">Array Spacing (λ):</label>
+                                <input type="number" id="doa_spacing_main" value="0.5" step="0.1" min="0.1" max="2.0" style="width: 100%; margin-top: 3px;">
+                                <div style="font-size: 9px; color: #666; margin-top: 2px;">0.5λ = 164mm @ 915 MHz</div>
+                            </div>
+
+                            <div>
+                                <label style="font-size: 10px; color: #888;">Algorithm:</label>
+                                <select id="doa_algorithm" style="width: 100%; margin-top: 3px; font-size: 10px;">
+                                    <option value="phase">Phase Difference (2-Ch Interferometry)</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label style="font-size: 10px; color: #888;">Update Rate:</label>
+                                <select id="doa_update_rate" style="width: 100%; margin-top: 3px; font-size: 10px;">
+                                    <option value="100">10 Hz</option>
+                                    <option value="200" selected>5 Hz</option>
+                                    <option value="500">2 Hz</option>
+                                    <option value="1000">1 Hz</option>
+                                </select>
+                            </div>
+
+                            <div style="margin-top: auto;">
+                                <label style="display: flex; align-items: center; cursor: pointer; font-size: 10px;">
+                                    <input type="checkbox" id="doa_multi_source" style="margin-right: 5px;">
+                                    <span>Multi-Source</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Control Buttons -->
+                    <div class="workspace-panel-slot" style="grid-row: 2; grid-column: 2;">
+                        <div style="padding: 12px; display: flex; flex-direction: column; gap: 8px; height: 100%; overflow-y: auto;">
+                            <strong style="color: #0ff; font-size: 12px;">CONTROL</strong>
+
+                            <div style="display: flex; flex-direction: column; gap: 6px; flex: 1; justify-content: center;">
+                                <button onclick="startDoA()" style="padding: 12px; background: #0a3a3a; border: 2px solid #0ff; color: #0ff; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 12px;">
+                                    ▶ START
+                                </button>
+                                <button onclick="stopDoA()" style="padding: 10px; background: #3a0a0a; border: 2px solid #f00; color: #f00; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 11px;">
+                                    ■ STOP
+                                </button>
+                                <button onclick="calibrateDoAMain()" style="padding: 8px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                                    Calibrate Array
+                                </button>
+                                <button onclick="openStreamOutConfig()" style="padding: 8px; background: #1a1a3a; border: 1px solid #88f; color: #aaf; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                                    Stream Out
+                                </button>
+                            </div>
+
+                            <div style="text-align: center; padding: 6px; background: #0a0a0a; border-radius: 3px; font-size: 10px;">
+                                Status: <span style="color: #0f0; font-weight: bold;" id="doa_status_live">Idle</span>
+                            </div>
+                            <div style="text-align: center; padding: 4px; background: #0a0a0a; border-radius: 3px; font-size: 9px; border-top: 1px solid #222;">
+                                Stream: <span style="color: #888; font-weight: bold;" id="doa_stream_status">Off</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Phase Analysis -->
+                    <div class="workspace-panel-slot" style="grid-row: 1; grid-column: 3;">
+                        <div style="padding: 12px; font-size: 11px; height: 100%; overflow-y: auto;">
+                            <strong style="color: #0ff; font-size: 12px;">PHASE ANALYSIS</strong>
+
+                            <div style="margin-top: 10px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                                <div style="margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid #222;">
+                                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                                        <span>CH1-CH2:</span><span style="color: #0f0;" id="doa_phase_diff">-- deg</span>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                                        <span>Unwrapped:</span><span style="color: #ff0;" id="doa_phase_unwrap">-- deg</span>
+                                    </div>
+                                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                                        <span>Std Dev:</span><span style="color: #888;" id="doa_phase_std">-- deg</span>
+                                    </div>
+                                </div>
+
+                                <div style="margin-top: 6px;">
+                                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                                        <span>Samples:</span><span style="color: #888;" id="doa_samples">0</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Direction History Timeline -->
+                    <div class="workspace-panel-slot" style="grid-row: 2; grid-column: 3;">
+                        <div style="padding: 12px; display: flex; flex-direction: column; height: 100%; gap: 8px;">
+                            <strong style="color: #0ff; font-size: 12px;">HISTORY</strong>
+                            <canvas id="doa_timeline" style="flex: 1; background: #0a0a0a; border: 1px solid #333; border-radius: 3px; min-height: 0;"></canvas>
+                            <div style="display: flex; gap: 4px;">
+                                <button onclick="clearDoAHistory()" style="flex: 1; padding: 4px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                                    Clear
+                                </button>
+                                <button onclick="exportDoAData()" style="flex: 1; padding: 4px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                                    Export
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div> <!-- End workspace-direction -->
+
+        <!-- TAB 5: SCANNER -->
+        <div class="workspace-content" id="workspace-scanner">
+            <div style="display: grid; grid-template-columns: 350px 1fr; gap: 15px; height: 100%; padding: 15px;">
+                <!-- Left Panel: Scanner Controls -->
+                <div style="display: flex; flex-direction: column; gap: 15px;">
+                    <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333;">
+                        <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">SCAN PARAMETERS</div>
+                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                            <div>
+                                <label style="font-size: 11px; color: #888;">Start Freq (MHz):</label>
+                                <input type="number" id="scan_start" value="400" min="47" max="6000" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; color: #888;">Stop Freq (MHz):</label>
+                                <input type="number" id="scan_stop" value="6000" min="47" max="6000" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; color: #888;">Step (MHz):</label>
+                                <input type="number" id="scan_step" value="40" min="1" max="100" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; color: #888;">Threshold (dBm):</label>
+                                <input type="number" id="scan_threshold" value="-80" min="-120" max="0" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
+                            </div>
+                            <div>
+                                <label style="font-size: 11px; color: #888;">Dwell (ms):</label>
+                                <input type="number" id="scan_dwell" value="100" min="10" max="5000" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333;">
+                        <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">CONTROL</div>
+                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                            <button id="scan_start_btn" onclick="startScanner()" style="padding: 10px; background: #0a0; border: none; color: #fff; font-weight: bold; border-radius: 3px; cursor: pointer;">▶ START SCAN</button>
+                            <button id="scan_stop_btn" onclick="stopScanner()" style="padding: 10px; background: #a00; border: none; color: #fff; font-weight: bold; border-radius: 3px; cursor: pointer; display: none;">⏹ STOP SCAN</button>
+                            <button onclick="clearScanner()" style="padding: 8px; background: #444; border: none; color: #fff; border-radius: 3px; cursor: pointer;">🗑 Clear Results</button>
+                        </div>
+                    </div>
+
+                    <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333;">
+                        <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">STATUS</div>
+                        <div style="font-family: monospace; font-size: 11px;">
+                            <div>Status: <span id="scan_status" style="color: #888;">Idle</span></div>
+                            <div>Current: <span id="scan_current_freq" style="color: #0f0;">--</span> MHz</div>
+                            <div>Scans: <span id="scan_count" style="color: #ff0;">0</span></div>
+                            <div>Signals: <span id="scan_signal_count" style="color: #0ff;">0</span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right Panel: Signal List -->
+                <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333; display: flex; flex-direction: column;">
+                    <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">DETECTED SIGNALS</div>
+                    <div id="scanner_signal_list" style="flex: 1; overflow-y: auto; font-family: monospace; font-size: 11px;">
+                        <div style="color: #888; text-align: center; padding: 20px;">No signals detected</div>
+                    </div>
+                </div>
+            </div>
+        </div> <!-- End workspace-scanner -->
+
+    </div> <!-- End workspace-container -->
+
+    <!-- Stream Out Configuration Modal -->
+    <div id="streamout_modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.8); z-index: 2000; justify-content: center; align-items: center;">
+        <div style="background: #1a1a1a; border: 2px solid #88f; border-radius: 8px; padding: 20px; max-width: 500px; width: 90%; max-height: 80vh; overflow-y: auto;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <h3 style="margin: 0; color: #88f; font-size: 16px;">Stream Out Configuration</h3>
+                <span onclick="closeStreamOutConfig()" style="cursor: pointer; color: #f00; font-size: 20px; font-weight: bold;">&times;</span>
+            </div>
+
+            <!-- Network Configuration -->
+            <div style="margin-bottom: 15px;">
+                <h4 style="color: #0ff; font-size: 13px; margin: 0 0 10px 0; border-bottom: 1px solid #333; padding-bottom: 5px;">Network</h4>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Endpoint (IP/Hostname)</label>
+                    <input type="text" id="stream_endpoint" placeholder="192.168.1.100 or hostname" value="127.0.0.1" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Port</label>
+                    <input type="number" id="stream_port" placeholder="8089" value="8089" min="1" max="65535" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                </div>
+            </div>
+
+            <!-- Data Format -->
+            <div style="margin-bottom: 15px;">
+                <h4 style="color: #0ff; font-size: 13px; margin: 0 0 10px 0; border-bottom: 1px solid #333; padding-bottom: 5px;">Data Format</h4>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Protocol</label>
+                    <select id="stream_protocol" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                        <option value="http">HTTP/HTTPS (POST)</option>
+                        <option value="udp">UDP (via server relay)</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Data Format</label>
+                    <select id="stream_format" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                        <option value="cot">Cursor on Target (CoT XML)</option>
+                        <option value="json">JSON</option>
+                        <option value="proto">Protobuf (Binary)</option>
+                        <option value="csv">CSV</option>
+                        <option value="nmea">NMEA-like</option>
+                    </select>
+                    <div style="font-size: 9px; color: #666; margin-top: 5px;">CoT format compatible with ATAK/WinTAK</div>
+                </div>
+            </div>
+
+            <!-- Sensor Position -->
+            <div style="margin-bottom: 15px;">
+                <h4 style="color: #0ff; font-size: 13px; margin: 0 0 10px 0; border-bottom: 1px solid #333; padding-bottom: 5px;">Sensor Position</h4>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: flex; align-items: center; cursor: pointer; margin-bottom: 8px;">
+                        <input type="radio" name="position_mode" value="static" checked onchange="togglePositionMode()" style="margin-right: 8px;">
+                        <span style="font-size: 11px;">Static (Manual Entry)</span>
+                    </label>
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="radio" name="position_mode" value="dynamic" onchange="togglePositionMode()" style="margin-right: 8px;">
+                        <span style="font-size: 11px;">Dynamic (GPS - TODO)</span>
+                    </label>
+                </div>
+
+                <div id="static_position_inputs">
+                    <div style="margin-bottom: 10px;">
+                        <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Coordinate Format</label>
+                        <select id="coord_format" onchange="toggleCoordFormat()" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                            <option value="latlon">Lat/Lon (Decimal Degrees)</option>
+                            <option value="mgrs">MGRS</option>
+                        </select>
+                    </div>
+
+                    <div id="latlon_inputs">
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+                            <div>
+                                <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Latitude</label>
+                                <input type="number" id="sensor_lat" placeholder="37.7749" step="0.000001" value="37.7749" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Longitude</label>
+                                <input type="number" id="sensor_lon" placeholder="-122.4194" step="0.000001" value="-122.4194" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                            </div>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Altitude (m HAE)</label>
+                            <input type="number" id="sensor_alt" placeholder="10" value="10" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                        </div>
+                    </div>
+
+                    <div id="mgrs_inputs" style="display: none;">
+                        <div style="margin-bottom: 10px;">
+                            <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">MGRS Coordinate</label>
+                            <input type="text" id="sensor_mgrs" placeholder="10SEG1234567890" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                            <div style="font-size: 9px; color: #666; margin-top: 3px;">Example: 10SEG1234567890</div>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Altitude (m HAE)</label>
+                            <input type="number" id="sensor_alt_mgrs" placeholder="10" value="10" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                        </div>
+                    </div>
+                </div>
+
+                <div id="dynamic_position_info" style="display: none;">
+                    <div style="background: #0a0a0a; padding: 10px; border-radius: 3px; border: 1px solid #333;">
+                        <div style="font-size: 10px; color: #ff0; margin-bottom: 5px;">⚠ GPS Integration TODO</div>
+                        <div style="font-size: 9px; color: #888;">Future: Connect to GPSD or serial GPS for dynamic positioning</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stream Settings -->
+            <div style="margin-bottom: 15px;">
+                <h4 style="color: #0ff; font-size: 13px; margin: 0 0 10px 0; border-bottom: 1px solid #333; padding-bottom: 5px;">Stream Settings</h4>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Platform Type</label>
+                    <select id="platform_type" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                        <option value="ugv">UGV (Unmanned Ground Vehicle)</option>
+                        <option value="uav-fixed">UAV Fixed-Wing</option>
+                        <option value="uav-rotary">UAV Rotary-Wing</option>
+                        <option value="usv">USV (Unmanned Surface Vehicle)</option>
+                        <option value="ground-station">Ground Station</option>
+                    </select>
+                    <div style="font-size: 9px; color: #666; margin-top: 3px;">Determines the icon displayed in TAKX</div>
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">LoB Range (meters)</label>
+                    <input type="number" id="lob_range" placeholder="10000" value="10000" min="1000" max="100000" step="1000" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                    <div style="font-size: 9px; color: #666; margin-top: 3px;">Line of bearing display length (default: 10km)</div>
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Update Rate</label>
+                    <select id="stream_rate" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                        <option value="1000">1 Hz (Every 1 second)</option>
+                        <option value="500" selected>2 Hz (Every 500ms)</option>
+                        <option value="200">5 Hz (Every 200ms)</option>
+                        <option value="100">10 Hz (Every 100ms)</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 10px;">
+                    <label style="display: block; font-size: 11px; color: #888; margin-bottom: 3px;">Sensor UID</label>
+                    <input type="text" id="sensor_uid" placeholder="DF-SENSOR-001" value="DF-SENSOR-001" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px; font-size: 11px;">
+                    <div style="font-size: 9px; color: #666; margin-top: 3px;">Unique identifier for this DF sensor</div>
+                </div>
+            </div>
+
+            <!-- Control Buttons -->
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button onclick="closeStreamOutConfig()" style="padding: 8px 16px; background: #3a0a0a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 11px;">
+                    Cancel
+                </button>
+                <button onclick="toggleStreamOut()" id="stream_toggle_btn" style="padding: 8px 16px; background: #0a3a0a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px; font-size: 11px; font-weight: bold;">
+                    Start Streaming
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Global draggable panels (outside workspaces) -->
+    <div id="iq_constellation" class="draggable-panel" style="display: none; top: 100px; right: 20px;">
+        <div class="panel-header">
+            <span class="panel-title">IQ Constellation</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('iq_constellation')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleIQ()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px;">
+            <canvas id="iq_canvas" width="320" height="300"></canvas>
+        </div>
+    </div>
+
+    <div id="xcorr_display" class="draggable-panel" style="display: none; bottom: 20px; left: 100px;">
+        <div class="panel-header">
+            <span class="panel-title">Cross-Correlation</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('xcorr_display')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleXCorr()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px;">
+            <canvas id="xcorr_canvas" width="600" height="200"></canvas>
+        </div>
+    </div>
+
+    <!-- Professional RF Measurements Panel -->
+    <div id="signal_analysis" class="draggable-panel" style="display: none; top: 60px; left: 20px; width: 450px;">
+        <div class="panel-header">
+            <span class="panel-title">RF Measurements</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('signal_analysis')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleSignalAnalysis()">&times;</span>
+            </div>
+        </div>
+
+        <!-- Tabbed Interface -->
+        <div style="display: flex; background: #111; border-bottom: 1px solid #333;">
+            <div class="meas-tab active" onclick="switchMeasTab('basic')" id="tab-basic">Basic</div>
+            <div class="meas-tab" onclick="switchMeasTab('power')" id="tab-power">Power</div>
+            <div class="meas-tab" onclick="switchMeasTab('spectral')" id="tab-spectral">Spectral</div>
+            <div class="meas-tab" onclick="switchMeasTab('advanced')" id="tab-advanced">Advanced</div>
+            <div class="meas-tab" onclick="switchMeasTab('mask')" id="tab-mask">Mask</div>
+        </div>
+
+        <div style="padding: 10px; font-size: 11px;">
+            <!-- Basic Measurements Tab -->
+            <div id="meas-content-basic" class="meas-content">
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Power Measurements</strong>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Peak Power:</span><span style="color: #0f0;" id="rf_peak_power">-- dBm</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Average Power:</span><span style="color: #0f0;" id="rf_avg_power">-- dBm</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>RMS Power:</span><span style="color: #0f0;" id="rf_rms_power">-- dBm</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Peak/Avg Ratio:</span><span style="color: #ff0;" id="rf_crest_factor">-- dB</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Bandwidth</strong>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>OBW (99%):</span><span style="color: #0f0;" id="rf_obw_99">-- MHz</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>OBW (-3dB):</span><span style="color: #0f0;" id="rf_obw_3db">-- MHz</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>OBW (-20dB):</span><span style="color: #0f0;" id="rf_obw_20db">-- MHz</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Center Freq:</span><span style="color: #ff0;" id="rf_center_measured">-- MHz</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Noise & Quality</strong>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Noise Floor:</span><span style="color: #0f0;" id="rf_noise_floor">-- dBm</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>SNR:</span><span style="color: #0f0;" id="rf_snr">-- dB</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>SINAD:</span><span style="color: #0f0;" id="rf_sinad">-- dB</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>SFDR:</span><span style="color: #0f0;" id="rf_sfdr">-- dBc</span>
+                        </div>
+                    </div>
+                </div>
+
+                <button onclick="runBasicMeasurements()" style="padding: 6px 12px; width: 100%; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                    ▶ Run Measurements
+                </button>
+            </div>
+
+            <!-- Channel Power Tab -->
+            <div id="meas-content-power" class="meas-content" style="display: none;">
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Channel Power</strong>
+                    <div style="margin-top: 8px;">
+                        <label>Integration BW (MHz):</label>
+                        <input type="number" id="chan_bw" value="1.0" step="0.1" style="width: 80px; margin-left: 5px;">
+                    </div>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Channel Power:</span><span style="color: #0f0;" id="rf_chan_power">-- dBm</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Power Density:</span><span style="color: #0f0;" id="rf_power_density">-- dBm/Hz</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">ACPR (Adjacent Channel Power)</strong>
+                    <div style="margin-top: 8px;">
+                        <label>Offset (MHz):</label>
+                        <input type="number" id="acpr_offset" value="1.5" step="0.1" style="width: 80px; margin-left: 5px;">
+                    </div>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Lower ACPR:</span><span style="color: #f90;" id="rf_acpr_lower">-- dBc</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Upper ACPR:</span><span style="color: #f90;" id="rf_acpr_upper">-- dBc</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Alt Lower:</span><span style="color: #888;" id="rf_aclr_lower">-- dBc</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Alt Upper:</span><span style="color: #888;" id="rf_aclr_upper">-- dBc</span>
+                        </div>
+                    </div>
+                </div>
+
+                <button onclick="runChannelPowerMeasurements()" style="padding: 6px 12px; width: 100%; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                    ▶ Measure Channel Power
+                </button>
+            </div>
+
+            <!-- Spectral Analysis Tab -->
+            <div id="meas-content-spectral" class="meas-content" style="display: none;">
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Spectral Characteristics</strong>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Spectral Flatness:</span><span style="color: #0f0;" id="rf_spectral_flatness">--</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Spectral Entropy:</span><span style="color: #0f0;" id="rf_spectral_entropy">--</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Spectral Kurtosis:</span><span style="color: #0f0;" id="rf_spectral_kurtosis">--</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>RBW (effective):</span><span style="color: #ff0;" id="rf_rbw">-- kHz</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Peak Analysis</strong>
+                    <div style="margin-top: 5px;">
+                        <label>Threshold:</label>
+                        <input type="number" id="peak_threshold_pro" value="-60" step="5" style="width: 60px; margin-left: 5px;">
+                        <label style="margin-left: 10px;">Excursion:</label>
+                        <input type="number" id="peak_excursion" value="10" step="1" style="width: 50px; margin-left: 5px;">
+                        <span style="color: #888; font-size: 9px;">dB</span>
+                    </div>
+                    <div id="peak_table_pro" style="margin-top: 8px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 9px; background: #0a0a0a; padding: 5px; border-radius: 3px;">
+                        <table style="width: 100%; border-collapse: collapse;">
+                            <thead style="color: #0ff; border-bottom: 1px solid #333;">
+                                <tr><th>#</th><th>Freq (MHz)</th><th>Power (dBm)</th><th>Δf (kHz)</th></tr>
+                            </thead>
+                            <tbody id="peak_table_body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <button onclick="runSpectralAnalysis()" style="padding: 6px 12px; width: 100%; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                    ▶ Analyze Spectrum
+                </button>
+            </div>
+
+            <!-- Advanced Analysis Tab -->
+            <div id="meas-content-advanced" class="meas-content" style="display: none;">
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Burst Detection</strong>
+                    <div style="margin-top: 8px;">
+                        <label>Threshold (dB):</label>
+                        <input type="number" id="burst_threshold" value="-70" step="5" style="width: 70px; margin-left: 5px;">
+                        <label style="margin-left: 10px;">Min Duration (ms):</label>
+                        <input type="number" id="burst_min_duration" value="10" step="5" style="width: 60px; margin-left: 5px;">
+                    </div>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Bursts Detected:</span><span style="color: #0f0;" id="burst_count">0</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Avg Duration:</span><span style="color: #0f0;" id="burst_avg_duration">-- ms</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Burst Rate:</span><span style="color: #0f0;" id="burst_rate">-- Hz</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Frequency Hopping</strong>
+                    <div style="margin-top: 5px;">
+                        <label style="font-size: 10px;">
+                            <input type="checkbox" id="fh_detect_enable"> Enable Detection
+                        </label>
+                        <label style="margin-left: 10px; font-size: 10px;">
+                            History: <input type="number" id="fh_history" value="100" step="10" style="width: 50px;"> frames
+                        </label>
+                    </div>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Hop Rate:</span><span style="color: #0f0;" id="fh_hop_rate">-- hops/sec</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Channels Used:</span><span style="color: #0f0;" id="fh_channels">--</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Pattern Type:</span><span style="color: #ff0;" id="fh_pattern">--</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Interference Analysis</strong>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Narrowband Interf:</span><span style="color: #f90;" id="interf_narrowband">0</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Wideband Interf:</span><span style="color: #f90;" id="interf_wideband">--</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Duty Cycle:</span><span style="color: #0f0;" id="interf_duty_cycle">--%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <button onclick="runAdvancedAnalysis()" style="padding: 6px 12px; width: 100%; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                    Run Advanced Analysis
+                </button>
+            </div>
+
+            <!-- Spectrum Mask Testing Tab -->
+            <div id="meas-content-mask" class="meas-content" style="display: none;">
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Mask Template</strong>
+                    <div style="margin-top: 8px;">
+                        <select id="mask_template" onchange="loadMaskTemplate()" style="width: 100%; margin-bottom: 8px;">
+                            <option value="custom">Custom</option>
+                            <option value="fcc_part15">FCC Part 15 (ISM 915)</option>
+                            <option value="etsi_300220">ETSI 300 220 (868 MHz)</option>
+                            <option value="wifi_2ghz">WiFi 2.4 GHz</option>
+                            <option value="lte_20mhz">LTE 20 MHz</option>
+                            <option value="bluetooth">Bluetooth LE</option>
+                        </select>
+                        <div style="display: flex; gap: 5px;">
+                            <button onclick="createMaskPoint()" style="flex: 1; padding: 4px; font-size: 10px; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 2px;">
+                                + Point
+                            </button>
+                            <button onclick="clearMask()" style="flex: 1; padding: 4px; font-size: 10px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                                Clear
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Mask Points</strong>
+                    <div id="mask_points_table" style="max-height: 200px; overflow-y: auto; margin-top: 5px; font-family: monospace; font-size: 9px; background: #0a0a0a; padding: 5px; border-radius: 3px;">
+                        <table style="width: 100%; border-collapse: collapse;">
+                            <thead style="color: #0ff; border-bottom: 1px solid #333;">
+                                <tr>
+                                    <th style="text-align: left;">Freq (MHz)</th>
+                                    <th style="text-align: right;">Level (dBm)</th>
+                                    <th style="text-align: center;">Del</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mask_points_body">
+                                <tr><td colspan="3" style="text-align: center; color: #888; padding: 10px;">No mask defined</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 12px;">
+                    <strong style="color: #0ff; font-size: 12px;">Test Results</strong>
+                    <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Status:</span><span id="mask_status" style="color: #888;">Not tested</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Violations:</span><span id="mask_violations" style="color: #f90;">--</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Max Margin:</span><span id="mask_max_margin" style="color: #0f0;">-- dB</span>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                            <span>Min Margin:</span><span id="mask_min_margin" style="color: #f90;">-- dB</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: 5px;">
+                    <button onclick="testMask()" style="flex: 1; padding: 6px 12px; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                        ▶ Test Mask
+                    </button>
+                    <button onclick="toggleMaskOverlay()" style="flex: 1; padding: 6px 12px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px;">
+                        Show/Hide
+                    </button>
+                </div>
+            </div>
+
+            <!-- Persistence & Trace Options (always visible at bottom) -->
+            <div style="margin-top: 15px; padding-top: 12px; border-top: 2px solid #333;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <strong style="color: #0ff; font-size: 11px;">Trace Mode:</strong>
+                    <select id="persistence_mode" onchange="changePersistenceMode()" style="width: 150px; font-size: 10px;">
+                        <option value="none">Live</option>
+                        <option value="max">Max Hold</option>
+                        <option value="min">Min Hold</option>
+                        <option value="avg">Average</option>
+                        <option value="decay">Decay</option>
+                    </select>
+                </div>
+                <div style="display: flex; gap: 5px;">
+                    <button onclick="saveReferenceTrace()" style="flex: 1; padding: 4px 8px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                        Save Ref
+                    </button>
+                    <button onclick="clearReferenceTrace()" style="flex: 1; padding: 4px 8px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                        Clear Ref
+                    </button>
+                    <button onclick="resetPersistence()" style="flex: 1; padding: 4px 8px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                        Reset
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Demodulation Panel -->
+    <div id="demod_panel" class="draggable-panel" style="display: none; top: 100px; right: 20px; width: 300px;">
+        <div class="panel-header">
+            <span class="panel-title">Demodulator</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('demod_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleDemod()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 11px;">
+            <div style="margin-bottom: 10px;">
+                <strong style="color: #0ff;">Mode:</strong>
+                <select id="demod_mode" onchange="changeDemodMode()" style="width: 100%; margin-top: 5px;">
+                    <option value="off">Off</option>
+                    <option value="am">AM</option>
+                    <option value="fm">FM (NFM)</option>
+                    <option value="wfm">FM (WFM)</option>
+                    <option value="usb">USB</option>
+                    <option value="lsb">LSB</option>
+                    <option value="fsk">FSK</option>
+                    <option value="psk">PSK (BPSK)</option>
+                </select>
+            </div>
+            <div style="margin-bottom: 10px;">
+                <label>Center Freq:</label>
+                <input type="number" id="demod_freq" value="0" step="0.001" style="width: 100%; margin-top: 3px;" placeholder="Offset from CF (MHz)">
+            </div>
+            <div style="margin-bottom: 10px;">
+                <label>Bandwidth:</label>
+                <input type="number" id="demod_bw" value="15" step="1" style="width: 100%; margin-top: 3px;" placeholder="kHz">
+            </div>
+            <div style="margin-bottom: 10px;">
+                <label>Volume:</label>
+                <input type="range" id="demod_volume" min="0" max="100" value="50" style="width: 100%;">
+            </div>
+            <div style="margin-bottom: 10px;">
+                <button id="demod_start_btn" onclick="startDemod()" style="width: 100%; padding: 5px;">Start Demodulation</button>
+            </div>
+            <div id="demod_status" style="margin-top: 5px; padding: 5px; background: #111; border-radius: 3px; font-size: 10px; font-family: monospace;">
+                Status: Stopped
+            </div>
+            <div id="demod_decode" style="margin-top: 10px; padding: 5px; background: #111; border-radius: 3px; font-size: 10px; font-family: monospace; max-height: 150px; overflow-y: auto; display: none;">
+                <strong>Decoded Data:</strong>
+                <div id="demod_output" style="margin-top: 5px; color: #0f0;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Signal Tracker Panel (Phase 3) -->
+    <div id="signal_tracker_panel" class="draggable-panel" style="display: none; top: 100px; right: 340px; width: 320px;">
+        <div class="panel-header">
+            <span class="panel-title">Signal Tracker</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('signal_tracker_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleSignalTracker()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 10px;">
+            <div style="margin-bottom: 10px; padding: 8px; background: #0a0a0a; border-radius: 3px;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 5px;">ACTIVE SIGNALS</div>
+                <div style="color: #888;">
+                    <div>Tracked: <span style="color: #0f0;" id="tracker_count">0</span> / 20</div>
+                    <div>Threshold: <span style="color: #ff0;" id="tracker_threshold">-80</span> dBm</div>
+                </div>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 5px;">HOPPING DETECTION</div>
+                <div id="hopping_status" style="padding: 5px; background: #0a0a0a; border-radius: 3px; font-family: monospace; font-size: 9px;">
+                    <div style="color: #888;">No hopping detected</div>
+                </div>
+            </div>
+
+            <div style="max-height: 250px; overflow-y: auto; background: #0a0a0a; border-radius: 3px; padding: 5px;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 5px; font-size: 9px;">SIGNAL LIST</div>
+                <div id="signal_list" style="font-family: monospace; font-size: 8px; color: #888;">
+                    No signals detected
+                </div>
+            </div>
+
+            <div style="margin-top: 10px;">
+                <button onclick="clearSignalTracker()" style="width: 100%; padding: 5px; font-size: 10px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px;">Clear Tracker</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Interference Analysis Panel (Phase 3) -->
+    <div id="interference_panel" class="draggable-panel" style="display: none; top: 100px; right: 680px; width: 340px;">
+        <div class="panel-header">
+            <span class="panel-title">Interference Analysis</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('interference_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleInterference()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 10px;">
+            <div style="margin-bottom: 10px;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 5px;">HARMONICS</div>
+                <div id="harmonics_list" style="max-height: 120px; overflow-y: auto; padding: 5px; background: #0a0a0a; border-radius: 3px; font-family: monospace; font-size: 9px; color: #888;">
+                    No harmonics detected
+                </div>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 5px;">INTERMODULATION (IMD)</div>
+                <div id="imd_list" style="max-height: 120px; overflow-y: auto; padding: 5px; background: #0a0a0a; border-radius: 3px; font-family: monospace; font-size: 9px; color: #888;">
+                    No IMD products detected
+                </div>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <div style="color: #ff0; font-weight: bold; margin-bottom: 5px;">RECOMMENDATIONS</div>
+                <div id="interference_recommendations" style="max-height: 100px; overflow-y: auto; padding: 5px; background: #0a0a0a; border-radius: 3px; font-size: 9px; color: #888;">
+                    No interference detected
+                </div>
+            </div>
+
+            <div style="margin-top: 10px; padding: 8px; background: #0a0a0a; border-radius: 3px;">
+                <div style="color: #888; font-size: 9px;">
+                    <div>Analysis updates every 500ms</div>
+                    <div>Checks up to 10th harmonic</div>
+                    <div>Detects 3rd order IMD products</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Protocol Decoder Output Panel (Phase 3) -->
+    <div id="decoder_panel" class="draggable-panel" style="display: none; top: 100px; right: 1040px; width: 360px;">
+        <div class="panel-header">
+            <span class="panel-title">Protocol Decoder</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('decoder_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleDecoder()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 10px; display: flex; flex-direction: column; height: calc(100% - 40px);">
+            <div style="margin-bottom: 10px; padding: 8px; background: #0a0a0a; border-radius: 3px;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 5px;">ACTIVE DECODERS</div>
+                <div style="color: #888; font-size: 9px;">
+                    <div>ADS-B: <span style="color: #ff0;" id="adsb_status">Inactive</span> (Enable PSK mode)</div>
+                    <div>AIS: <span style="color: #ff0;" id="ais_status">Inactive</span> (Enable FSK mode)</div>
+                </div>
+            </div>
+
+            <div style="flex: 1; display: flex; flex-direction: column; overflow: hidden;">
+                <div style="color: #0ff; font-weight: bold; margin-bottom: 5px;">DECODED MESSAGES</div>
+                <div id="decoded_messages" style="flex: 1; padding: 5px; background: #0a0a0a; border-radius: 3px; font-family: monospace; font-size: 8px; overflow-y: auto; color: #888;">
+                    <div style="text-align: center; margin-top: 20px;">No messages decoded yet</div>
+                </div>
+            </div>
+
+            <div style="margin-top: 10px;">
+                <button onclick="clearDecodedMessages()" style="width: 100%; padding: 5px; font-size: 10px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px;">Clear Messages</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Signal Recorder Panel -->
+    <div id="recorder_panel" class="draggable-panel" style="display: none; top: 100px; left: 20px; width: 380px;">
+        <div class="panel-header">
+            <span class="panel-title">Signal Recorder</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('recorder_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleRecorder()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 11px;">
+            <div style="margin-bottom: 12px;">
+                <strong style="color: #0ff; font-size: 12px;">Recording Settings</strong>
+                <div style="margin-top: 8px;">
+                    <div style="margin-bottom: 8px;">
+                        <label>Format:</label>
+                        <select id="record_format" style="width: 100%; margin-top: 3px;">
+                            <option value="iq_int16">IQ Int16 (Raw)</option>
+                            <option value="iq_float32">IQ Float32</option>
+                            <option value="wav">WAV (Audio)</option>
+                            <option value="sigmf">SigMF (Metadata)</option>
+                        </select>
+                    </div>
+                    <div style="margin-bottom: 8px;">
+                        <label>Duration (sec):</label>
+                        <input type="number" id="record_duration" value="10" min="1" max="3600" style="width: 100%; margin-top: 3px;">
+                    </div>
+                    <div style="margin-bottom: 8px;">
+                        <label>Trigger:</label>
+                        <select id="record_trigger" style="width: 100%; margin-top: 3px;">
+                            <option value="manual">Manual</option>
+                            <option value="level">Power Level</option>
+                            <option value="edge">Rising Edge</option>
+                            <option value="schedule">Scheduled</option>
+                        </select>
+                    </div>
+                    <div id="record_trigger_level" style="margin-bottom: 8px; display: none;">
+                        <label>Threshold (dBm):</label>
+                        <input type="number" id="record_threshold" value="-60" step="1" style="width: 100%; margin-top: 3px;">
+                    </div>
+                </div>
+            </div>
+
+            <div style="margin-bottom: 12px;">
+                <strong style="color: #0ff; font-size: 12px;">Status</strong>
+                <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                    <div>State: <span id="record_state" style="color: #888;">Idle</span></div>
+                    <div>Samples: <span id="record_samples" style="color: #0f0;">0</span></div>
+                    <div>Size: <span id="record_size" style="color: #0f0;">0 MB</span></div>
+                    <div>File: <span id="record_filename" style="color: #888;">--</span></div>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 5px; margin-bottom: 10px;">
+                <button onclick="startRecording()" style="flex: 1; padding: 6px; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                    ● Record
+                </button>
+                <button onclick="stopRecording()" style="flex: 1; padding: 6px; background: #3a0a0a; border: 1px solid #f00; color: #f00; cursor: pointer; border-radius: 3px;">
+                    ■ Stop
+                </button>
+            </div>
+
+            <div style="margin-bottom: 12px; padding-top: 10px; border-top: 1px solid #333;">
+                <strong style="color: #0ff; font-size: 12px;">Recordings</strong>
+                <div id="recordings_list" style="max-height: 150px; overflow-y: auto; margin-top: 5px; font-family: monospace; font-size: 9px; background: #0a0a0a; padding: 5px; border-radius: 3px;">
+                    <div style="text-align: center; color: #888; padding: 20px;">No recordings</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Direction Finding (DoA) Panel -->
+    <div id="doa_panel" class="draggable-panel" style="display: none; top: 100px; right: 20px; width: 400px;">
+        <div class="panel-header">
+            <span class="panel-title">Direction Finding</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('doa_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleDoA()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 11px;">
+            <div style="margin-bottom: 10px;">
+                <strong style="color: #0ff; font-size: 12px;">Coherent Dual-Channel DoA</strong>
+                <div style="margin-top: 5px; font-size: 9px; color: #888; line-height: 1.4;">
+                    Uses phase difference between CH1 and CH2 to estimate signal direction of arrival
+                </div>
+            </div>
+
+            <div style="margin-bottom: 12px;">
+                <strong style="color: #0ff; font-size: 11px;">Array Configuration</strong>
+                <div style="margin-top: 5px;">
+                    <label>Element Spacing (λ):</label>
+                    <input type="number" id="doa_spacing" value="0.5" step="0.1" min="0.1" max="2.0" style="width: 100%; margin-top: 3px;">
+                    <div style="font-size: 9px; color: #888; margin-top: 2px;">0.5λ = ~164mm @ 915 MHz</div>
+                </div>
+                <div style="margin-top: 8px;">
+                    <label>Method:</label>
+                    <select id="doa_method" style="width: 100%; margin-top: 3px;">
+                        <option value="phase">Phase Difference (2-Ch Interferometry)</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Polar DoA Display -->
+            <div style="margin-bottom: 12px;">
+                <strong style="color: #0ff; font-size: 11px;">Angle of Arrival</strong>
+                <canvas id="doa_polar" width="360" height="200" style="background: #0a0a0a; border: 1px solid #333; border-radius: 3px; margin-top: 5px;"></canvas>
+            </div>
+
+            <div style="margin-bottom: 12px;">
+                <strong style="color: #0ff; font-size: 11px;">Results</strong>
+                <div style="margin-top: 5px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                        <span>Azimuth:</span><span id="doa_azimuth" style="color: #0f0;">-- deg</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                        <span>Phase Diff:</span><span id="doa_phase" style="color: #0f0;">-- deg</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                        <span>Confidence:</span><span id="doa_confidence" style="color: #ff0;">--%</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                        <span>Coherence:</span><span id="doa_coherence" style="color: #0f0;">--</span>
+                    </div>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 5px;">
+                <button onclick="updateDoA()" style="flex: 1; padding: 6px 12px; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                    ▶ Update
+                </button>
+                <button onclick="calibrateDoA()" style="flex: 1; padding: 6px 12px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px;">
+                    Calibrate
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Signal Activity Timeline -->
+    <div id="activity_timeline" class="draggable-panel" style="display: none; bottom: 20px; right: 20px; width: 500px;">
+        <div class="panel-header">
+            <span class="panel-title">Signal Activity Timeline</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('activity_timeline')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" onclick="toggleActivityTimeline()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 11px;">
+            <canvas id="timeline_canvas" width="480" height="150" style="margin-bottom: 10px;"></canvas>
+            <div>
+                <button onclick="clearActivityHistory()" style="padding: 3px 8px;">Clear History</button>
+                <span style="margin-left: 10px; color: #888;">Tracking: <span id="activity_duration">0</span>s</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Professional Marker System -->
+    <div id="marker_panel" class="draggable-panel" style="display: none; top: 60px; right: 20px; width: 400px;">
+        <div class="panel-header">
+            <span class="panel-title">Marker System</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('marker_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" id="marker_panel_close">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 11px;">
+            <div style="display: flex; gap: 5px; margin-bottom: 10px;">
+                <button onclick="addMarker()" style="flex: 1; padding: 5px; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                    + Add Marker
+                </button>
+                <button onclick="clearAllMarkers()" style="flex: 1; padding: 5px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                    Clear All
+                </button>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <strong style="color: #0ff; font-size: 11px;">Quick Actions:</strong>
+                <div style="display: flex; gap: 5px; margin-top: 5px; flex-wrap: wrap;">
+                    <button onclick="markerToPeak()" style="padding: 3px 8px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                        → Peak
+                    </button>
+                    <button onclick="markerToCenter()" style="padding: 3px 8px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                        → Center
+                    </button>
+                    <button onclick="markNextPeak()" style="padding: 3px 8px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                        Next Peak
+                    </button>
+                    <button onclick="exportMarkers()" style="padding: 3px 8px; font-size: 9px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 2px;">
+                        Export CSV
+                    </button>
+                </div>
+            </div>
+
+            <div id="marker_table" style="max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 9px;">
+                <table style="width: 100%; border-collapse: collapse; background: #0a0a0a;">
+                    <thead style="color: #0ff; background: #111; position: sticky; top: 0;">
+                        <tr>
+                            <th style="padding: 5px; text-align: left;">M</th>
+                            <th style="padding: 5px; text-align: right;">Frequency</th>
+                            <th style="padding: 5px; text-align: right;">Power</th>
+                            <th style="padding: 5px; text-align: right;">Delta</th>
+                            <th style="padding: 5px; text-align: center;">Act</th>
+                        </tr>
+                    </thead>
+                    <tbody id="marker_table_body">
+                        <tr><td colspan="5" style="text-align: center; color: #888; padding: 20px;">No markers</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;">
+                <strong style="color: #0ff; font-size: 11px;">Delta Measurements:</strong>
+                <div style="margin-top: 5px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                    <div>Reference: <span style="color: #ff0;" id="delta_ref_marker">None</span></div>
+                    <div>Δf: <span style="color: #0f0;" id="delta_freq">-- kHz</span></div>
+                    <div>ΔPower: <span style="color: #0f0;" id="delta_power">-- dB</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Vector Signal Analyzer Panel -->
+    <div id="vsa_panel" class="draggable-panel" style="display: none; bottom: 60px; right: 20px; width: 500px;">
+        <div class="panel-header">
+            <span class="panel-title">Vector Signal Analysis</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('vsa_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" id="vsa_panel_close">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 11px;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                <!-- Constellation Diagram -->
+                <div>
+                    <strong style="color: #0ff; font-size: 11px;">IQ Constellation</strong>
+                    <canvas id="constellation_canvas" width="220" height="220" style="background: #0a0a0a; border: 1px solid #333; border-radius: 3px; margin-top: 5px;"></canvas>
+                </div>
+
+                <!-- EVM & Quality Metrics -->
+                <div>
+                    <strong style="color: #0ff; font-size: 11px;">Quality Metrics</strong>
+                    <div style="margin-top: 5px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px; height: 220px;">
+                        <div style="margin: 5px 0;">EVM RMS: <span style="color: #0f0;" id="vsa_evm_rms">--%</span></div>
+                        <div style="margin: 5px 0;">EVM Peak: <span style="color: #f90;" id="vsa_evm_peak">--%</span></div>
+                        <div style="margin: 5px 0;">Mag Error: <span style="color: #0f0;" id="vsa_mag_error">-- dB</span></div>
+                        <div style="margin: 5px 0;">Phase Error: <span style="color: #0f0;" id="vsa_phase_error">-- deg</span></div>
+                        <div style="margin: 5px 0; padding-top: 5px; border-top: 1px solid #222;">IQ Offset: <span style="color: #ff0;" id="vsa_iq_offset">-- dB</span></div>
+                        <div style="margin: 5px 0;">Quad Error: <span style="color: #ff0;" id="vsa_quad_error">-- deg</span></div>
+                        <div style="margin: 5px 0;">Gain Imbal: <span style="color: #ff0;" id="vsa_gain_imbal">-- dB</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Eye Diagram -->
+            <div style="margin-top: 10px;">
+                <strong style="color: #0ff; font-size: 11px;">Eye Diagram</strong>
+                <canvas id="eye_diagram_canvas" width="480" height="150" style="background: #0a0a0a; border: 1px solid #333; border-radius: 3px; margin-top: 5px;"></canvas>
+            </div>
+
+            <div style="margin-top: 10px;">
+                <button onclick="updateVSA()" style="padding: 6px 12px; width: 100%; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px;">
+                    ▶ Update VSA
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Statistics & CCDF Panel -->
+    <div id="stats_panel" class="draggable-panel" style="display: none; bottom: 60px; left: 20px; width: 450px;">
+        <div class="panel-header">
+            <span class="panel-title">Statistics & CCDF</span>
+            <div>
+                <span class="panel-detach" onclick="detachPanel('stats_panel')" title="Detach to floating">&#8599;</span>
+                <span class="panel-close" id="stats_panel_close">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 10px; font-size: 11px;">
+            <div style="margin-bottom: 10px;">
+                <strong style="color: #0ff; font-size: 12px;">Power Statistics</strong>
+                <div style="margin-top: 8px; font-family: monospace; font-size: 10px; background: #0a0a0a; padding: 8px; border-radius: 3px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px;">
+                        <div>Mean: <span style="color: #0f0;" id="stats_mean">-- dBm</span></div>
+                        <div>Median: <span style="color: #0f0;" id="stats_median">-- dBm</span></div>
+                        <div>Std Dev: <span style="color: #ff0;" id="stats_stddev">-- dB</span></div>
+                        <div>Variance: <span style="color: #ff0;" id="stats_variance">--</span></div>
+                        <div>Skewness: <span style="color: #0f0;" id="stats_skew">--</span></div>
+                        <div>Kurtosis: <span style="color: #0f0;" id="stats_kurt">--</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CCDF Plot -->
+            <div style="margin-bottom: 10px;">
+                <strong style="color: #0ff; font-size: 12px;">CCDF (Complementary CDF)</strong>
+                <canvas id="ccdf_canvas" width="430" height="200" style="background: #0a0a0a; border: 1px solid #333; border-radius: 3px; margin-top: 5px;"></canvas>
+            </div>
+
+            <!-- Histogram -->
+            <div style="margin-bottom: 10px;">
+                <strong style="color: #0ff; font-size: 12px;">Power Histogram</strong>
+                <canvas id="histogram_canvas" width="430" height="150" style="background: #0a0a0a; border: 1px solid #333; border-radius: 3px; margin-top: 5px;"></canvas>
+            </div>
+
+            <div style="display: flex; gap: 5px;">
+                <button onclick="updateStatistics()" style="flex: 1; padding: 6px 12px; background: #0a3a3a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                    ▶ Update Stats
+                </button>
+                <button onclick="resetStatistics()" style="flex: 1; padding: 6px 12px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                    Reset
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Measurement Cursors Canvas Overlay -->
+    <canvas id="cursor_overlay" style="position: fixed; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 500;"></canvas>
+
+    <!-- Global UI elements (outside workspaces) -->
+    <div class="fps" id="fps">-- FPS</div>
+    <div class="resolution-info" id="resolution">--</div>
+
+    <div class="toggle-controls" id="toggleControls" onclick="toggleControlPanel()">Controls</div>
+    <div class="control-panel" id="controlPanel" style="display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <h3 style="margin: 0;">RF Parameters</h3>
+            <span onclick="toggleControlPanel()" style="cursor: pointer; color: #f00; font-weight: bold; font-size: 16px; padding: 0 5px;" title="Close">X</span>
+        </div>
+        <div class="control-group">
+            <label>Frequency (MHz)</label>
+            <input type="number" id="freqInput" step="0.01" min="47" max="6000" value="915.00">
+            <button onclick="applyFrequency()">Set</button>
+        </div>
+        <div class="control-group">
+            <label>Sample Rate (MHz)</label>
+            <input type="number" id="srInput" step="0.1" min="0.52" max="61.44" value="40.0">
+            <button onclick="applySampleRate()">Set</button>
+        </div>
+        <div class="control-group">
+            <label>Bandwidth (MHz)</label>
+            <input type="number" id="bwInput" step="0.1" min="0.52" max="61.44" value="40.0">
+            <button onclick="applyBandwidth()">Set</button>
+        </div>
+        <div class="control-group">
+            <label>Gain RX1 (dB)</label>
+            <input type="number" id="gain1Input" step="1" min="0" max="60" value="40">
+            <button onclick="applyGain1()">Set</button>
+        </div>
+        <div class="control-group">
+            <label>Gain RX2 (dB)</label>
+            <input type="number" id="gain2Input" step="1" min="0" max="60" value="40">
+            <button onclick="applyGain2()">Set</button>
+        </div>
+        <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Display Settings</h3>
+        <div class="control-group">
+            <label>Quality Profile</label>
+            <select id="qualityProfile" onchange="applyQualityProfile()" style="width: 100%;">
+                <option value="high">High (Full Quality)</option>
+                <option value="medium">Medium (Balanced)</option>
+                <option value="low">Low (Tactical Link)</option>
+                <option value="custom">Custom</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Color Palette</label>
+            <select id="colorPalette" onchange="changeColorPalette()" style="width: 100%;">
+                <option value="viridis">Viridis</option>
+                <option value="plasma">Plasma</option>
+                <option value="inferno">Inferno</option>
+                <option value="turbo">Turbo</option>
+                <option value="hot">Hot</option>
+                <option value="cool">Cool</option>
+                <option value="grayscale">Grayscale</option>
+                <option value="rainbow">Rainbow</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Waterfall Intensity</label>
+            <input type="range" id="waterfallIntensity" min="0.5" max="2" step="0.1" value="1.0"
+                   oninput="updateWaterfallIntensity(this.value)" style="width: 120px;">
+            <span id="intensityValue" style="color: #0ff; font-size: 11px; margin-left: 5px;">1.0x</span>
+        </div>
+        <div class="control-group">
+            <label>Waterfall Contrast</label>
+            <input type="range" id="waterfallContrast" min="0.5" max="2" step="0.1" value="1.0"
+                   oninput="updateWaterfallContrast(this.value)" style="width: 120px;">
+            <span id="contrastValue" style="color: #0ff; font-size: 11px; margin-left: 5px;">1.0x</span>
+        </div>
+        <div class="control-group">
+            <label>Spectrum Min (dB)</label>
+            <input type="number" id="spectrumMin" step="10" min="-120" max="-20" value="-100">
+            <button onclick="updateSpectrumRange()">Set</button>
+        </div>
+        <div class="control-group">
+            <label>Spectrum Max (dB)</label>
+            <input type="number" id="spectrumMax" step="10" min="-60" max="20" value="-10">
+            <button onclick="updateSpectrumRange()">Set</button>
+        </div>
+
+        <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Configuration Presets</h3>
+        <div class="control-group">
+            <label>Preset Name</label>
+            <input type="text" id="presetName" placeholder="Enter name" style="width: 120px;">
+        </div>
+        <div class="control-group">
+            <label>Load Preset</label>
+            <select id="presetSelect" onchange="loadPreset()" style="width: 140px;">
+                <option value="">-- Select --</option>
+            </select>
+        </div>
+        <div class="control-group" style="margin-top: 8px;">
+            <button onclick="savePreset()" style="padding: 4px 8px; margin-right: 4px;">Save</button>
+            <button onclick="deletePreset()" style="padding: 4px 8px; margin-right: 4px;">Delete</button>
+        </div>
+        <div class="control-group" style="margin-top: 4px;">
+            <button onclick="exportPresets()" style="padding: 4px 8px; margin-right: 4px;">Export</button>
+            <button onclick="importPresets()" style="padding: 4px 8px;">Import</button>
+        </div>
+        <input type="file" id="presetImportFile" accept=".json" style="display: none;" onchange="handlePresetImport(event)" />
+
+        <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Recording</h3>
+        <div class="control-group">
+            <button id="recordButton" onclick="toggleRecording()" style="padding: 6px 12px; width: 100%;">Start Recording</button>
+        </div>
+        <div class="control-group" style="margin-top: 5px;">
+            <label style="font-size: 11px;">Duration (sec):</label>
+            <input type="number" id="recordDuration" min="1" max="300" value="10" style="width: 60px;">
+        </div>
+        <div class="control-group">
+            <label style="font-size: 11px;">Mode:</label>
+            <select id="recordMode" onchange="updateRecordMode()" style="width: 100%;">
+                <option value="full">Full Spectrum</option>
+                <option value="band">Specific Band</option>
+            </select>
+        </div>
+        <div id="recordBandControls" style="display: none; margin-top: 5px;">
+            <div class="control-group">
+                <label style="font-size: 10px;">Center (MHz):</label>
+                <input type="number" id="recordCenterFreq" step="0.1" min="47" max="6000" value="915" style="width: 80px;">
+            </div>
+            <div class="control-group">
+                <label style="font-size: 10px;">BW (MHz):</label>
+                <input type="number" id="recordBandwidth" step="0.1" min="0.1" max="61.44" value="10" style="width: 80px;">
+            </div>
+        </div>
+        <div class="control-group" style="margin-top: 5px;">
+            <span id="recordingStatus" style="color: #888; font-size: 10px;">Ready</span>
+        </div>
+
+        <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Data Export</h3>
+        <div class="control-group">
+            <button onclick="exportSpectrumCSV()" style="padding: 6px 12px; width: 100%;">Export Spectrum to CSV</button>
+        </div>
+    </div>
+
+    <div class="axis-label freq-axis" id="freq-axis"></div>
+    <div class="axis-label time-axis" id="time-axis"></div>
+
+    <script>
+        const canvas = document.getElementById('waterfall');
+        const ctx = canvas.getContext('2d');
+        const canvas2 = document.getElementById('waterfall2');
+        const ctx2 = canvas2.getContext('2d');
+        const spectrumCanvas = document.getElementById('spectrum');
+        const spectrumCtx = spectrumCanvas.getContext('2d');
+        const iqCanvas = document.getElementById('iq_canvas');
+        const iqCtx = iqCanvas.getContext('2d');
+        const xcorrCanvas = document.getElementById('xcorr_canvas');
+        const xcorrCtx = xcorrCanvas.getContext('2d');
+        const FFT_SIZE = 4096;
+        const IQ_SAMPLES = 256;
+        let currentChannel = 1;
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
+        let measuredFPS = 20;  // Track actual FPS for time axis calculations
+        let showSpectrum = false;
+        let showIQ = false;
+        let showXCorr = false;
+        let latestFFTData = null;  // Store latest FFT data for spectrum display
+        let latestFFTData2 = null;  // Store CH2 FFT data for dual display
+
+        // Spectrum Y-axis control
+        let spectrumYOffset = 0;
+        let spectrumYScale = 1.0;
+        let spectrumMinDb = -100;
+        let spectrumMaxDb = -10;
+
+        // Waterfall display controls
+        let waterfallIntensity = 1.0;
+        let waterfallContrast = 1.0;
+
+        // Zoom state (display-only zoom, no hardware reconfiguration)
+        let zoomState = {
+            isSelecting: false,
+            startX: 0,
+            currentX: 0,
+            fullBandwidth: 40000000,  // Hardware sample rate
+            centerFreq: 915000000,    // Hardware center frequency
+            // Display zoom in FFT bin indices
+            zoomStartBin: 0,          // Start FFT bin of zoom region
+            zoomEndBin: 4095,         // End FFT bin of zoom region (FFT_SIZE-1)
+            isZoomed: false           // Whether we're zoomed in
+        };
+
+        // Global state for signal analysis
+        let signalAnalysis = {
+            persistenceMode: 'none',
+            persistenceData: null,
+            persistenceDecayRate: 0.95,
+            avgCount: 0,
+            colorPalette: 'viridis',
+            bookmarks: JSON.parse(localStorage.getItem('signal_bookmarks') || '[]'),
+            cursorsEnabled: false,
+            cursorPos: { x: null, y: null },
+            peakMarkers: []
+        };
+
+        // Helper functions for dB conversion
+        function rawToDb(raw) {
+            return (raw / 255.0) * 120.0 - 100.0;
+        }
+
+        function dbToRaw(db) {
+            return ((db + 100.0) / 120.0) * 255.0;
+        }
+
+        // Viridis colormap (JavaScript version)
+        // Dark purple → blue → cyan → green → yellow
+        function viridisColor(value) {
+            value = Math.max(0, Math.min(1, value));
+            let r, g, b;
+
+            if (value < 0.25) {
+                // Dark purple to blue
+                const t = value / 0.25;
+                r = 68 + t * (59 - 68);
+                g = 1 + t * (82 - 1);
+                b = 84 + t * (139 - 84);
+            } else if (value < 0.5) {
+                // Blue to teal/cyan
+                const t = (value - 0.25) / 0.25;
+                r = 59 + t * (33 - 59);
+                g = 82 + t * (145 - 82);
+                b = 139 + t * (140 - 139);
+            } else if (value < 0.75) {
+                // Cyan to green
+                const t = (value - 0.5) / 0.25;
+                r = 33 + t * (94 - 33);
+                g = 145 + t * (201 - 145);
+                b = 140 + t * (98 - 140);
+            } else {
+                // Green to bright yellow
+                const t = (value - 0.75) / 0.25;
+                r = 94 + t * (253 - 94);
+                g = 201 + t * (231 - 201);
+                b = 98 + t * (37 - 98);
+            }
+
+            return [Math.floor(r), Math.floor(g), Math.floor(b)];
+        }
+
+        // Make panels draggable
+        function makeDraggable(element) {
+            let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+            const header = element.querySelector('.panel-header');
+
+            if (header) {
+                header.onmousedown = dragMouseDown;
+            }
+
+            function dragMouseDown(e) {
+                e.preventDefault();
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                document.onmouseup = closeDragElement;
+                document.onmousemove = elementDrag;
+                element.classList.add('active');
+            }
+
+            function elementDrag(e) {
+                e.preventDefault();
+                pos1 = pos3 - e.clientX;
+                pos2 = pos4 - e.clientY;
+                pos3 = e.clientX;
+                pos4 = e.clientY;
+                element.style.top = (element.offsetTop - pos2) + "px";
+                element.style.left = (element.offsetLeft - pos1) + "px";
+            }
+
+            function closeDragElement() {
+                document.onmouseup = null;
+                document.onmousemove = null;
+                element.classList.remove('active');
+            }
+        }
+
+        // Resize canvas to fill window
+        function resizeCanvas() {
+            const waterfallTop = showSpectrum ? 250 : 50;
+            const waterfallBottom = showXCorr ? 210 : 30;
+            const chSelect = document.getElementById('channel_select').value;
+            const isDualChannel = (chSelect === 'both');
+
+            console.log('resizeCanvas called: channel=' + chSelect + ', isDual=' + isDualChannel);
+
+            // Update label visibility
+            document.getElementById('waterfall-label').style.display = (!isDualChannel && !showSpectrum) ? 'block' : 'none';
+            // Show dual-channel labels whenever dual-channel mode is active, not just when spectrum is on
+            document.getElementById('waterfall-label-ch1').style.display = isDualChannel ? 'block' : 'none';
+            document.getElementById('waterfall-label-ch2').style.display = isDualChannel ? 'block' : 'none';
+            document.getElementById('spectrum-label').style.display = showSpectrum ? 'block' : 'none';
+
+            if (isDualChannel) {
+                // Dual-channel mode: split screen 50/50
+                const halfWidth = Math.floor((window.innerWidth - 60) / 2);
+
+                console.log('Setting up dual-channel: halfWidth=' + halfWidth);
+
+                // Only change canvas dimensions if they actually changed (setting .width clears canvas!)
+                const newWidth1 = Math.max(halfWidth, FFT_SIZE);
+                const newHeight = window.innerHeight - waterfallTop - waterfallBottom;
+
+                if (canvas.width !== newWidth1 || canvas.height !== newHeight) {
+                    console.log('Resizing canvas1 from ' + canvas.width + 'x' + canvas.height + ' to ' + newWidth1 + 'x' + newHeight);
+                    canvas.width = newWidth1;
+                    canvas.height = newHeight;
+                }
+
+                canvas.style.top = waterfallTop + 'px';
+                canvas.style.left = '50px';
+                canvas.style.width = halfWidth + 'px';
+                canvas.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+                canvas.style.display = 'block';
+
+                const newWidth2 = Math.max(halfWidth, FFT_SIZE);
+                if (canvas2.width !== newWidth2 || canvas2.height !== newHeight) {
+                    console.log('Resizing canvas2 from ' + canvas2.width + 'x' + canvas2.height + ' to ' + newWidth2 + 'x' + newHeight);
+                    canvas2.width = newWidth2;
+                    canvas2.height = newHeight;
+                }
+                canvas2.style.top = waterfallTop + 'px';
+                canvas2.style.left = (50 + halfWidth) + 'px';
+                canvas2.style.width = halfWidth + 'px';
+                canvas2.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+                canvas2.style.display = 'block';
+
+                // Position dual-channel labels
+                document.getElementById('waterfall-label-ch1').style.left = (50 + halfWidth / 2 - 50) + 'px';
+                document.getElementById('waterfall-label-ch2').style.left = (50 + halfWidth + halfWidth / 2 - 50) + 'px';
+
+                // Show and position channel divider
+                const divider = document.getElementById('channel-divider');
+                divider.style.display = 'block';
+                divider.style.left = (50 + halfWidth) + 'px';
+                divider.style.top = waterfallTop + 'px';
+                divider.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+
+                console.log('Canvas1: left=50px, width=' + halfWidth + 'px, buffer=' + canvas.width + 'px');
+                console.log('Canvas2: left=' + (50 + halfWidth) + 'px, width=' + halfWidth + 'px, buffer=' + canvas2.width + 'px, display=' + canvas2.style.display);
+                console.log('Divider: left=' + (50 + halfWidth) + 'px');
+            } else {
+                // Single-channel mode: full width
+                // Only change canvas dimensions if they actually changed (setting .width clears canvas!)
+                const viewWidth = window.innerWidth - 60;
+                const newWidth = Math.max(viewWidth, FFT_SIZE);
+                const newHeight = window.innerHeight - waterfallTop - waterfallBottom;
+
+                if (canvas.width !== newWidth || canvas.height !== newHeight) {
+                    console.log('Resizing canvas from ' + canvas.width + 'x' + canvas.height + ' to ' + newWidth + 'x' + newHeight);
+                    canvas.width = newWidth;
+                    canvas.height = newHeight;
+                }
+
+                canvas.style.top = waterfallTop + 'px';
+                canvas.style.left = '50px';
+                canvas.style.width = `calc(100% - 60px)`;
+                canvas.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+                canvas.style.display = 'block';
+
+                canvas2.style.display = 'none';
+
+                // Hide channel divider in single-channel mode
+                document.getElementById('channel-divider').style.display = 'none';
+
+                console.log('Single-channel: view=' + viewWidth + 'px, buffer=' + canvas.width + 'px');
+            }
+
+            // Spectrum and XCorr also benefit from high resolution
+            const specWidth = window.innerWidth - 60;
+            const newSpecWidth = Math.max(specWidth, FFT_SIZE);
+            const newSpecHeight = 200;
+
+            // Only resize if dimensions changed
+            if (spectrumCanvas.width !== newSpecWidth || spectrumCanvas.height !== newSpecHeight) {
+                spectrumCanvas.width = newSpecWidth;
+                spectrumCanvas.height = newSpecHeight;
+            }
+
+            // Ensure spectrum positioning matches waterfall
+            spectrumCanvas.style.left = '50px';
+            spectrumCanvas.style.width = `calc(100% - 60px)`;
+
+            if (showXCorr) {
+                const newXCorrWidth = Math.max(specWidth, FFT_SIZE);
+                const newXCorrHeight = 180;
+
+                if (xcorrCanvas.width !== newXCorrWidth || xcorrCanvas.height !== newXCorrHeight) {
+                    xcorrCanvas.width = newXCorrWidth;
+                    xcorrCanvas.height = newXCorrHeight;
+                }
+            }
+
+            updateTimeAxis();
+        }
+
+        // Fetch and display IQ constellation data
+        async function updateIQData() {
+            if (!showIQ) return;
+
+            try {
+                const response = await fetch('/iq_data?t=' + Date.now());
+                if (!response.ok) return;
+
+                const buffer = await response.arrayBuffer();
+                const data = new Int16Array(buffer);
+
+                // Data format: CH1_I (256), CH1_Q (256), CH2_I (256), CH2_Q (256)
+                const ch1_i = data.slice(0, IQ_SAMPLES);
+                const ch1_q = data.slice(IQ_SAMPLES, IQ_SAMPLES * 2);
+                const ch2_i = data.slice(IQ_SAMPLES * 2, IQ_SAMPLES * 3);
+                const ch2_q = data.slice(IQ_SAMPLES * 3, IQ_SAMPLES * 4);
+
+                // Debug: Check if we're getting non-zero data
+                const hasData = Math.max(...ch1_i.map(Math.abs), ...ch1_q.map(Math.abs)) > 0;
+                if (!hasData) {
+                    console.warn('IQ data appears to be all zeros');
+                }
+
+                drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q);
+            } catch (err) {
+                console.error('IQ data fetch error:', err);
+            }
+        }
+
+        // Fetch and display cross-correlation data
+        async function updateXCorrData() {
+            if (!showXCorr) return;
+
+            try {
+                const response = await fetch('/xcorr_data?t=' + Date.now());
+                if (!response.ok) return;
+
+                const buffer = await response.arrayBuffer();
+                const data = new Float32Array(buffer);
+
+                // Data format: magnitude (4096), phase (4096)
+                const halfLen = data.length / 2;
+                const magnitude = data.slice(0, halfLen);
+                const phase = data.slice(halfLen);
+
+                // Debug: Check if we're getting non-zero data
+                const maxMag = Math.max(...magnitude);
+                const maxPhase = Math.max(...phase.map(Math.abs));
+                if (maxMag === 0 && maxPhase === 0) {
+                    console.warn('XCorr data appears to be all zeros');
+                } else {
+                    console.log('XCorr data range - mag:', maxMag.toFixed(2), 'phase:', maxPhase.toFixed(2));
+                }
+
+                drawXCorr(magnitude, phase);
+            } catch (err) {
+                console.error('XCorr data fetch error:', err);
+            }
+        }
+
+        // Update link quality indicator
+        async function updateLinkQuality() {
+            try {
+                const response = await fetch('/link_quality');
+                if (!response.ok) return;
+
+                const data = await response.json();
+
+                // Update RTT
+                document.getElementById('rtt').textContent = data.rtt_ms.toFixed(0) + 'ms';
+
+                // Update bandwidth
+                const bw = data.bandwidth_kbps;
+                let bwStr = '';
+                if (bw >= 1000) {
+                    bwStr = (bw / 1000).toFixed(2) + 'Mbps';
+                } else {
+                    bwStr = bw.toFixed(0) + 'kbps';
+                }
+                document.getElementById('bandwidth').textContent = bwStr;
+
+                // Update link quality bar (5 bars based on quality)
+                const fps = data.fps;
+                const loss = data.packet_loss;
+                let bars = 5;
+
+                if (fps < 2 || loss > 0.3) bars = 1;
+                else if (fps < 5 || loss > 0.1) bars = 2;
+                else if (fps < 8 || loss > 0.05) bars = 3;
+                else if (fps < 9.5 || loss > 0.01) bars = 4;
+
+                const fullBars = '●'.repeat(bars);
+                const emptyBars = '○'.repeat(5 - bars);
+                const barEl = document.getElementById('link_quality_bar');
+                barEl.textContent = fullBars + emptyBars;
+
+                // Color code by quality
+                if (bars >= 4) {
+                    barEl.style.color = '#0f0';  // Green - excellent
+                } else if (bars >= 3) {
+                    barEl.style.color = '#ff0';  // Yellow - good
+                } else {
+                    barEl.style.color = '#f80';  // Orange/red - poor
+                }
+            } catch (err) {
+                console.error('Link quality fetch error:', err);
+            }
+        }
+
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // Initialize draggable panels
+        makeDraggable(document.getElementById('iq_constellation'));
+        makeDraggable(document.getElementById('xcorr_display'));
+
+        // Fetch and render FFT data
+        let fetchTimeout = null;
+
+        function updateWaterfall() {
+            const chSelect = document.getElementById('channel_select').value;
+
+            // Handle dual-channel mode
+            if (chSelect === 'both') {
+                updateWaterfallDualChannel();
+                return;
+            }
+
+            const ch = chSelect;
+
+            // Failsafe: force unlock after 5 seconds if fetch hangs
+            if (fetchTimeout) clearTimeout(fetchTimeout);
+            fetchTimeout = setTimeout(() => {
+                console.warn('Fetch timeout - forcing unlock');
+                isUpdating = false;
+            }, 5000);
+
+            fetch('/fft?ch=' + ch + '&t=' + Date.now(), {
+                method: 'GET',
+                cache: 'no-cache',
+                signal: fetchSignal
+            })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('HTTP ' + response.status);
+                    }
+                    return response.arrayBuffer();
+                })
+                .then(buffer => {
+                    clearTimeout(fetchTimeout);  // Cancel timeout on success
+
+                    let data = new Uint8Array(buffer);
+
+                    if (data.length !== FFT_SIZE) {
+                        console.warn('Size mismatch: got ' + data.length + ' bytes, expected ' + FFT_SIZE);
+                        isUpdating = false;
+                        return;
+                    }
+
+                    // Apply persistence mode if enabled
+                    data = applyPersistence(data);
+
+                    // Store latest FFT data for spectrum display
+                    latestFFTData = data;
+
+                    // Scroll canvas down by 1 pixel (GPU-accelerated)
+                    // Check canvas has valid dimensions before attempting scroll
+                    if (canvas.width > 0 && canvas.height > 1) {
+                        try {
+                            ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
+                        } catch (e) {
+                            // Canvas might be in intermediate state during resize, skip scroll
+                            console.warn('Canvas scroll skipped:', e.message);
+                        }
+                    }
+
+                    // Draw new FFT line at top
+                    const lineData = ctx.createImageData(canvas.width, 1);
+                    for (let x = 0; x < canvas.width; x++) {
+                        // Map canvas X to FFT bin, respecting zoom
+                        const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                        const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas.width) * zoomedBins);
+                        let value = data[fftIdx];
+
+                        value = value * waterfallIntensity;
+                        value = 128 + (value - 128) * waterfallContrast;
+                        value = Math.max(0, Math.min(255, value));
+
+                        const mag = value / 255.0;
+                        const [r, g, b] = getColorForValue(mag, signalAnalysis.colorPalette);
+                        const idx = x * 4;
+                        lineData.data[idx + 0] = r;
+                        lineData.data[idx + 1] = g;
+                        lineData.data[idx + 2] = b;
+                        lineData.data[idx + 3] = 255;
+                    }
+                    ctx.putImageData(lineData, 0, 0);
+
+                    // Capture recording frame if recording
+                    captureRecordingFrame(data);
+
+                    // Draw spectrum if enabled
+                    if (showSpectrum) {
+                        drawSpectrum(data);
+                    }
+
+                    // Update FPS counter
+                    frameCount++;
+                    const now = Date.now();
+                    if (now - lastFpsUpdate >= 1000) {
+                        measuredFPS = frameCount;  // Save measured FPS
+                        document.getElementById('fps').textContent = frameCount + ' FPS';
+                        updateTimeAxis();  // Update time labels when FPS updates
+                        frameCount = 0;
+                        lastFpsUpdate = now;
+                    }
+
+                    // Unlock after successful render
+                    isUpdating = false;
+                })
+                .catch(err => {
+                    clearTimeout(fetchTimeout);  // Cancel timeout on error
+                    // Don't log aborted fetches (intentional cleanup)
+                    if (err.name !== 'AbortError') {
+                        console.error('FFT fetch error:', err);
+                    }
+                    isUpdating = false;
+                });
+        }
+
+        // Update waterfall with dual-channel side-by-side
+        async function updateWaterfallDualChannel() {
+            try {
+                // Fetch both channels in parallel
+                const [ch1Response, ch2Response] = await Promise.all([
+                    fetch('/fft?ch=1&t=' + Date.now(), { signal: fetchSignal }),
+                    fetch('/fft?ch=2&t=' + Date.now(), { signal: fetchSignal })
+                ]);
+
+                if (!ch1Response.ok || !ch2Response.ok) {
+                    throw new Error('HTTP error');
+                }
+
+                const [ch1Buffer, ch2Buffer] = await Promise.all([
+                    ch1Response.arrayBuffer(),
+                    ch2Response.arrayBuffer()
+                ]);
+
+                let ch1Data = new Uint8Array(ch1Buffer);
+                let ch2Data = new Uint8Array(ch2Buffer);
+
+                if (ch1Data.length !== FFT_SIZE || ch2Data.length !== FFT_SIZE) {
+                    console.warn('Size mismatch in dual-channel mode');
+                    isUpdating = false;
+                    return;
+                }
+
+                // Apply persistence mode if enabled
+                ch1Data = applyPersistence(ch1Data);
+                ch2Data = applyPersistence(ch2Data);
+
+                // Store latest data for spectrum display
+                latestFFTData = ch1Data;
+                latestFFTData2 = ch2Data;
+
+                // Update CH1 waterfall (left)
+                if (canvas.width > 0 && canvas.height > 1) {
+                    try {
+                        ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
+                    } catch (e) {
+                        console.warn('Canvas CH1 scroll skipped:', e.message);
+                    }
+                }
+
+                const lineData1 = ctx.createImageData(canvas.width, 1);
+                for (let x = 0; x < canvas.width; x++) {
+                    // Map canvas X to FFT bin, respecting zoom
+                    const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                    const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas.width) * zoomedBins);
+                    let val = ch1Data[fftIdx];
+
+                    val = val * waterfallIntensity;
+                    val = 128 + (val - 128) * waterfallContrast;
+                    val = Math.max(0, Math.min(255, val));
+
+                    const rgb = getColorForValue(val / 255.0, signalAnalysis.colorPalette);
+                    const idx = x * 4;
+                    lineData1.data[idx + 0] = rgb[0];
+                    lineData1.data[idx + 1] = rgb[1];
+                    lineData1.data[idx + 2] = rgb[2];
+                    lineData1.data[idx + 3] = 255;
+                }
+                ctx.putImageData(lineData1, 0, 0);
+
+                // Update CH2 waterfall (right)
+                if (canvas2.width > 0 && canvas2.height > 1) {
+                    try {
+                        ctx2.drawImage(canvas2, 0, 0, canvas2.width, canvas2.height - 1, 0, 1, canvas2.width, canvas2.height - 1);
+                    } catch (e) {
+                        console.warn('Canvas CH2 scroll skipped:', e.message);
+                    }
+                }
+
+                const lineData2 = ctx2.createImageData(canvas2.width, 1);
+                for (let x = 0; x < canvas2.width; x++) {
+                    // Map canvas X to FFT bin, respecting zoom
+                    const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                    const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas2.width) * zoomedBins);
+                    let val = ch2Data[fftIdx];
+
+                    val = val * waterfallIntensity;
+                    val = 128 + (val - 128) * waterfallContrast;
+                    val = Math.max(0, Math.min(255, val));
+
+                    const rgb = getColorForValue(val / 255.0, signalAnalysis.colorPalette);
+                    const idx = x * 4;
+                    lineData2.data[idx + 0] = rgb[0];
+                    lineData2.data[idx + 1] = rgb[1];
+                    lineData2.data[idx + 2] = rgb[2];
+                    lineData2.data[idx + 3] = 255;
+                }
+                ctx2.putImageData(lineData2, 0, 0);
+
+                // Update FPS counter
+                frameCount++;
+                const now = Date.now();
+                if (now - lastFpsUpdate >= 1000) {
+                    measuredFPS = frameCount;
+                    document.getElementById('fps').textContent = frameCount + ' FPS (Dual)';
+                    updateTimeAxis();
+                    frameCount = 0;
+                    lastFpsUpdate = now;
+                }
+
+                // Draw spectrum if enabled
+                if (showSpectrum && latestFFTData && latestFFTData2) {
+                    drawSpectrum(latestFFTData, latestFFTData2);
+                }
+
+                isUpdating = false;
+            } catch (err) {
+                console.error('Dual-channel waterfall error:', err);
+                isUpdating = false;
+            }
+        }
+
+        // Draw FFT spectrum (SDR++/sigdigger style)
+        function drawSpectrum(data, data2) {
+            if (!data) return;
+
+            const width = spectrumCanvas.width;
+            const height = spectrumCanvas.height;
+
+            // Clear canvas with dark background
+            spectrumCtx.fillStyle = '#0a0a0a';
+            spectrumCtx.fillRect(0, 0, width, height);
+
+            // Draw horizontal grid lines (more visible)
+            spectrumCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            spectrumCtx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                spectrumCtx.beginPath();
+                spectrumCtx.moveTo(0, y);
+                spectrumCtx.lineTo(width, y);
+                spectrumCtx.stroke();
+            }
+
+            // Draw vertical grid lines
+            spectrumCtx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
+            for (let i = 0; i <= 10; i++) {
+                const x = (width / 10) * i;
+                spectrumCtx.beginPath();
+                spectrumCtx.moveTo(x, 0);
+                spectrumCtx.lineTo(x, height);
+                spectrumCtx.stroke();
+            }
+
+            // Enable smoothing for better visual quality
+            spectrumCtx.imageSmoothingEnabled = true;
+            spectrumCtx.imageSmoothingQuality = 'high';
+
+            // Calculate Y-axis mapping based on current zoom/scroll range
+            const dbRange = spectrumMaxDb - spectrumMinDb;
+
+            // Store path for gradient fill
+            spectrumCtx.beginPath();
+            spectrumCtx.moveTo(0, height);
+
+            // Draw spectrum line with gradient color based on amplitude
+            const points = [];
+            for (let x = 0; x < width; x++) {
+                // Map canvas X to FFT bin, respecting zoom
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const fftIdx = zoomState.zoomStartBin + Math.floor((x / width) * zoomedBins);
+                const raw = data[fftIdx];
+                const magDb = rawToDb(raw);
+
+                // Map magnitude to visible range
+                const normalizedMag = Math.max(0, Math.min(1, (magDb - spectrumMinDb) / dbRange));
+                const y = height - (normalizedMag * height);
+                points.push({ x: x, y: y, mag: normalizedMag });
+
+                spectrumCtx.lineTo(x, y);
+            }
+
+            // Complete the path for fill
+            spectrumCtx.lineTo(width, height);
+            spectrumCtx.closePath();
+
+            // Create gradient fill (green-yellow gradient like SDR++)
+            const gradient = spectrumCtx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');    // Yellow at top (strong signals)
+            gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');  // Green
+            gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');  // Cyan
+            gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');    // Blue at bottom (noise floor)
+
+            spectrumCtx.fillStyle = gradient;
+            spectrumCtx.fill();
+
+            // Draw spectrum line with variable color
+            spectrumCtx.lineJoin = 'round';
+            spectrumCtx.lineCap = 'round';
+            spectrumCtx.lineWidth = 1.5;
+
+            // Draw line with gradient based on signal strength
+            for (let i = 0; i < points.length - 1; i++) {
+                const p1 = points[i];
+                const p2 = points[i + 1];
+
+                // Color based on magnitude (green-yellow gradient)
+                const mag = (p1.mag + p2.mag) / 2;
+                if (mag > 0.8) {
+                    spectrumCtx.strokeStyle = '#ffff00';  // Yellow for strong signals
+                } else if (mag > 0.5) {
+                    spectrumCtx.strokeStyle = '#88ff00';  // Yellow-green
+                } else if (mag > 0.3) {
+                    spectrumCtx.strokeStyle = '#00ff88';  // Green-cyan
+                } else {
+                    spectrumCtx.strokeStyle = '#00ffff';  // Cyan for weak signals
+                }
+
+                spectrumCtx.beginPath();
+                spectrumCtx.moveTo(p1.x, p1.y);
+                spectrumCtx.lineTo(p2.x, p2.y);
+                spectrumCtx.stroke();
+            }
+
+            // Draw dB scale labels (now shows scrolled/zoomed range)
+            spectrumCtx.fillStyle = '#888';
+            spectrumCtx.font = '10px monospace';
+            spectrumCtx.textAlign = 'right';
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
+                spectrumCtx.fillText(dbValue + ' dB', width - 5, y + 3);
+            }
+
+            // Draw Y-axis range indicator (top-left of spectrum)
+            // Always show if not at default range
+            if (spectrumMinDb !== -100 || spectrumMaxDb !== -10) {
+                spectrumCtx.fillStyle = 'rgba(255, 255, 0, 0.8)';
+                spectrumCtx.font = 'bold 11px monospace';
+                spectrumCtx.textAlign = 'left';
+                spectrumCtx.fillText(`Range: ${spectrumMinDb.toFixed(0)}-${spectrumMaxDb.toFixed(0)} dBFS`, 5, 15);
+                spectrumCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+                spectrumCtx.font = '10px monospace';
+                spectrumCtx.fillText('(Scroll: pan, Ctrl+Scroll: zoom, DblClick: reset)', 5, 28);
+            }
+
+            // Draw markers on spectrum (from marker_system.js)
+            if (typeof drawMarkersOnSpectrum === 'function') {
+                drawMarkersOnSpectrum(spectrumCtx, width, height);
+            }
+        }
+
+        // Toggle spectrum display
+        function toggleSpectrum() {
+            showSpectrum = !showSpectrum;
+            const button = document.getElementById('spectrum_toggle');
+            const timeAxis = document.getElementById('time-axis');
+            const freqAxis = document.getElementById('freq-axis');
+
+            if (showSpectrum) {
+                spectrumCanvas.style.display = 'block';
+                button.classList.add('active');
+                timeAxis.style.top = '250px';
+            } else {
+                spectrumCanvas.style.display = 'none';
+                button.classList.remove('active');
+                timeAxis.style.top = '50px';
+            }
+
+            resizeCanvas();
+        }
+
+        // Toggle IQ constellation display
+        function toggleIQ() {
+            showIQ = !showIQ;
+            const button = document.getElementById('iq_toggle');
+            const panel = document.getElementById('iq_constellation');
+
+            if (showIQ) {
+                panel.style.display = 'block';
+                button.classList.add('active');
+                // Only resize if dimensions changed (setting .width clears canvas!)
+                if (iqCanvas.width !== 320 || iqCanvas.height !== 300) {
+                    iqCanvas.width = 320;
+                    iqCanvas.height = 300;
+                }
+            } else {
+                panel.style.display = 'none';
+                button.classList.remove('active');
+            }
+
+            // No need to call resizeCanvas() - IQ plot doesn't affect waterfall layout
+        }
+
+        // Toggle cross-correlation display
+        function toggleXCorr() {
+            showXCorr = !showXCorr;
+            const button = document.getElementById('xcorr_toggle');
+            const panel = document.getElementById('xcorr_display');
+
+            if (showXCorr) {
+                panel.style.display = 'block';
+                button.classList.add('active');
+                // Only resize if dimensions changed (setting .width clears canvas!)
+                if (xcorrCanvas.width !== 600 || xcorrCanvas.height !== 200) {
+                    xcorrCanvas.width = 600;
+                    xcorrCanvas.height = 200;
+                }
+            } else {
+                panel.style.display = 'none';
+                button.classList.remove('active');
+            }
+
+            // Update waterfall positioning without clearing canvas
+            const waterfallTop = showSpectrum ? 250 : 50;
+            const waterfallBottom = showXCorr ? 210 : 30;
+
+            // Only update CSS dimensions, not canvas buffer (which would clear it)
+            canvas.style.top = waterfallTop + 'px';
+            canvas.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+            canvas2.style.top = waterfallTop + 'px';
+            canvas2.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+
+            // Update divider position if dual channel
+            const divider = document.getElementById('channel-divider');
+            divider.style.top = waterfallTop + 'px';
+            divider.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+        }
+
+        // Draw IQ constellation plot
+        function drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q) {
+            const width = iqCanvas.width;
+            const height = iqCanvas.height;
+
+            // Clear canvas
+            iqCtx.fillStyle = '#0a0a0a';
+            iqCtx.fillRect(0, 0, width, height);
+
+            // Draw grid
+            iqCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            iqCtx.lineWidth = 1;
+
+            // Crosshairs
+            iqCtx.beginPath();
+            iqCtx.moveTo(width / 2, 0);
+            iqCtx.lineTo(width / 2, height);
+            iqCtx.moveTo(0, height / 2);
+            iqCtx.lineTo(width, height / 2);
+            iqCtx.stroke();
+
+            // Circle markers
+            for (let r of [0.25, 0.5, 0.75, 1.0]) {
+                iqCtx.beginPath();
+                iqCtx.arc(width / 2, height / 2, r * (width / 2 - 10), 0, 2 * Math.PI);
+                iqCtx.stroke();
+            }
+
+            // Draw IQ samples
+            const scale = (width / 2 - 10) / 32768;  // Scale int16 to canvas
+
+            // Channel 1 (cyan)
+            iqCtx.fillStyle = 'rgba(0, 255, 255, 0.6)';
+            for (let i = 0; i < IQ_SAMPLES; i++) {
+                const x = width / 2 + ch1_i[i] * scale;
+                const y = height / 2 - ch1_q[i] * scale;
+                iqCtx.fillRect(x - 1, y - 1, 2, 2);
+            }
+
+            // Channel 2 (orange)
+            iqCtx.fillStyle = 'rgba(255, 165, 0, 0.6)';
+            for (let i = 0; i < IQ_SAMPLES; i++) {
+                const x = width / 2 + ch2_i[i] * scale;
+                const y = height / 2 - ch2_q[i] * scale;
+                iqCtx.fillRect(x - 1, y - 1, 2, 2);
+            }
+
+            // Labels
+            iqCtx.fillStyle = '#888';
+            iqCtx.font = '11px monospace';
+            iqCtx.textAlign = 'left';
+            iqCtx.fillText('IQ Constellation', 5, 15);
+            iqCtx.fillText('RX1', 5, 30);
+            iqCtx.fillStyle = '#0ff';
+            iqCtx.fillRect(25, 23, 10, 2);
+            iqCtx.fillStyle = '#888';
+            iqCtx.fillText('RX2', 40, 30);
+            iqCtx.fillStyle = '#ffa500';
+            iqCtx.fillRect(60, 23, 10, 2);
+        }
+
+        // Draw cross-correlation display
+        function drawXCorr(magnitude, phase) {
+            const width = xcorrCanvas.width;
+            const height = xcorrCanvas.height;
+
+            // Clear canvas
+            xcorrCtx.fillStyle = '#0a0a0a';
+            xcorrCtx.fillRect(0, 0, width, height);
+
+            // Draw grid
+            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            xcorrCtx.lineWidth = 1;
+            for (let i = 0; i <= 4; i++) {
+                const y = (height / 2 / 4) * i;
+                xcorrCtx.beginPath();
+                xcorrCtx.moveTo(0, y);
+                xcorrCtx.lineTo(width, y);
+                xcorrCtx.moveTo(0, height / 2 + y);
+                xcorrCtx.lineTo(width, height / 2 + y);
+                xcorrCtx.stroke();
+            }
+
+            // Draw magnitude (top half)
+            xcorrCtx.strokeStyle = '#00ff00';
+            xcorrCtx.lineWidth = 1.5;
+            xcorrCtx.beginPath();
+            for (let x = 0; x < width; x++) {
+                const idx = Math.floor((x / width) * magnitude.length);
+                const mag = Math.min(1.0, magnitude[idx]);
+                const y = (height / 2) * (1 - mag);
+                if (x === 0) {
+                    xcorrCtx.moveTo(x, y);
+                } else {
+                    xcorrCtx.lineTo(x, y);
+                }
+            }
+            xcorrCtx.stroke();
+
+            // Draw phase (bottom half)
+            xcorrCtx.strokeStyle = '#ffaa00';
+            xcorrCtx.lineWidth = 1.5;
+            xcorrCtx.beginPath();
+            for (let x = 0; x < width; x++) {
+                const idx = Math.floor((x / width) * phase.length);
+                const ph = phase[idx] / Math.PI;  // Normalize to -1 to 1
+                const y = height / 2 + (height / 4) + (ph * height / 4);
+                if (x === 0) {
+                    xcorrCtx.moveTo(x, y);
+                } else {
+                    xcorrCtx.lineTo(x, y);
+                }
+            }
+            xcorrCtx.stroke();
+
+            // Labels
+            xcorrCtx.fillStyle = '#888';
+            xcorrCtx.font = '11px monospace';
+            xcorrCtx.fillText('Magnitude', 5, 15);
+            xcorrCtx.fillText('Phase (rad)', 5, height / 2 + 15);
+
+            // Center line for phase
+            xcorrCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            xcorrCtx.beginPath();
+            xcorrCtx.moveTo(0, height * 0.75);
+            xcorrCtx.lineTo(width, height * 0.75);
+            xcorrCtx.stroke();
+        }
+
+        // Track bandwidth for display
+        let currentBandwidth = 40000000;
+
+        // Update frequency axis labels
+        function updateFreqAxis(centerFreq, sampleRate, bandwidth) {
+            const freqAxisEl = document.getElementById('freq-axis');
+            currentBandwidth = bandwidth || sampleRate;  // Store for overlay rendering
+
+            // Calculate frequency range based on zoom state
+            const binWidth = sampleRate / FFT_SIZE;  // Hz per FFT bin
+            const fullStartFreq = centerFreq - sampleRate / 2;
+
+            // When zoomed, show only the zoomed frequency range
+            const startBinOffset = zoomState.zoomStartBin * binWidth;
+            const endBinOffset = (zoomState.zoomEndBin + 1) * binWidth;
+
+            const startFreq = fullStartFreq + startBinOffset;
+            const endFreq = fullStartFreq + endBinOffset;
+            const displayBandwidth = endFreq - startFreq;
+
+            const formatFreq = (freq) => {
+                if (freq >= 1e9) return (freq / 1e9).toFixed(3) + ' GHz';
+                if (freq >= 1e6) return (freq / 1e6).toFixed(2) + ' MHz';
+                if (freq >= 1e3) return (freq / 1e3).toFixed(1) + ' kHz';
+                return freq.toFixed(0) + ' Hz';
+            };
+
+            let html = '<span>' + formatFreq(startFreq) + '</span>';
+
+            // Add 3 intermediate labels (using display bandwidth, which accounts for zoom)
+            for (let i = 1; i <= 3; i++) {
+                const freq = startFreq + (displayBandwidth * i / 4);
+                html += '<span>' + formatFreq(freq) + '</span>';
+            }
+
+            html += '<span>' + formatFreq(endFreq) + '</span>';
+
+            // Add bandwidth indicator if BW < SR
+            if (bandwidth < sampleRate) {
+                const bwSpan = (bandwidth / sampleRate * 100).toFixed(0);
+                html += `<span style="color: #ff0; margin-left: 20px;">BW: ${(bandwidth/1e6).toFixed(1)} MHz (${bwSpan}% of SR)</span>`;
+            }
+
+            freqAxisEl.innerHTML = html;
+        }
+
+        // Update time axis labels
+        function updateTimeAxis() {
+            const timeAxisEl = document.getElementById('time-axis');
+            const canvasHeight = canvas.height;
+            const totalSeconds = Math.floor(canvasHeight / measuredFPS);
+
+            let html = '<span style="color: #0ff;">NOW</span>';
+
+            // Add time labels at regular intervals
+            const intervals = 5;
+            for (let i = 1; i <= intervals; i++) {
+                const seconds = Math.floor(totalSeconds * (i / intervals));
+                html += '<span>-' + seconds + 's</span>';
+            }
+
+            timeAxisEl.innerHTML = html;
+        }
+
+        // Update status
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                const ch = document.getElementById('channel_select').value;
+
+                document.getElementById('freq').textContent = (data.freq / 1e6).toFixed(2) + ' MHz';
+                document.getElementById('sr').textContent = (data.sr / 1e6).toFixed(1) + ' MHz';
+                document.getElementById('gain').textContent = (ch === '1' ? data.g1 : data.g2) + ' dB';
+
+                // Update control panel inputs with current values (only if not focused)
+                const freqInput = document.getElementById('freqInput');
+                const srInput = document.getElementById('srInput');
+                const bwInput = document.getElementById('bwInput');
+                const gain1Input = document.getElementById('gain1Input');
+                const gain2Input = document.getElementById('gain2Input');
+
+                if (document.activeElement !== freqInput) {
+                    freqInput.value = (data.freq / 1e6).toFixed(2);
+                }
+                if (document.activeElement !== srInput) {
+                    srInput.value = (data.sr / 1e6).toFixed(1);
+                }
+                if (document.activeElement !== bwInput) {
+                    bwInput.value = (data.bw / 1e6).toFixed(1);
+                }
+                if (document.activeElement !== gain1Input) {
+                    gain1Input.value = data.g1;
+                }
+                if (document.activeElement !== gain2Input) {
+                    gain2Input.value = data.g2;
+                }
+
+                // Calculate and display frequency resolution
+                const binResolution = data.sr / FFT_SIZE;
+                let resText = '';
+                if (binResolution >= 1000) {
+                    resText = (binResolution / 1000).toFixed(2) + ' kHz/bin';
+                } else {
+                    resText = binResolution.toFixed(0) + ' Hz/bin';
+                }
+                document.getElementById('resolution').textContent = resText;
+
+                // Update zoom level indicator
+                updateZoomIndicator();
+
+                // Update frequency axis
+                updateFreqAxis(data.freq, data.sr, data.bw);
+
+                // Update zoom state with current parameters
+                updateZoomState(data.freq, data.sr);
+            } catch (err) {
+                console.error('Status update failed:', err);
+            }
+        }
+
+        // Toggle control panel visibility
+        function toggleControlPanel() {
+            const panel = document.getElementById('controlPanel');
+            const toggle = document.getElementById('toggleControls');
+            const isHidden = panel.style.display === 'none' || panel.style.display === '';
+
+            if (isHidden) {
+                panel.style.display = 'block';
+                toggle.textContent = 'Close';
+                toggle.style.background = 'rgba(255, 100, 100, 0.3)';
+            } else {
+                panel.style.display = 'none';
+                toggle.textContent = 'Controls';
+                toggle.style.background = '';
+            }
+        }
+
+        // Apply frequency change
+        async function applyFrequency() {
+            const freq = parseFloat(document.getElementById('freqInput').value);
+            if (isNaN(freq) || freq < 47 || freq > 6000) {
+                alert('Frequency must be between 47 and 6000 MHz');
+                return;
+            }
+
+            const currentSR = zoomState.fullBandwidth || 40000000;
+            await sendControlUpdate(Math.floor(freq * 1e6), currentSR, null, null, null);
+        }
+
+        // Apply sample rate change
+        async function applySampleRate() {
+            const sr = parseFloat(document.getElementById('srInput').value);
+            if (isNaN(sr) || sr < 0.52 || sr > 61.44) {
+                alert('Sample rate must be between 0.52 and 61.44 MHz');
+                return;
+            }
+
+            const currentFreq = zoomState.centerFreq || 915000000;
+            await sendControlUpdate(currentFreq, Math.floor(sr * 1e6), null, null, null);
+        }
+
+        // Apply bandwidth change
+        async function applyBandwidth() {
+            const bw = parseFloat(document.getElementById('bwInput').value);
+            if (isNaN(bw) || bw < 0.52 || bw > 61.44) {
+                alert('Bandwidth must be between 0.52 and 61.44 MHz');
+                return;
+            }
+
+            const currentFreq = zoomState.centerFreq || 915000000;
+            const currentSR = zoomState.fullBandwidth || 40000000;
+            await sendControlUpdate(currentFreq, currentSR, Math.floor(bw * 1e6), null, null);
+        }
+
+        // Apply gain RX1 change
+        async function applyGain1() {
+            const gain = parseInt(document.getElementById('gain1Input').value);
+            if (isNaN(gain) || gain < 0 || gain > 60) {
+                alert('Gain must be between 0 and 60 dB');
+                return;
+            }
+
+            await sendControlUpdate(null, null, null, gain, null);
+        }
+
+        // Apply gain RX2 change
+        async function applyGain2() {
+            const gain = parseInt(document.getElementById('gain2Input').value);
+            if (isNaN(gain) || gain < 0 || gain > 60) {
+                alert('Gain must be between 0 and 60 dB');
+                return;
+            }
+
+            await sendControlUpdate(null, null, null, null, gain);
+        }
+
+        function updateWaterfallIntensity(value) {
+            waterfallIntensity = parseFloat(value);
+            document.getElementById('intensityValue').textContent = parseFloat(value).toFixed(1) + 'x';
+        }
+
+        function updateWaterfallContrast(value) {
+            waterfallContrast = parseFloat(value);
+            document.getElementById('contrastValue').textContent = parseFloat(value).toFixed(1) + 'x';
+        }
+
+        function updateSpectrumRange() {
+            spectrumMinDb = parseInt(document.getElementById('spectrumMin').value);
+            spectrumMaxDb = parseInt(document.getElementById('spectrumMax').value);
+        }
+
+        // Apply quality profile settings
+        function applyQualityProfile() {
+            const profile = document.getElementById('qualityProfile').value;
+
+            if (profile === 'custom') {
+                return;  // User controls everything manually
+            }
+
+            // High quality: all features enabled
+            if (profile === 'high') {
+                // Enable all displays
+                if (!showSpectrum) toggleSpectrum();
+                if (!showIQ) toggleIQ();
+                if (!showXCorr) toggleXCorr();
+
+                console.log('Quality profile: HIGH (all features enabled)');
+            }
+            // Medium quality: spectrum and IQ only
+            else if (profile === 'medium') {
+                if (!showSpectrum) toggleSpectrum();
+                if (!showIQ) toggleIQ();
+                if (showXCorr) toggleXCorr();  // Disable XCorr
+
+                console.log('Quality profile: MEDIUM (spectrum + IQ only)');
+            }
+            // Low quality: waterfall only
+            else if (profile === 'low') {
+                if (showSpectrum) toggleSpectrum();  // Disable all extras
+                if (showIQ) toggleIQ();
+                if (showXCorr) toggleXCorr();
+
+                console.log('Quality profile: LOW (waterfall only)');
+            }
+        }
+
+        // ===== Configuration Preset Management =====
+
+        // Get current configuration from all UI elements
+        function getCurrentConfig() {
+            return {
+                frequency: parseFloat(document.getElementById('freqInput').value) * 1e6,
+                sampleRate: parseFloat(document.getElementById('srInput').value) * 1e6,
+                bandwidth: parseFloat(document.getElementById('bwInput').value) * 1e6,
+                gain1: parseInt(document.getElementById('gain1Input').value),
+                gain2: parseInt(document.getElementById('gain2Input').value),
+                waterfallIntensity: parseFloat(document.getElementById('waterfallIntensity').value),
+                waterfallContrast: parseFloat(document.getElementById('waterfallContrast').value),
+                spectrumMin: parseInt(document.getElementById('spectrumMin').value),
+                spectrumMax: parseInt(document.getElementById('spectrumMax').value),
+                channel: currentChannel
+            };
+        }
+
+        // Apply a configuration to all UI elements
+        async function applyConfig(config) {
+            if (config.frequency !== undefined) {
+                document.getElementById('freqInput').value = (config.frequency / 1e6).toFixed(3);
+            }
+            if (config.sampleRate !== undefined) {
+                document.getElementById('srInput').value = (config.sampleRate / 1e6).toFixed(2);
+            }
+            if (config.bandwidth !== undefined) {
+                document.getElementById('bwInput').value = (config.bandwidth / 1e6).toFixed(2);
+            }
+            if (config.gain1 !== undefined) {
+                document.getElementById('gain1Input').value = config.gain1;
+            }
+            if (config.gain2 !== undefined) {
+                document.getElementById('gain2Input').value = config.gain2;
+            }
+            if (config.waterfallIntensity !== undefined) {
+                document.getElementById('waterfallIntensity').value = config.waterfallIntensity;
+                updateWaterfallIntensity(config.waterfallIntensity);
+            }
+            if (config.waterfallContrast !== undefined) {
+                document.getElementById('waterfallContrast').value = config.waterfallContrast;
+                updateWaterfallContrast(config.waterfallContrast);
+            }
+            if (config.spectrumMin !== undefined) {
+                document.getElementById('spectrumMin').value = config.spectrumMin;
+                updateSpectrumRange();
+            }
+            if (config.spectrumMax !== undefined) {
+                document.getElementById('spectrumMax').value = config.spectrumMax;
+                updateSpectrumRange();
+            }
+            if (config.channel !== undefined) {
+                currentChannel = config.channel;
+            }
+
+            // Apply RF settings to device
+            await sendControlUpdate(
+                config.frequency || null,
+                config.sampleRate || null,
+                config.bandwidth || null,
+                config.gain1 || null,
+                config.gain2 || null
+            );
+        }
+
+        // Save current configuration as a preset
+        function savePreset() {
+            const presetName = document.getElementById('presetName').value.trim();
+
+            if (!presetName) {
+                alert('Please enter a preset name');
+                return;
+            }
+
+            const config = getCurrentConfig();
+            const presets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
+
+            presets[presetName] = {
+                config: config,
+                timestamp: new Date().toISOString()
+            };
+
+            localStorage.setItem('bladerfsensor_webserver_presets', JSON.stringify(presets));
+            refreshPresetList();
+            alert('Preset "' + presetName + '" saved successfully');
+            document.getElementById('presetName').value = '';
+        }
+
+        // Load a preset configuration
+        async function loadPreset() {
+            const presetName = document.getElementById('presetSelect').value;
+
+            if (!presetName) {
+                return;
+            }
+
+            const presets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
+            const preset = presets[presetName];
+
+            if (!preset) {
+                alert('Preset "' + presetName + '" not found');
+                return;
+            }
+
+            await applyConfig(preset.config);
+            alert('Preset "' + presetName + '" loaded successfully');
+        }
+
+        // Delete the currently selected preset
+        function deletePreset() {
+            const presetName = document.getElementById('presetSelect').value;
+
+            if (!presetName) {
+                alert('Please select a preset to delete');
+                return;
+            }
+
+            if (!confirm('Are you sure you want to delete the preset "' + presetName + '"?')) {
+                return;
+            }
+
+            const presets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
+            delete presets[presetName];
+            localStorage.setItem('bladerfsensor_webserver_presets', JSON.stringify(presets));
+
+            refreshPresetList();
+            alert('Preset "' + presetName + '" deleted successfully');
+        }
+
+        // Export all presets to a JSON file
+        function exportPresets() {
+            const presets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
+
+            if (Object.keys(presets).length === 0) {
+                alert('No presets to export');
+                return;
+            }
+
+            const dataStr = JSON.stringify(presets, null, 2);
+            const dataBlob = new Blob([dataStr], { type: 'application/json' });
+            const url = URL.createObjectURL(dataBlob);
+
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'bladerfsensor_webserver_presets_' + new Date().toISOString().split('T')[0] + '.json';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            alert('Exported ' + Object.keys(presets).length + ' preset(s)');
+        }
+
+        // Trigger file input for importing presets
+        function importPresets() {
+            document.getElementById('presetImportFile').click();
+        }
+
+        // Handle imported preset file
+        function handlePresetImport(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const importedPresets = JSON.parse(e.target.result);
+                    const currentPresets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
+
+                    let importedCount = 0;
+                    for (const name in importedPresets) {
+                        if (importedPresets[name].config) {
+                            currentPresets[name] = importedPresets[name];
+                            importedCount++;
+                        }
+                    }
+
+                    localStorage.setItem('bladerfsensor_webserver_presets', JSON.stringify(currentPresets));
+                    refreshPresetList();
+                    alert('Imported ' + importedCount + ' preset(s) successfully');
+                } catch (error) {
+                    alert('Error importing presets: Invalid file format');
+                }
+            };
+            reader.readAsText(file);
+
+            // Reset the file input
+            event.target.value = '';
+        }
+
+        // Refresh the preset dropdown list
+        function refreshPresetList() {
+            const presets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
+            const select = document.getElementById('presetSelect');
+
+            // Clear existing options except the first one
+            select.innerHTML = '<option value="">-- Select --</option>';
+
+            // Add presets sorted alphabetically
+            const sortedNames = Object.keys(presets).sort();
+            for (let i = 0; i < sortedNames.length; i++) {
+                const name = sortedNames[i];
+                const option = document.createElement('option');
+                option.value = name;
+                option.textContent = name;
+                select.appendChild(option);
+            }
+        }
+
+        // Initialize preset list on page load
+        window.addEventListener('load', function() {
+            refreshPresetList();
+            updateRecordMode();  // Initialize recording UI
+        });
+
+        // ===== Recording Functions =====
+        let isRecording = false;
+        let recordedFrames = [];
+        let recordingStartTime = null;
+        let recordingTimer = null;
+        let recordingConfig = {};
+
+        function updateRecordMode() {
+            const mode = document.getElementById('recordMode').value;
+            const bandControls = document.getElementById('recordBandControls');
+            if (mode === 'band') {
+                bandControls.style.display = '';
+            } else {
+                bandControls.style.display = 'none';
+            }
+        }
+
+        function toggleRecording() {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        }
+
+        function startRecording() {
+            const duration = parseInt(document.getElementById('recordDuration').value);
+            if (!duration || duration < 1 || duration > 300) {
+                alert('Please set a valid duration (1-300 seconds)');
+                return;
+            }
+
+            const mode = document.getElementById('recordMode').value;
+            const freq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+            const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
+
+            recordingConfig = {
+                duration: duration,
+                mode: mode,
+                centerFreq: freq,
+                sampleRate: sr,
+                startTime: new Date().toISOString()
+            };
+
+            if (mode === 'band') {
+                const centerMHz = parseFloat(document.getElementById('recordCenterFreq').value);
+                const bwMHz = parseFloat(document.getElementById('recordBandwidth').value);
+                if (!centerMHz || !bwMHz) {
+                    alert('Please enter valid center frequency and bandwidth');
+                    return;
+                }
+                recordingConfig.recordCenterFreq = centerMHz * 1e6;
+                recordingConfig.recordBandwidth = bwMHz * 1e6;
+            }
+
+            isRecording = true;
+            recordedFrames = [];
+            recordingStartTime = Date.now();
+
+            document.getElementById('recordButton').textContent = '⏹ Stop Recording';
+            document.getElementById('recordButton').style.background = '#ff0000';
+
+            recordingTimer = setTimeout(() => {
+                stopRecording();
+            }, duration * 1000);
+
+            updateRecordingStatus();
+        }
+
+        function stopRecording() {
+            if (!isRecording) return;
+            isRecording = false;
+
+            if (recordingTimer) {
+                clearTimeout(recordingTimer);
+                recordingTimer = null;
+            }
+
+            document.getElementById('recordButton').textContent = '⏺ Start Recording';
+            document.getElementById('recordButton').style.background = '';
+
+            if (recordedFrames.length === 0) {
+                alert('No data recorded');
+                document.getElementById('recordingStatus').textContent = 'Ready';
+                return;
+            }
+
+            saveRecordingAsWAV();
+            document.getElementById('recordingStatus').textContent = 'Ready';
+            document.getElementById('recordingStatus').style.color = '#888';
+        }
+
+        function updateRecordingStatus() {
+            if (!isRecording) return;
+            const elapsed = (Date.now() - recordingStartTime) / 1000;
+            document.getElementById('recordingStatus').textContent =
+                'Recording... ' + elapsed.toFixed(1) + 's (' + recordedFrames.length + ' frames)';
+            document.getElementById('recordingStatus').style.color = '#ff0000';
+            setTimeout(updateRecordingStatus, 100);
+        }
+
+        function captureRecordingFrame(data) {
+            if (!isRecording || !data) return;
+            recordedFrames.push({
+                timestamp: Date.now() - recordingStartTime,
+                data: [...data]
+            });
+        }
+
+        function saveRecordingAsWAV() {
+            if (recordedFrames.length === 0) return;
+
+            const audioSampleRate = 48000;
+            const numChannels = 2;
+            const bitsPerSample = 16;
+
+            // Generate filename
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+            let filename = 'bladerf-rec-' + timestamp;
+
+            if (recordingConfig.mode === 'band') {
+                const freqMHz = (recordingConfig.recordCenterFreq / 1e6).toFixed(1);
+                const bwMHz = (recordingConfig.recordBandwidth / 1e6).toFixed(1);
+                filename += '-' + freqMHz + 'MHz-BW' + bwMHz + 'MHz';
+            } else {
+                const freqMHz = (recordingConfig.centerFreq / 1e6).toFixed(1);
+                filename += '-' + freqMHz + 'MHz-full';
+            }
+
+            filename += '.wav';
+
+            // Create WAV file
+            const wavData = createWAVFileWebServer(recordedFrames, audioSampleRate, numChannels, bitsPerSample);
+
+            // Download
+            const blob = new Blob([wavData], { type: 'audio/wav' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            // Save metadata
+            saveRecordingMetadataWebServer(filename.replace('.wav', '.json'));
+        }
+
+        function createWAVFileWebServer(frames, sampleRate, numChannels, bitsPerSample) {
+            const samplesPerFrame = Math.floor(sampleRate / 20);
+            const totalSamples = frames.length * samplesPerFrame;
+            const fftBins = frames[0].data.length;
+            const dataSize = totalSamples * numChannels * (bitsPerSample / 8);
+            const buffer = new ArrayBuffer(44 + dataSize);
+            const view = new DataView(buffer);
+
+            // WAV Header
+            writeStringWebServer(view, 0, 'RIFF');
+            view.setUint32(4, 36 + dataSize, true);
+            writeStringWebServer(view, 8, 'WAVE');
+            writeStringWebServer(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true);
+            view.setUint16(32, numChannels * (bitsPerSample / 8), true);
+            view.setUint16(34, bitsPerSample, true);
+            writeStringWebServer(view, 36, 'data');
+            view.setUint32(40, dataSize, true);
+
+            // Write audio data
+            let offset = 44;
+            for (let frameIdx = 0; frameIdx < frames.length; frameIdx++) {
+                const frame = frames[frameIdx];
+                for (let s = 0; s < samplesPerFrame; s++) {
+                    const binIdx = Math.floor((s / samplesPerFrame) * fftBins);
+                    const magnitude = frame.data[binIdx] || 0;
+                    const audioSample = Math.floor((magnitude / 255) * 32767) - 16384;
+                    view.setInt16(offset, audioSample, true);
+                    offset += 2;
+                    view.setInt16(offset, audioSample, true);
+                    offset += 2;
+                }
+            }
+            return buffer;
+        }
+
+        function writeStringWebServer(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+
+        function saveRecordingMetadataWebServer(filename) {
+            const metadata = {
+                recording: {
+                    startTime: recordingConfig.startTime,
+                    duration: recordingConfig.duration,
+                    frames: recordedFrames.length,
+                    mode: recordingConfig.mode
+                },
+                rf: {
+                    centerFrequency: recordingConfig.centerFreq,
+                    sampleRate: recordingConfig.sampleRate,
+                    fftSize: FFT_SIZE
+                },
+                timestamp: new Date().toISOString()
+            };
+
+            if (recordingConfig.mode === 'band') {
+                metadata.recording.recordCenterFreq = recordingConfig.recordCenterFreq;
+                metadata.recording.recordBandwidth = recordingConfig.recordBandwidth;
+            }
+
+            const metadataStr = JSON.stringify(metadata, null, 2);
+            const blob = new Blob([metadataStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }
+
+        // Export spectrum data to CSV with metadata
+        function exportSpectrumCSV() {
+            if (!latestFFTData || latestFFTData.length === 0) {
+                alert('No spectrum data available to export');
+                return;
+            }
+
+            const timestamp = new Date().toISOString();
+            const dateStr = new Date().toLocaleString();
+
+            // Get current RF settings
+            const freq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+            const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
+            const bw = parseFloat(document.getElementById('bwInput').value) * 1e6;
+            const gain = parseInt(document.getElementById(currentChannel === 1 ? 'gain1Input' : 'gain2Input').value);
+
+            // Build CSV with metadata header
+            let csv = '# bladeRF Spectrum Data Export\n';
+            csv += '# Export Date: ' + dateStr + '\n';
+            csv += '# Timestamp: ' + timestamp + '\n';
+            csv += '#\n';
+            csv += '# Configuration:\n';
+            csv += '# Center Frequency: ' + (freq / 1e6).toFixed(3) + ' MHz\n';
+            csv += '# Sample Rate: ' + (sr / 1e6).toFixed(2) + ' MHz\n';
+            csv += '# Bandwidth: ' + (bw / 1e6).toFixed(2) + ' MHz\n';
+            csv += '# Channel: RX' + currentChannel + '\n';
+            csv += '# Gain: ' + gain + ' dB\n';
+            csv += '# FFT Size: ' + FFT_SIZE + '\n';
+            csv += '#\n';
+            csv += '# Display Settings:\n';
+            csv += '# Waterfall Intensity: ' + waterfallIntensity.toFixed(1) + 'x\n';
+            csv += '# Waterfall Contrast: ' + waterfallContrast.toFixed(1) + 'x\n';
+            csv += '# Spectrum Range: ' + spectrumMinDb + ' to ' + spectrumMaxDb + ' dBFS\n';
+            csv += '#\n';
+            csv += '# Data Format:\n';
+            csv += '# Frequency (Hz), Magnitude (raw), Power (dBFS)\n';
+            csv += '#\n';
+
+            // Column headers
+            csv += 'Frequency_Hz,Magnitude_Raw,Power_dBFS\n';
+
+            // Export data with both raw and dBFS values
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const binFreq = freq - (sr / 2) + (i * sr / FFT_SIZE);
+                const raw = latestFFTData[i];
+                const dBFS = rawToDb(raw);
+                csv += binFreq.toFixed(0) + ',' + raw.toFixed(2) + ',' + dBFS.toFixed(2) + '\n';
+            }
+
+            // Create download
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'bladerf-spectrum-' + timestamp.replace(/[:.]/g, '-') + '.csv';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            alert('Spectrum data exported (' + latestFFTData.length + ' bins)');
+        }
+
+        // Send control update to server
+        async function sendControlUpdate(freq, sr, bw, gain1, gain2) {
+            const payload = {};
+            if (freq !== null) payload.freq = freq;
+            if (sr !== null) payload.sr = sr;
+            if (bw !== null) payload.bw = bw;
+            if (gain1 !== null) payload.gain1 = gain1;
+            if (gain2 !== null) payload.gain2 = gain2;
+
+            console.log('Sending control update:', payload);
+
+            try {
+                const response = await fetch('/control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    console.log('Control update successful');
+                    // Clear canvas for fresh data
+                    ctx.fillStyle = '#000';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                } else {
+                    console.error('Control update failed:', result);
+                    alert('Error: ' + (result.error || 'Unknown error'));
+                }
+            } catch (err) {
+                console.error('Control request error:', err);
+                alert('Failed to send control update');
+            }
+        }
+
+        // Continuous update loop using requestAnimationFrame
+        let lastUpdateTime = 0;
+        let isUpdating = false;
+
+        function updateLoop(timestamp) {
+            // Only start new fetch if previous one finished
+            // Throttle to 100ms (10 Hz) to match server update rate
+            if (!isUpdating && timestamp - lastUpdateTime >= 100) {
+                isUpdating = true;
+                lastUpdateTime = timestamp;
+                updateWaterfall();
+                // DO NOT unlock here - fetch will unlock when complete
+            }
+            requestAnimationFrame(updateLoop);
+        }
+
+        // AbortController to cancel all pending fetches
+        const abortController = new AbortController();
+        const fetchSignal = abortController.signal;
+
+        // Start the update loop
+        let animationFrameId = requestAnimationFrame(updateLoop);
+
+        // Store interval IDs for cleanup
+        const intervals = [];
+        intervals.push(setInterval(updateStatus, 2000));
+        intervals.push(setInterval(updateIQData, 100));
+        intervals.push(setInterval(updateXCorrData, 500));
+        intervals.push(setInterval(updateLinkQuality, 1000));
+
+        // Cleanup function
+        function cleanup() {
+            console.log('RX page cleanup - aborting all requests');
+            abortController.abort();  // Cancel all pending fetches
+            intervals.forEach(id => clearInterval(id));
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+        }
+
+        // Cleanup intervals when leaving page
+        window.addEventListener('beforeunload', cleanup);
+        window.addEventListener('pagehide', cleanup);
+
+        // CRITICAL: Stop all fetch loops when leaving
+        window.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                cleanup();
+            }
+        });
+
+        // Initial updates
+        updateStatus();
+        updateLinkQuality();
+
+        // Toggle button handlers
+        document.getElementById('spectrum_toggle').addEventListener('click', toggleSpectrum);
+        // Note: iq_toggle and xcorr_toggle removed in favor of workspace tabs
+        // document.getElementById('iq_toggle').addEventListener('click', toggleIQ);
+        // document.getElementById('xcorr_toggle').addEventListener('click', toggleXCorr);
+
+        // Spectrum Y-axis scroll/zoom handler
+        spectrumCanvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            console.log('Spectrum wheel event:', e.deltaY, 'Ctrl:', e.ctrlKey);
+
+            if (e.ctrlKey) {
+                // Ctrl+wheel = zoom
+                const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+                const oldRange = spectrumMaxDb - spectrumMinDb;
+                const newRange = Math.max(20, Math.min(400, oldRange * zoomFactor)); // Min 20, max 400 dB range
+                const center = (spectrumMinDb + spectrumMaxDb) / 2;
+
+                spectrumMinDb = Math.max(-50, center - newRange / 2);
+                spectrumMaxDb = Math.min(350, center + newRange / 2);
+            } else {
+                // Regular wheel = scroll (shift the window up/down)
+                const scrollAmount = e.deltaY * 0.5;
+                const range = spectrumMaxDb - spectrumMinDb;
+
+                // Shift both min and max by the same amount
+                let newMin = spectrumMinDb + scrollAmount;
+                let newMax = spectrumMaxDb + scrollAmount;
+
+                // Allow extended range for scrolling (data is 0-255, but allow viewing beyond)
+                const minLimit = -50;   // Allow scrolling below 0 to see noise floor
+                const maxLimit = 350;   // Allow scrolling above 255 to accommodate strong signals
+
+                // Clamp to extended range while maintaining window size
+                if (newMin < minLimit) {
+                    newMin = minLimit;
+                    newMax = minLimit + range;
+                }
+                if (newMax > maxLimit) {
+                    newMax = maxLimit;
+                    newMin = maxLimit - range;
+                }
+
+                spectrumMinDb = newMin;
+                spectrumMaxDb = newMax;
+            }
+
+            console.log('New range:', spectrumMinDb, 'to', spectrumMaxDb);
+
+            // Redraw spectrum with new range
+            if (latestFFTData) {
+                drawSpectrum(latestFFTData);
+            }
+        });
+
+        console.log('Spectrum event listeners attached');
+
+        // Double-click to reset spectrum Y-axis to default range
+        spectrumCanvas.addEventListener('dblclick', () => {
+            spectrumMinDb = 75;
+            spectrumMaxDb = 225;
+            console.log('Spectrum Y-axis reset to default range: 75-225');
+            if (latestFFTData) {
+                drawSpectrum(latestFFTData);
+            }
+        });
+
+        // Channel change handler
+        document.getElementById('channel_select').addEventListener('change', () => {
+            // Clear canvas when switching channels
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            if (canvas2) {
+                ctx2.fillStyle = '#000';
+                ctx2.fillRect(0, 0, canvas2.width, canvas2.height);
+            }
+            // Resize to handle dual-channel layout
+            resizeCanvas();
+        });
+
+        // ===== INTERACTIVE ZOOM FUNCTIONALITY =====
+        // Display-only zoom (no hardware reconfiguration)
+        // Note: zoomState is declared at the top of the script
+
+        // Update zoom state from server status
+        function updateZoomState(freq, sr) {
+            zoomState.centerFreq = freq;
+            zoomState.fullBandwidth = sr;
+        }
+
+        // Update zoom level indicator in header
+        function updateZoomIndicator() {
+            const indicator = document.getElementById('zoom_indicator');
+            const levelSpan = document.getElementById('zoom_level');
+
+            if (!zoomState.isZoomed) {
+                indicator.style.display = 'none';
+            } else {
+                indicator.style.display = 'inline';
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const zoomFactor = Math.round(FFT_SIZE / zoomedBins);
+                levelSpan.textContent = zoomFactor + 'x';
+            }
+        }
+
+        // Canvas mouse handlers for zoom selection
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.button === 0) {  // Left click
+                zoomState.isSelecting = true;
+                zoomState.startX = e.offsetX;
+                zoomState.currentX = e.offsetX;
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (zoomState.isSelecting) {
+                zoomState.currentX = e.offsetX;
+                drawSelectionBox();
+            }
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (e.button === 0 && zoomState.isSelecting) {
+                zoomState.isSelecting = false;
+                const x1 = Math.min(zoomState.startX, zoomState.currentX);
+                const x2 = Math.max(zoomState.startX, zoomState.currentX);
+
+                // Only zoom if selection is at least 20 pixels wide
+                if (x2 - x1 > 20) {
+                    applyZoom(x1, x2);
+                }
+                // Clear selection box
+                drawSelectionBox(true);
+            }
+        });
+
+        canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            zoomOut();
+            return false;
+        });
+
+        // Draw selection box overlay
+        function drawSelectionBox(clear = false) {
+            // This is a visual overlay - we'll use a second canvas
+            let overlayCanvas = document.getElementById('overlay');
+            if (!overlayCanvas) {
+                overlayCanvas = document.createElement('canvas');
+                overlayCanvas.id = 'overlay';
+                overlayCanvas.style.position = 'fixed';
+                overlayCanvas.style.top = '50px';
+                overlayCanvas.style.left = '60px';
+                overlayCanvas.style.pointerEvents = 'none';
+                overlayCanvas.style.zIndex = '100';
+                canvas.parentElement.appendChild(overlayCanvas);
+            }
+
+            overlayCanvas.width = canvas.width;
+            overlayCanvas.height = canvas.height;
+            const octx = overlayCanvas.getContext('2d');
+            octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+            if (!clear && zoomState.isSelecting) {
+                const x1 = Math.min(zoomState.startX, zoomState.currentX);
+                const x2 = Math.max(zoomState.startX, zoomState.currentX);
+                const width = x2 - x1;
+
+                // Semi-transparent selection box
+                octx.fillStyle = 'rgba(0, 255, 255, 0.1)';
+                octx.fillRect(x1, 0, width, canvas.height);
+
+                // Border
+                octx.strokeStyle = '#0ff';
+                octx.lineWidth = 2;
+                octx.strokeRect(x1, 0, width, canvas.height);
+
+                // Frequency labels on selection (respect current zoom)
+                const currentSR = zoomState.fullBandwidth;
+                const currentCF = zoomState.centerFreq;
+                const fullStartFreq = currentCF - currentSR / 2;
+
+                // Calculate frequency range currently displayed (respecting zoom)
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const binWidth = currentSR / FFT_SIZE;
+                const displayedStartFreq = fullStartFreq + (zoomState.zoomStartBin * binWidth);
+                const displayedBandwidth = zoomedBins * binWidth;
+
+                const freq1 = displayedStartFreq + (x1 / canvas.width) * displayedBandwidth;
+                const freq2 = displayedStartFreq + (x2 / canvas.width) * displayedBandwidth;
+                const bw = freq2 - freq1;
+
+                octx.fillStyle = '#0ff';
+                octx.font = '12px monospace';
+                octx.fillText(`BW: ${(bw / 1e6).toFixed(2)} MHz`, x1 + 5, 20);
+            }
+        }
+
+        // Apply display zoom to selected region (no hardware reconfiguration)
+        function applyZoom(x1, x2) {
+            // Calculate FFT bin indices for the selected region
+            // Map canvas X coordinates to FFT bins, respecting current zoom
+            const currentZoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+            const bin1 = zoomState.zoomStartBin + Math.floor((x1 / canvas.width) * currentZoomedBins);
+            const bin2 = zoomState.zoomStartBin + Math.floor((x2 / canvas.width) * currentZoomedBins);
+
+            // Set zoom region
+            zoomState.zoomStartBin = Math.max(0, bin1);
+            zoomState.zoomEndBin = Math.min(FFT_SIZE - 1, bin2);
+            zoomState.isZoomed = true;
+
+            const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+            const zoomFactor = (FFT_SIZE / zoomedBins).toFixed(1);
+
+            console.log(`Display zoom: bins ${zoomState.zoomStartBin}-${zoomState.zoomEndBin} (${zoomedBins} bins, ${zoomFactor}x)`);
+
+            updateZoomIndicator();
+            updateTimeAxis();  // Update frequency labels
+        }
+
+        // Zoom out to full spectrum
+        function zoomOut() {
+            if (!zoomState.isZoomed) {
+                console.log('Already at full spectrum');
+                return;
+            }
+
+            console.log('Zooming out to full spectrum');
+
+            // Reset to full spectrum
+            zoomState.zoomStartBin = 0;
+            zoomState.zoomEndBin = FFT_SIZE - 1;
+            zoomState.isZoomed = false;
+
+            updateZoomIndicator();
+            updateTimeAxis();  // Update frequency labels
+        }
+
+        // ========================================================================
+        // ADVANCED SIGNAL ANALYSIS FEATURES
+        // ========================================================================
+
+        // Note: signalAnalysis is declared at the top of the script
+
+        // Demodulator state
+        let demodulator = {
+            active: false,
+            mode: 'off',
+            audioCtx: null,
+            oscillator: null,
+            gainNode: null,
+            scriptNode: null,
+            sampleBuffer: [],
+            phase: 0,
+            lastSample: 0
+        };
+
+        // ===== COLOR PALETTE FUNCTIONS =====
+
+        // Color palette implementations
+        function getColorForValue(value, palette) {
+            value = Math.max(0, Math.min(1, value));
+
+            switch(palette) {
+                case 'viridis':
+                    return viridisColor(value);
+                case 'plasma':
+                    return plasmaColor(value);
+                case 'inferno':
+                    return infernoColor(value);
+                case 'turbo':
+                    return turboColor(value);
+                case 'hot':
+                    return hotColor(value);
+                case 'cool':
+                    return coolColor(value);
+                case 'grayscale':
+                    return grayscaleColor(value);
+                case 'rainbow':
+                    return rainbowColor(value);
+                default:
+                    return viridisColor(value);
+            }
+        }
+
+        function plasmaColor(t) {
+            const r = Math.floor(255 * (0.05 + 2.4*t - 5.1*t*t + 3.8*t*t*t));
+            const g = Math.floor(255 * (0.02 + 1.7*t - 1.9*t*t));
+            const b = Math.floor(255 * (0.6 + 1.3*t - 1.6*t*t));
+            return [Math.max(0, Math.min(255, r)), Math.max(0, Math.min(255, g)), Math.max(0, Math.min(255, b))];
+        }
+
+        function infernoColor(t) {
+            const r = Math.floor(255 * Math.min(1, 1.8*t));
+            const g = Math.floor(255 * Math.max(0, 1.5*t - 0.5));
+            const b = Math.floor(255 * Math.max(0, 3*t - 2));
+            return [r, g, b];
+        }
+
+        function turboColor(t) {
+            const r = Math.floor(255 * (0.13 + 1.5*t - 2.7*t*t + 2.2*t*t*t));
+            const g = Math.floor(255 * (-0.01 + 2.6*t - 3.5*t*t + 1.9*t*t*t));
+            const b = Math.floor(255 * (0.7 - 1.5*t + 2.3*t*t - 1.5*t*t*t));
+            return [Math.max(0, Math.min(255, r)), Math.max(0, Math.min(255, g)), Math.max(0, Math.min(255, b))];
+        }
+
+        function hotColor(t) {
+            let r, g, b;
+            if (t < 0.4) {
+                r = 255 * (t / 0.4);
+                g = 0;
+                b = 0;
+            } else if (t < 0.7) {
+                r = 255;
+                g = 255 * ((t - 0.4) / 0.3);
+                b = 0;
+            } else {
+                r = 255;
+                g = 255;
+                b = 255 * ((t - 0.7) / 0.3);
+            }
+            return [Math.floor(r), Math.floor(g), Math.floor(b)];
+        }
+
+        function coolColor(t) {
+            const r = Math.floor(255 * t);
+            const g = Math.floor(255 * (1 - t));
+            const b = 255;
+            return [r, g, b];
+        }
+
+        function grayscaleColor(t) {
+            const v = Math.floor(255 * t);
+            return [v, v, v];
+        }
+
+        function rainbowColor(t) {
+            const h = t * 360;
+            const s = 1;
+            const v = 1;
+            const c = v * s;
+            const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+            const m = v - c;
+            let r, g, b;
+            if (h < 60) { r = c; g = x; b = 0; }
+            else if (h < 120) { r = x; g = c; b = 0; }
+            else if (h < 180) { r = 0; g = c; b = x; }
+            else if (h < 240) { r = 0; g = x; b = c; }
+            else if (h < 300) { r = x; g = 0; b = c; }
+            else { r = c; g = 0; b = x; }
+            return [Math.floor((r + m) * 255), Math.floor((g + m) * 255), Math.floor((b + m) * 255)];
+        }
+
+        function changeColorPalette() {
+            signalAnalysis.colorPalette = document.getElementById('colorPalette').value;
+            console.log('Changed color palette to:', signalAnalysis.colorPalette);
+        }
+
+        // ===== PERSISTENCE DISPLAY MODES =====
+
+        function changePersistenceMode() {
+            const mode = document.getElementById('persistence_mode').value;
+            signalAnalysis.persistenceMode = mode;
+
+            if (mode === 'none') {
+                signalAnalysis.persistenceData = null;
+                signalAnalysis.avgCount = 0;
+            } else if (!signalAnalysis.persistenceData) {
+                signalAnalysis.persistenceData = new Uint8Array(FFT_SIZE);
+                if (mode === 'min') {
+                    signalAnalysis.persistenceData.fill(255);
+                }
+            }
+
+            console.log('Persistence mode:', mode);
+        }
+
+        function resetPersistence() {
+            signalAnalysis.persistenceData = null;
+            signalAnalysis.avgCount = 0;
+            console.log('Persistence reset');
+        }
+
+        function applyPersistence(data) {
+            if (signalAnalysis.persistenceMode === 'none') {
+                return data;
+            }
+
+            if (!signalAnalysis.persistenceData) {
+                signalAnalysis.persistenceData = new Uint8Array(data);
+                return data;
+            }
+
+            const result = new Uint8Array(data.length);
+
+            switch(signalAnalysis.persistenceMode) {
+                case 'max':
+                    for (let i = 0; i < data.length; i++) {
+                        signalAnalysis.persistenceData[i] = Math.max(signalAnalysis.persistenceData[i], data[i]);
+                        result[i] = signalAnalysis.persistenceData[i];
+                    }
+                    break;
+
+                case 'min':
+                    for (let i = 0; i < data.length; i++) {
+                        signalAnalysis.persistenceData[i] = Math.min(signalAnalysis.persistenceData[i], data[i]);
+                        result[i] = signalAnalysis.persistenceData[i];
+                    }
+                    break;
+
+                case 'avg':
+                    signalAnalysis.avgCount++;
+                    for (let i = 0; i < data.length; i++) {
+                        signalAnalysis.persistenceData[i] = (signalAnalysis.persistenceData[i] * (signalAnalysis.avgCount - 1) + data[i]) / signalAnalysis.avgCount;
+                        result[i] = Math.floor(signalAnalysis.persistenceData[i]);
+                    }
+                    break;
+
+                case 'decay':
+                    for (let i = 0; i < data.length; i++) {
+                        signalAnalysis.persistenceData[i] = Math.max(
+                            signalAnalysis.persistenceData[i] * signalAnalysis.persistenceDecayRate,
+                            data[i]
+                        );
+                        result[i] = Math.floor(signalAnalysis.persistenceData[i]);
+                    }
+                    break;
+            }
+
+            return result;
+        }
+
+        // ===== SIGNAL MEASUREMENT FUNCTIONS =====
+
+        // NOTE: rawToDb already defined in main scope with correct formula
+        // DO NOT redefine - use the global version: (raw / 255.0) * 120.0 - 100.0
+        // This maps 0-255 to -100dB to +20dB (120dB range) matching C++ compute_magnitude_db()
+
+        function updateMeasurements() {
+            if (!latestFFTData || latestFFTData.length === 0) {
+                console.log('No FFT data available');
+                return;
+            }
+
+            const data = latestFFTData;
+            let peakRaw = 0;
+            let sumRaw = 0;
+
+            // Find peak and calculate average
+            for (let i = 0; i < data.length; i++) {
+                peakRaw = Math.max(peakRaw, data[i]);
+                sumRaw += data[i];
+            }
+
+            const avgRaw = sumRaw / data.length;
+            const peakDb = rawToDb(peakRaw);
+            const avgDb = rawToDb(avgRaw);
+
+            // Estimate noise floor (lowest 10% of bins)
+            const sorted = Array.from(data).sort((a, b) => a - b);
+            const noiseFloorIdx = Math.floor(sorted.length * 0.1);
+            const noiseFloorRaw = sorted[noiseFloorIdx];
+            const noiseFloorDb = rawToDb(noiseFloorRaw);
+
+            // Calculate SNR
+            const snr = peakDb - noiseFloorDb;
+
+            // Calculate occupied bandwidth (-3dB points)
+            // Raw data is quantized dB: raw = (dB + 100) / 120 * 255
+            // For -3dB: threshold_raw = peakRaw - (3 / 120 * 255) = peakRaw - 6.375
+            const threshold3db = peakRaw - 6.375;
+            let firstIdx = -1, lastIdx = -1;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] >= threshold3db) {
+                    if (firstIdx === -1) firstIdx = i;
+                    lastIdx = i;
+                }
+            }
+
+            const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
+            const obw = firstIdx >= 0 ? ((lastIdx - firstIdx) * sr / FFT_SIZE) / 1e6 : 0;
+
+            // Update display
+            document.getElementById('meas_peak_power').textContent = peakDb.toFixed(1);
+            document.getElementById('meas_avg_power').textContent = avgDb.toFixed(1);
+            document.getElementById('meas_noise_floor').textContent = noiseFloorDb.toFixed(1);
+            document.getElementById('meas_snr').textContent = snr.toFixed(1);
+            document.getElementById('meas_obw').textContent = obw.toFixed(3);
+
+            console.log('Measurements updated:', { peakDb, avgDb, noiseFloorDb, snr, obw });
+        }
+
+        // ===== PEAK DETECTION =====
+
+        function detectPeaks() {
+            if (!latestFFTData || latestFFTData.length === 0) {
+                alert('No FFT data available');
+                return;
+            }
+
+            const threshold = parseFloat(document.getElementById('peak_threshold').value);
+            // Convert dB threshold to raw using correct 120 dB range formula
+            const thresholdRaw = ((threshold + 100) / 120) * 255;
+            const data = latestFFTData;
+            const peaks = [];
+
+            // Find peaks above threshold with local maxima detection
+            for (let i = 10; i < data.length - 10; i++) {
+                if (data[i] > thresholdRaw) {
+                    // Check if local maximum
+                    let isMax = true;
+                    for (let j = i - 5; j <= i + 5; j++) {
+                        if (j !== i && data[j] > data[i]) {
+                            isMax = false;
+                            break;
+                        }
+                    }
+
+                    if (isMax) {
+                        const freq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+                        const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
+                        const binFreq = freq - (sr / 2) + (i * sr / FFT_SIZE);
+                        const powerDb = rawToDb(data[i]);
+
+                        peaks.push({ bin: i, freq: binFreq, power: powerDb });
+                    }
+                }
+            }
+
+            // Sort by power
+            peaks.sort((a, b) => b.power - a.power);
+
+            // Display top 20 peaks
+            const listDiv = document.getElementById('peak_list');
+            if (peaks.length === 0) {
+                listDiv.innerHTML = '<div style="color: #888;">No peaks found above threshold</div>';
+            } else {
+                let html = '<table style="width: 100%; font-size: 10px;"><tr><th>Freq (MHz)</th><th>Power (dBFS)</th></tr>';
+                for (let i = 0; i < Math.min(peaks.length, 20); i++) {
+                    const p = peaks[i];
+                    html += `<tr><td>${(p.freq / 1e6).toFixed(3)}</td><td>${p.power.toFixed(1)}</td></tr>`;
+                }
+                html += '</table>';
+                listDiv.innerHTML = html;
+            }
+
+            signalAnalysis.peakMarkers = peaks.slice(0, 20);
+            console.log('Detected', peaks.length, 'peaks');
+        }
+
+        // ===== BOOKMARK SYSTEM =====
+
+        function addBookmark() {
+            const name = document.getElementById('bookmark_name').value.trim();
+            if (!name) {
+                alert('Please enter a signal name');
+                return;
+            }
+
+            const freq = parseFloat(document.getElementById('freqInput').value);
+            const bookmark = {
+                name: name,
+                freq: freq,
+                timestamp: new Date().toISOString()
+            };
+
+            signalAnalysis.bookmarks.push(bookmark);
+            localStorage.setItem('signal_bookmarks', JSON.stringify(signalAnalysis.bookmarks));
+            updateBookmarkList();
+            document.getElementById('bookmark_name').value = '';
+            console.log('Bookmark added:', bookmark);
+        }
+
+        function updateBookmarkList() {
+            const listDiv = document.getElementById('bookmark_list');
+            if (!listDiv) return;  // Element doesn't exist, skip silently
+
+            if (signalAnalysis.bookmarks.length === 0) {
+                listDiv.innerHTML = '<div style="color: #888;">No bookmarks</div>';
+                return;
+            }
+
+            let html = '';
+            signalAnalysis.bookmarks.forEach((b, idx) => {
+                html += `<div style="margin: 2px 0; padding: 3px; background: #111; border-radius: 2px;">
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #0ff;">${b.name}</span>
+                        <button onclick="deleteBookmark(${idx})" style="padding: 0 4px; font-size: 9px;">×</button>
+                    </div>
+                    <div style="color: #888; font-size: 9px;">${b.freq.toFixed(3)} MHz</div>
+                </div>`;
+            });
+            listDiv.innerHTML = html;
+        }
+
+        function deleteBookmark(idx) {
+            signalAnalysis.bookmarks.splice(idx, 1);
+            localStorage.setItem('signal_bookmarks', JSON.stringify(signalAnalysis.bookmarks));
+            updateBookmarkList();
+        }
+
+        // ===== MEASUREMENT CURSORS =====
+
+        function toggleCursors() {
+            signalAnalysis.cursorsEnabled = !signalAnalysis.cursorsEnabled;
+            const btn = document.getElementById('cursor_toggle');
+            btn.classList.toggle('active', signalAnalysis.cursorsEnabled);
+
+            const overlay = document.getElementById('cursor_overlay');
+            overlay.style.pointerEvents = signalAnalysis.cursorsEnabled ? 'auto' : 'none';
+
+            if (!signalAnalysis.cursorsEnabled) {
+                const ctx = overlay.getContext('2d');
+                ctx.clearRect(0, 0, overlay.width, overlay.height);
+            }
+
+            console.log('Cursors:', signalAnalysis.cursorsEnabled ? 'enabled' : 'disabled');
+        }
+
+        // Setup cursor overlay
+        const cursorOverlay = document.getElementById('cursor_overlay');
+        cursorOverlay.width = window.innerWidth;
+        cursorOverlay.height = window.innerHeight;
+
+        cursorOverlay.addEventListener('mousemove', (e) => {
+            if (!signalAnalysis.cursorsEnabled) return;
+
+            signalAnalysis.cursorPos.x = e.clientX;
+            signalAnalysis.cursorPos.y = e.clientY;
+
+            drawCursors();
+        });
+
+        function drawCursors() {
+            if (!signalAnalysis.cursorsEnabled || !signalAnalysis.cursorPos.x) return;
+
+            const overlay = document.getElementById('cursor_overlay');
+            const ctx = overlay.getContext('2d');
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+            // Draw crosshair
+            ctx.strokeStyle = '#0ff';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([5, 5]);
+
+            // Vertical line
+            ctx.beginPath();
+            ctx.moveTo(signalAnalysis.cursorPos.x, 0);
+            ctx.lineTo(signalAnalysis.cursorPos.x, overlay.height);
+            ctx.stroke();
+
+            // Horizontal line
+            ctx.beginPath();
+            ctx.moveTo(0, signalAnalysis.cursorPos.y);
+            ctx.lineTo(overlay.width, signalAnalysis.cursorPos.y);
+            ctx.stroke();
+
+            ctx.setLineDash([]);
+
+            // Calculate and display frequency
+            const canvas = document.getElementById('waterfall');
+            if (canvas) {
+                const rect = canvas.getBoundingClientRect();
+                const x = signalAnalysis.cursorPos.x - rect.left;
+
+                if (x >= 0 && x <= rect.width) {
+                    const freq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+                    const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
+                    const binFreq = freq - (sr / 2) + ((x / rect.width) * sr);
+
+                    // Draw frequency label
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                    ctx.fillRect(signalAnalysis.cursorPos.x + 5, signalAnalysis.cursorPos.y - 30, 150, 25);
+                    ctx.fillStyle = '#0ff';
+                    ctx.font = '12px monospace';
+                    ctx.fillText(`${(binFreq / 1e6).toFixed(3)} MHz`, signalAnalysis.cursorPos.x + 10, signalAnalysis.cursorPos.y - 10);
+                }
+            }
+        }
+
+        window.addEventListener('resize', () => {
+            cursorOverlay.width = window.innerWidth;
+            cursorOverlay.height = window.innerHeight;
+        });
+
+        // ===== COMPREHENSIVE DEMODULATION ENGINE (Phase 3) =====
+
+        // Enhanced demodulator state with audio processing chain
+        let demodState = {
+            active: false,
+            mode: 'off',
+            audioCtx: null,
+            audioWorklet: null,
+            gainNode: null,
+            audioBuffer: [],
+            sampleBuffer: 4096,
+            audioSampleRate: 48000,
+
+            // Demodulator state variables
+            lastPhase: 0,
+            dcI: 0,
+            dcQ: 0,
+            dcAlpha: 0.001,
+            agcGain: 1.0,
+            agcTarget: 0.3,
+            agcAttack: 0.1,
+            agcDecay: 0.001,
+
+            // Audio filter (simple IIR lowpass)
+            filterState: [0, 0],
+            filterCoeffs: { a: [1, -0.95], b: [0.025, 0.025] },
+
+            // Squelch
+            squelchOpen: false,
+            squelchLevel: -100,
+
+            // Digital demod state
+            symbolBuffer: [],
+            bitBuffer: [],
+            symbolRate: 1200,
+            lastSymbolTime: 0,
+
+            // Statistics
+            audioLevel: 0,
+            snrEstimate: 0,
+            freqOffset: 0
+        };
+
+        // Multi-signal tracking system
+        let signalTracker = {
+            signals: [],  // Array of tracked signals
+            maxSignals: 20,
+            detectionThreshold: -80,  // dBm
+            updateInterval: null,
+
+            addSignal: function(freq, power, bandwidth) {
+                const existing = this.signals.find(s => Math.abs(s.freq - freq) < bandwidth/2);
+                if (existing) {
+                    existing.power = power;
+                    existing.lastSeen = Date.now();
+                    existing.duration += 0.1;
+                } else if (this.signals.length < this.maxSignals) {
+                    this.signals.push({
+                        id: Date.now(),
+                        freq: freq,
+                        power: power,
+                        bandwidth: bandwidth,
+                        firstSeen: Date.now(),
+                        lastSeen: Date.now(),
+                        duration: 0,
+                        classification: 'Unknown'
+                    });
+                }
+            },
+
+            removeStale: function() {
+                const now = Date.now();
+                this.signals = this.signals.filter(s => (now - s.lastSeen) < 2000);
+            },
+
+            detectHopping: function() {
+                // Detect frequency hopping by analyzing timing patterns
+                const recentSignals = this.signals.filter(s => s.duration < 1.0);
+                if (recentSignals.length >= 3) {
+                    // Check if signals have similar timing patterns
+                    const timeDiffs = [];
+                    for (let i = 1; i < recentSignals.length; i++) {
+                        timeDiffs.push(recentSignals[i].firstSeen - recentSignals[i-1].firstSeen);
+                    }
+                    const avgDiff = timeDiffs.reduce((a,b) => a+b, 0) / timeDiffs.length;
+                    const variance = timeDiffs.reduce((sum, d) => sum + Math.pow(d - avgDiff, 2), 0) / timeDiffs.length;
+
+                    if (variance < avgDiff * 0.2) {  // Low variance = regular hopping
+                        return {
+                            detected: true,
+                            hopRate: 1000 / avgDiff,
+                            channels: recentSignals.map(s => s.freq)
+                        };
+                    }
+                }
+                return { detected: false };
+            }
+        };
+
+        // Interference analysis engine
+        let interferenceAnalyzer = {
+            harmonics: [],
+            imdProducts: [],
+
+            detectHarmonics: function(spectrum, fundamentalFreq, centerFreq, sampleRate) {
+                this.harmonics = [];
+                const binWidth = sampleRate / spectrum.length;
+                const startFreq = centerFreq - sampleRate / 2;
+
+                // Check up to 10th harmonic
+                for (let n = 2; n <= 10; n++) {
+                    const harmonicFreq = fundamentalFreq * n;
+                    if (harmonicFreq > centerFreq + sampleRate/2) break;
+
+                    const bin = Math.floor((harmonicFreq - startFreq) / binWidth);
+                    if (bin >= 0 && bin < spectrum.length) {
+                        const power = (spectrum[bin] / 255.0) * 120 - 100;
+                        if (power > -80) {
+                            this.harmonics.push({
+                                order: n,
+                                freq: harmonicFreq,
+                                power: power,
+                                bin: bin
+                            });
+                        }
+                    }
+                }
+                return this.harmonics;
+            },
+
+            detectIMD: function(spectrum, signal1Freq, signal2Freq, centerFreq, sampleRate) {
+                this.imdProducts = [];
+                const binWidth = sampleRate / spectrum.length;
+                const startFreq = centerFreq - sampleRate / 2;
+
+                // Check 3rd order IMD products: 2*f1 - f2 and 2*f2 - f1
+                const imd3_1 = 2 * signal1Freq - signal2Freq;
+                const imd3_2 = 2 * signal2Freq - signal1Freq;
+
+                for (const imdFreq of [imd3_1, imd3_2]) {
+                    if (imdFreq < startFreq || imdFreq > centerFreq + sampleRate/2) continue;
+
+                    const bin = Math.floor((imdFreq - startFreq) / binWidth);
+                    if (bin >= 0 && bin < spectrum.length) {
+                        const power = (spectrum[bin] / 255.0) * 120 - 100;
+                        if (power > -80) {
+                            this.imdProducts.push({
+                                order: 3,
+                                freq: imdFreq,
+                                power: power,
+                                signal1: signal1Freq,
+                                signal2: signal2Freq
+                            });
+                        }
+                    }
+                }
+                return this.imdProducts;
+            },
+
+            recommendMitigation: function() {
+                const recommendations = [];
+
+                if (this.harmonics.length > 0) {
+                    recommendations.push({
+                        type: 'Harmonics Detected',
+                        severity: 'Medium',
+                        suggestion: `${this.harmonics.length} harmonic(s) detected. Consider using harmonic filter or reducing drive level.`
+                    });
+                }
+
+                if (this.imdProducts.length > 0) {
+                    recommendations.push({
+                        type: 'Intermodulation Detected',
+                        severity: 'High',
+                        suggestion: `IMD products detected. Reduce signal levels or increase frequency separation.`
+                    });
+                }
+
+                return recommendations;
+            }
+        };
+
+        // Protocol decoders
+        let protocolDecoders = {
+            // ADS-B decoder (1090 MHz aircraft transponder)
+            adsb: {
+                enabled: false,
+                preamblePattern: [1,0,1,0,0,0,0,1,0,1,0,0,0,0,0,0],  // ADS-B preamble
+                messageBuffer: [],
+
+                decode: function(bits) {
+                    // Look for preamble
+                    for (let i = 0; i < bits.length - 112; i++) {
+                        let preambleMatch = true;
+                        for (let j = 0; j < this.preamblePattern.length; j++) {
+                            if (bits[i+j] !== this.preamblePattern[j]) {
+                                preambleMatch = false;
+                                break;
+                            }
+                        }
+
+                        if (preambleMatch) {
+                            const message = bits.slice(i + 16, i + 128);  // 112 bits
+                            return this.parseADSB(message);
+                        }
+                    }
+                    return null;
+                },
+
+                parseADSB: function(bits) {
+                    const df = this.bitsToInt(bits.slice(0, 5));  // Downlink Format
+
+                    if (df === 17) {  // ADS-B message
+                        const ca = this.bitsToInt(bits.slice(5, 8));
+                        const icao = this.bitsToHex(bits.slice(8, 32));
+                        const typeCode = this.bitsToInt(bits.slice(32, 37));
+
+                        return {
+                            type: 'ADS-B',
+                            icao: icao,
+                            typeCode: typeCode,
+                            data: this.bitsToHex(bits.slice(32, 88))
+                        };
+                    }
+                    return null;
+                },
+
+                bitsToInt: function(bits) {
+                    return parseInt(bits.join(''), 2);
+                },
+
+                bitsToHex: function(bits) {
+                    return this.bitsToInt(bits).toString(16).toUpperCase().padStart(bits.length/4, '0');
+                }
+            },
+
+            // AIS decoder (VHF marine transponder)
+            ais: {
+                enabled: false,
+                baudRate: 9600,
+                messageBuffer: [],
+
+                decode: function(bits) {
+                    // AIS uses NRZI encoding and HDLC framing
+                    // Look for HDLC flag: 01111110
+                    const flag = [0,1,1,1,1,1,1,0];
+
+                    for (let i = 0; i < bits.length - 8; i++) {
+                        let flagMatch = true;
+                        for (let j = 0; j < flag.length; j++) {
+                            if (bits[i+j] !== flag[j]) {
+                                flagMatch = false;
+                                break;
+                            }
+                        }
+
+                        if (flagMatch) {
+                            // Extract message between flags (up to 256 bits)
+                            const nextFlag = this.findNextFlag(bits, i + 8);
+                            if (nextFlag > 0) {
+                                const message = bits.slice(i + 8, nextFlag);
+                                return this.parseAIS(message);
+                            }
+                        }
+                    }
+                    return null;
+                },
+
+                findNextFlag: function(bits, start) {
+                    const flag = [0,1,1,1,1,1,1,0];
+                    for (let i = start; i < Math.min(start + 256, bits.length - 8); i++) {
+                        let match = true;
+                        for (let j = 0; j < flag.length; j++) {
+                            if (bits[i+j] !== flag[j]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) return i;
+                    }
+                    return -1;
+                },
+
+                parseAIS: function(bits) {
+                    if (bits.length < 168) return null;
+
+                    const messageType = this.bitsToInt(bits.slice(0, 6));
+                    const mmsi = this.bitsToInt(bits.slice(8, 38));
+
+                    return {
+                        type: 'AIS',
+                        messageType: messageType,
+                        mmsi: mmsi.toString(),
+                        raw: this.bitsToHex(bits)
+                    };
+                },
+
+                bitsToInt: function(bits) {
+                    return parseInt(bits.join(''), 2);
+                },
+
+                bitsToHex: function(bits) {
+                    return this.bitsToInt(bits).toString(16).toUpperCase();
+                }
+            }
+        };
+
+        // AM Demodulator: Envelope detection
+        function demodulateAM(i_samples, q_samples) {
+            const output = new Float32Array(i_samples.length);
+
+            for (let n = 0; n < i_samples.length; n++) {
+                // Normalize to float
+                const i = i_samples[n] / 2048.0;
+                const q = q_samples[n] / 2048.0;
+
+                // DC removal
+                demodState.dcI = demodState.dcAlpha * i + (1 - demodState.dcAlpha) * demodState.dcI;
+                demodState.dcQ = demodState.dcAlpha * q + (1 - demodState.dcAlpha) * demodState.dcQ;
+
+                const i_dc = i - demodState.dcI;
+                const q_dc = q - demodState.dcQ;
+
+                // Envelope detection: |I + jQ|
+                const magnitude = Math.sqrt(i_dc * i_dc + q_dc * q_dc);
+
+                // Simple DC blocker for audio (remove carrier)
+                const audioSample = magnitude - 1.0;
+
+                // Apply IIR lowpass filter (audio bandwidth limiting)
+                const filtered = demodState.filterCoeffs.b[0] * audioSample +
+                                demodState.filterCoeffs.b[1] * demodState.filterState[0] -
+                                demodState.filterCoeffs.a[1] * demodState.filterState[1];
+
+                demodState.filterState[0] = audioSample;
+                demodState.filterState[1] = filtered;
+
+                output[n] = filtered;
+            }
+
+            return output;
+        }
+
+        // FM Demodulator: Phase differentiation
+        function demodulateFM(i_samples, q_samples, wideband = false) {
+            const output = new Float32Array(i_samples.length);
+            const deviation = wideband ? 75000 : 2500;  // WFM: 75kHz, NFM: 2.5kHz
+
+            for (let n = 0; n < i_samples.length; n++) {
+                const i = i_samples[n] / 2048.0;
+                const q = q_samples[n] / 2048.0;
+
+                // Calculate instantaneous phase
+                const phase = Math.atan2(q, i);
+
+                // Phase difference (frequency deviation)
+                let phaseDiff = phase - demodState.lastPhase;
+
+                // Unwrap phase (handle ±π discontinuities)
+                while (phaseDiff > Math.PI) phaseDiff -= 2 * Math.PI;
+                while (phaseDiff < -Math.PI) phaseDiff += 2 * Math.PI;
+
+                demodState.lastPhase = phase;
+
+                // Convert phase difference to audio sample
+                // Normalize by deviation and sample rate
+                const audioSample = phaseDiff / (2 * Math.PI * deviation / demodState.audioSampleRate);
+
+                // Lowpass filter
+                const filtered = demodState.filterCoeffs.b[0] * audioSample +
+                                demodState.filterCoeffs.b[1] * demodState.filterState[0] -
+                                demodState.filterCoeffs.a[1] * demodState.filterState[1];
+
+                demodState.filterState[0] = audioSample;
+                demodState.filterState[1] = filtered;
+
+                output[n] = filtered;
+            }
+
+            return output;
+        }
+
+        // FSK Demodulator: Frequency shift keying bit extraction
+        function demodulateFSK(i_samples, q_samples, baudRate = 1200) {
+            const bits = [];
+            const samplesPerSymbol = Math.floor(demodState.audioSampleRate / baudRate);
+
+            for (let n = 0; n < i_samples.length - 1; n += samplesPerSymbol) {
+                const i1 = i_samples[n] / 2048.0;
+                const q1 = q_samples[n] / 2048.0;
+                const i2 = i_samples[n + 1] / 2048.0;
+                const q2 = q_samples[n + 1] / 2048.0;
+
+                const phase1 = Math.atan2(q1, i1);
+                const phase2 = Math.atan2(q2, i2);
+
+                let phaseDiff = phase2 - phase1;
+                while (phaseDiff > Math.PI) phaseDiff -= 2 * Math.PI;
+                while (phaseDiff < -Math.PI) phaseDiff += 2 * Math.PI;
+
+                // Positive phase change = '1', negative = '0'
+                bits.push(phaseDiff > 0 ? 1 : 0);
+            }
+
+            return bits;
+        }
+
+        // PSK Demodulator: Phase shift keying bit extraction
+        function demodulatePSK(i_samples, q_samples, baudRate = 1200) {
+            const bits = [];
+            const samplesPerSymbol = Math.floor(demodState.audioSampleRate / baudRate);
+
+            for (let n = 0; n < i_samples.length; n += samplesPerSymbol) {
+                const i = i_samples[n] / 2048.0;
+                const q = q_samples[n] / 2048.0;
+
+                const phase = Math.atan2(q, i);
+
+                // BPSK: phase 0° = '1', phase 180° = '0'
+                const bit = (Math.cos(phase) > 0) ? 1 : 0;
+                bits.push(bit);
+            }
+
+            return bits;
+        }
+
+        // Apply AGC to audio samples
+        function applyAGC(samples) {
+            const output = new Float32Array(samples.length);
+
+            for (let n = 0; n < samples.length; n++) {
+                const sample = samples[n];
+
+                // Measure signal level
+                const level = Math.abs(sample);
+
+                // Adjust gain
+                if (level > demodState.agcTarget) {
+                    demodState.agcGain *= (1 - demodState.agcAttack);
+                } else {
+                    demodState.agcGain *= (1 + demodState.agcDecay);
+                }
+
+                // Clamp gain
+                demodState.agcGain = Math.max(0.1, Math.min(10.0, demodState.agcGain));
+
+                // Apply gain
+                output[n] = sample * demodState.agcGain;
+
+                // Update audio level display
+                demodState.audioLevel = 0.99 * demodState.audioLevel + 0.01 * level;
+            }
+
+            return output;
+        }
+
+        // Process demodulated audio and output to speakers
+        function processAudio(audioSamples) {
+            if (!demodState.audioCtx || !demodState.gainNode) return;
+
+            // Apply AGC
+            const agcSamples = applyAGC(audioSamples);
+
+            // Create audio buffer
+            const audioBuffer = demodState.audioCtx.createBuffer(1, agcSamples.length, demodState.audioSampleRate);
+            const channelData = audioBuffer.getChannelData(0);
+
+            for (let i = 0; i < agcSamples.length; i++) {
+                channelData[i] = Math.max(-1, Math.min(1, agcSamples[i]));
+            }
+
+            // Create buffer source and play
+            const source = demodState.audioCtx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(demodState.gainNode);
+            source.start();
+        }
+
+        // Main demodulation processing loop
+        function processDemodulation() {
+            if (!demodState.active) return;
+
+            fetch('/iq_data?t=' + Date.now())
+                .then(response => response.arrayBuffer())
+                .then(buffer => {
+                    const int16View = new Int16Array(buffer);
+                    const samplesPerChannel = int16View.length / 4;
+
+                    const ch1_i = int16View.slice(0, samplesPerChannel);
+                    const ch1_q = int16View.slice(samplesPerChannel, samplesPerChannel * 2);
+
+                    let audioSamples = null;
+                    let decodedBits = null;
+
+                    switch(demodState.mode) {
+                        case 'am':
+                            audioSamples = demodulateAM(ch1_i, ch1_q);
+                            processAudio(audioSamples);
+                            break;
+
+                        case 'fm':
+                            audioSamples = demodulateFM(ch1_i, ch1_q, false);
+                            processAudio(audioSamples);
+                            break;
+
+                        case 'wfm':
+                            audioSamples = demodulateFM(ch1_i, ch1_q, true);
+                            processAudio(audioSamples);
+                            break;
+
+                        case 'fsk':
+                            decodedBits = demodulateFSK(ch1_i, ch1_q, 1200);
+                            demodState.bitBuffer.push(...decodedBits);
+
+                            // Try protocol decoders
+                            if (protocolDecoders.ais.enabled && demodState.bitBuffer.length > 256) {
+                                const aisMsg = protocolDecoders.ais.decode(demodState.bitBuffer);
+                                if (aisMsg) {
+                                    displayDecodedData(aisMsg);
+                                    demodState.bitBuffer = [];
+                                }
+                            }
+                            break;
+
+                        case 'psk':
+                            decodedBits = demodulatePSK(ch1_i, ch1_q, 1200);
+                            demodState.bitBuffer.push(...decodedBits);
+
+                            // Try protocol decoders
+                            if (protocolDecoders.adsb.enabled && demodState.bitBuffer.length > 128) {
+                                const adsbMsg = protocolDecoders.adsb.decode(demodState.bitBuffer);
+                                if (adsbMsg) {
+                                    displayDecodedData(adsbMsg);
+                                    demodState.bitBuffer = [];
+                                }
+                            }
+                            break;
+                    }
+
+                    // Update statistics
+                    updateDemodStats();
+
+                    // Schedule next processing
+                    setTimeout(processDemodulation, 50);  // 20 Hz update rate
+                })
+                .catch(err => {
+                    console.error('Demodulation error:', err);
+                    setTimeout(processDemodulation, 100);
+                });
+        }
+
+        // Display decoded protocol data
+        function displayDecodedData(message) {
+            const output = document.getElementById('decoded_messages');
+            if (!output) return;
+
+            // Remove "no messages" text if present
+            if (output.textContent.includes('No messages decoded yet')) {
+                output.innerHTML = '';
+            }
+
+            const timestamp = new Date().toLocaleTimeString();
+            let text = `[${timestamp}] ${message.type}: `;
+
+            if (message.type === 'ADS-B') {
+                text += `ICAO=${message.icao} Type=${message.typeCode} Data=${message.data}`;
+            } else if (message.type === 'AIS') {
+                text += `MMSI=${message.mmsi} MsgType=${message.messageType} Raw=${message.raw}`;
+            }
+
+            const line = document.createElement('div');
+            line.textContent = text;
+            line.style.color = '#0f0';
+            line.style.marginBottom = '4px';
+            line.style.padding = '4px';
+            line.style.background = '#0a0a0a';
+            line.style.borderLeft = '2px solid #0f0';
+            line.style.borderRadius = '2px';
+            output.appendChild(line);
+
+            // Scroll to bottom
+            output.scrollTop = output.scrollHeight;
+
+            // Limit to 100 lines
+            while (output.children.length > 100) {
+                output.removeChild(output.firstChild);
+            }
+        }
+
+        // Update demodulation statistics display
+        function updateDemodStats() {
+            const statusDiv = document.getElementById('demod_status');
+            if (!statusDiv) return;
+
+            let status = `Status: ${demodState.mode.toUpperCase()} Active\\n`;
+            status += `Audio Level: ${(demodState.audioLevel * 100).toFixed(1)}%\\n`;
+            status += `AGC Gain: ${demodState.agcGain.toFixed(2)}x`;
+
+            if (demodState.mode === 'fsk' || demodState.mode === 'psk') {
+                status += `\\nBits Buffered: ${demodState.bitBuffer.length}`;
+            }
+
+            statusDiv.textContent = status;
+        }
+
+        // UI Control Functions
+        function toggleDemod() {
+            const panel = document.getElementById('demod_panel');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        }
+
+        function changeDemodMode() {
+            const mode = document.getElementById('demod_mode').value;
+            const decodeDiv = document.getElementById('demod_decode');
+
+            if (mode === 'fsk' || mode === 'psk') {
+                decodeDiv.style.display = 'block';
+            } else {
+                decodeDiv.style.display = 'none';
+            }
+        }
+
+        function startDemod() {
+            if (demodState.active) {
+                stopDemod();
+                return;
+            }
+
+            const mode = document.getElementById('demod_mode').value;
+            if (mode === 'off') {
+                alert('Please select a demodulation mode');
+                return;
+            }
+
+            // Initialize Web Audio API
+            if (!demodState.audioCtx) {
+                demodState.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                demodState.gainNode = demodState.audioCtx.createGain();
+                demodState.gainNode.connect(demodState.audioCtx.destination);
+            }
+
+            // Reset state
+            demodState.mode = mode;
+            demodState.active = true;
+            demodState.lastPhase = 0;
+            demodState.dcI = 0;
+            demodState.dcQ = 0;
+            demodState.agcGain = 1.0;
+            demodState.filterState = [0, 0];
+            demodState.bitBuffer = [];
+
+            // Set volume
+            const volume = document.getElementById('demod_volume').value / 100.0;
+            demodState.gainNode.gain.value = volume;
+
+            // Enable protocol decoders based on mode
+            if (mode === 'psk') {
+                protocolDecoders.adsb.enabled = true;
+            } else if (mode === 'fsk') {
+                protocolDecoders.ais.enabled = true;
+            }
+
+            document.getElementById('demod_start_btn').textContent = 'Stop Demodulation';
+            document.getElementById('demod_status').textContent = `Status: Starting ${mode.toUpperCase()}...`;
+
+            console.log(`Demodulator started: ${mode.toUpperCase()} mode`);
+
+            // Start processing
+            processDemodulation();
+        }
+
+        function stopDemod() {
+            demodState.active = false;
+
+            if (demodState.audioCtx) {
+                demodState.audioCtx.close();
+                demodState.audioCtx = null;
+                demodState.gainNode = null;
+            }
+
+            // Disable protocol decoders
+            protocolDecoders.adsb.enabled = false;
+            protocolDecoders.ais.enabled = false;
+
+            document.getElementById('demod_start_btn').textContent = 'Start Demodulation';
+            document.getElementById('demod_status').textContent = 'Status: Stopped';
+            console.log('Demodulator stopped');
+        }
+
+        // ===== DEMOD UI CONTROL FUNCTIONS =====
+
+        // Enhanced demodulator state
+        let demodEnhanced = {
+            tunedFreq: null,  // Hz
+            bandwidth: 15000,  // Hz
+            afcEnabled: false,
+            freqOffset: 0,
+            squelchLevel: -100,
+            squelchOpen: true,
+            recording: false,
+            recordedChunks: [],
+            recordStartTime: null,
+            signalPower: -100,
+            sMeterValue: 0
+        };
+
+        // Demod spectrum canvas
+        let demodSpectrumCanvas = null;
+        let demodSpectrumCtx = null;
+
+        // S-meter canvas
+        let sMeterCanvas = null;
+        let sMeterCtx = null;
+
+        // Initialize demod spectrum display
+        function initDemodSpectrum() {
+            demodSpectrumCanvas = document.getElementById('demod_spectrum');
+            if (!demodSpectrumCanvas) return;
+
+            demodSpectrumCtx = demodSpectrumCanvas.getContext('2d');
+            const parent = demodSpectrumCanvas.parentElement;
+            demodSpectrumCanvas.width = parent.clientWidth;
+            demodSpectrumCanvas.height = parent.clientHeight;
+
+            // Click to tune
+            demodSpectrumCanvas.addEventListener('click', (e) => {
+                const rect = demodSpectrumCanvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const width = demodSpectrumCanvas.width;
+
+                // Get current RF parameters
+                const centerFreq = parseFloat(document.getElementById('freq')?.textContent) || 915;  // MHz
+                const sampleRate = parseFloat(document.getElementById('sample_rate')?.textContent) || 40;  // MHz
+
+                // Calculate clicked frequency
+                const startFreq = (centerFreq - sampleRate / 2) * 1e6;  // Hz
+                const clickedFreq = startFreq + (x / width) * sampleRate * 1e6;
+
+                // Tune to this frequency
+                tuneToFrequency(clickedFreq);
+            });
+
+            console.log('Demod spectrum initialized');
+        }
+
+        // Update demod spectrum display
+        function updateDemodSpectrum() {
+            if (!demodSpectrumCtx || !latestFFTData) return;
+
+            const canvas = demodSpectrumCanvas;
+            const ctx = demodSpectrumCtx;
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw grid
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw spectrum with gradient fill
+            const gradient = ctx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');
+            gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');
+            gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');
+            gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');
+
+            ctx.beginPath();
+            ctx.moveTo(0, height);
+
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const x = (i / latestFFTData.length) * width;
+                const magnitude = latestFFTData[i] / 255.0;
+                const y = height - (magnitude * height);
+
+                if (i === 0) {
+                    ctx.lineTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+
+            ctx.lineTo(width, height);
+            ctx.closePath();
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Draw spectrum line
+            ctx.beginPath();
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const x = (i / latestFFTData.length) * width;
+                const magnitude = latestFFTData[i] / 255.0;
+                const y = height - (magnitude * height);
+
+                // Color based on magnitude
+                if (magnitude > 0.8) ctx.strokeStyle = '#ffff00';
+                else if (magnitude > 0.5) ctx.strokeStyle = '#88ff00';
+                else if (magnitude > 0.3) ctx.strokeStyle = '#00ff88';
+                else ctx.strokeStyle = '#00ffff';
+
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // Draw tuned frequency marker
+            if (demodEnhanced.tunedFreq !== null) {
+                const centerFreq = parseFloat(document.getElementById('freq')?.textContent) || 915;  // MHz
+                const sampleRate = parseFloat(document.getElementById('sample_rate')?.textContent) || 40;  // MHz
+                const startFreq = (centerFreq - sampleRate / 2) * 1e6;  // Hz
+                const endFreq = (centerFreq + sampleRate / 2) * 1e6;
+
+                if (demodEnhanced.tunedFreq >= startFreq && demodEnhanced.tunedFreq <= endFreq) {
+                    const markerX = ((demodEnhanced.tunedFreq - startFreq) / (sampleRate * 1e6)) * width;
+
+                    // Draw bandwidth box
+                    const bwPixels = (demodEnhanced.bandwidth / (sampleRate * 1e6)) * width;
+                    ctx.fillStyle = 'rgba(0, 255, 0, 0.1)';
+                    ctx.fillRect(markerX - bwPixels/2, 0, bwPixels, height);
+
+                    // Draw center line
+                    ctx.strokeStyle = '#0f0';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([5, 5]);
+                    ctx.beginPath();
+                    ctx.moveTo(markerX, 0);
+                    ctx.lineTo(markerX, height);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // Update signal power at tuned frequency
+                    const bin = Math.floor(((demodEnhanced.tunedFreq - startFreq) / (sampleRate * 1e6)) * latestFFTData.length);
+                    if (bin >= 0 && bin < latestFFTData.length) {
+                        demodEnhanced.signalPower = (latestFFTData[bin] / 255.0) * 120 - 100;
+                        document.getElementById('demod_signal_power').textContent = demodEnhanced.signalPower.toFixed(1) + ' dBm';
+                    }
+                }
+            }
+        }
+
+        // Initialize S-meter
+        function initSMeter() {
+            sMeterCanvas = document.getElementById('s_meter_canvas');
+            if (!sMeterCanvas) return;
+
+            sMeterCtx = sMeterCanvas.getContext('2d');
+            const parent = sMeterCanvas.parentElement;
+            sMeterCanvas.width = parent.clientWidth;
+            sMeterCanvas.height = 80;
+
+            console.log('S-meter initialized');
+        }
+
+        // Update S-meter display
+        function updateSMeter() {
+            if (!sMeterCtx) return;
+
+            const canvas = sMeterCanvas;
+            const ctx = sMeterCtx;
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, width, height);
+
+            // Convert signal power to S-units
+            // S9 = -73 dBm, each S-unit = 6 dB
+            // S9+10 = -63 dBm, S9+20 = -53 dBm, etc.
+            let sValue = 0;
+            let sText = 'S0';
+            const power = demodEnhanced.signalPower;
+
+            if (power >= -73) {
+                sValue = 9 + (power + 73) / 10;  // Above S9: +10dB steps
+                if (sValue > 9) {
+                    sText = `S9+${((sValue - 9) * 10).toFixed(0)}`;
+                } else {
+                    sText = 'S9';
+                }
+            } else {
+                sValue = Math.max(0, 9 + (power + 73) / 6);  // Below S9: 6dB per S-unit
+                sText = `S${Math.floor(sValue)}`;
+            }
+
+            // Draw meter background
+            const meterWidth = width - 20;
+            const meterHeight = height - 40;
+            const meterX = 10;
+            const meterY = 10;
+
+            // Draw S-meter scale
+            ctx.fillStyle = '#222';
+            ctx.fillRect(meterX, meterY, meterWidth, meterHeight);
+
+            // Draw segments
+            const segments = 15;  // 9 S-units + 6 for +60dB
+            const segmentWidth = meterWidth / segments;
+
+            for (let i = 0; i < segments; i++) {
+                const x = meterX + i * segmentWidth;
+                const fillAmount = Math.max(0, Math.min(1, (sValue - i)));
+
+                let color;
+                if (i < 5) color = '#0f0';  // Green for S1-S5
+                else if (i < 9) color = '#ff0';  // Yellow for S6-S9
+                else color = '#f00';  // Red for S9+
+
+                ctx.fillStyle = color;
+                ctx.globalAlpha = fillAmount;
+                ctx.fillRect(x + 2, meterY + 2, segmentWidth - 4, meterHeight - 4);
+            }
+            ctx.globalAlpha = 1.0;
+
+            // Draw border
+            ctx.strokeStyle = '#0ff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(meterX, meterY, meterWidth, meterHeight);
+
+            // Update text display
+            document.getElementById('s_meter_value').textContent = sText;
+        }
+
+        // Tune to specific frequency
+        function tuneToFrequency(freqHz) {
+            demodEnhanced.tunedFreq = freqHz;
+            const freqMHz = freqHz / 1e6;
+
+            document.getElementById('demod_tuned_freq').textContent = freqMHz.toFixed(3) + ' MHz';
+            document.getElementById('demod_status_text').textContent = `Tuned to ${freqMHz.toFixed(3)} MHz`;
+
+            console.log(`Tuned to ${freqMHz.toFixed(3)} MHz`);
+        }
+
+        // Signal presets
+        const signalPresets = {
+            broadcast_fm: { mode: 'wfm', bandwidth: 200000, freq: 100.0e6, name: 'FM Broadcast' },
+            aircraft: { mode: 'am', bandwidth: 8000, freq: 121.5e6, name: 'Aircraft (121.5 MHz)' },
+            marine: { mode: 'fm', bandwidth: 12500, freq: 156.8e6, name: 'Marine VHF Ch 16' },
+            weather: { mode: 'fm', bandwidth: 12500, freq: 162.4e6, name: 'NOAA Weather Radio' }
+        };
+
+        function loadPreset(presetName) {
+            const preset = signalPresets[presetName];
+            if (!preset) return;
+
+            // Set mode
+            quickSelectMode(preset.mode);
+
+            // Set bandwidth
+            demodEnhanced.bandwidth = preset.bandwidth;
+            document.getElementById('demod_bandwidth').textContent = (preset.bandwidth / 1000).toFixed(1) + ' kHz';
+
+            // Tune to frequency
+            tuneToFrequency(preset.freq);
+
+            // Update RF parameters (would need to send to backend in real system)
+            document.getElementById('demod_status_text').textContent = `Preset loaded: ${preset.name}`;
+
+            console.log(`Loaded preset: ${preset.name}`);
+        }
+
+        // Squelch control
+        document.getElementById('squelch_slider')?.addEventListener('input', (e) => {
+            const squelchLevel = parseInt(e.target.value);
+            demodEnhanced.squelchLevel = squelchLevel;
+
+            if (squelchLevel >= -20) {
+                document.getElementById('squelch_value').textContent = squelchLevel + ' dBm';
+            } else {
+                document.getElementById('squelch_value').textContent = 'OFF';
+            }
+
+            // Apply squelch to demodulator
+            demodState.squelchLevel = squelchLevel;
+        });
+
+        // AFC toggle
+        function toggleAFC() {
+            demodEnhanced.afcEnabled = document.getElementById('afc_enable').checked;
+            document.getElementById('afc_status').textContent = demodEnhanced.afcEnabled ? 'ON' : 'OFF';
+            document.getElementById('afc_status').style.color = demodEnhanced.afcEnabled ? '#0f0' : '#888';
+
+            console.log('AFC:', demodEnhanced.afcEnabled ? 'enabled' : 'disabled');
+        }
+
+        // AFC processing (runs periodically when enabled)
+        function processAFC() {
+            if (!demodEnhanced.afcEnabled || !demodState.active) return;
+
+            // Detect frequency offset from phase differences
+            // This is a simplified AFC - real implementation would track carrier offset
+            if (Math.abs(demodEnhanced.freqOffset) > 500) {  // Hz
+                // Adjust tuned frequency
+                const correction = -demodEnhanced.freqOffset * 0.1;  // Slow correction
+                demodEnhanced.tunedFreq += correction;
+                document.getElementById('demod_tuned_freq').textContent = (demodEnhanced.tunedFreq / 1e6).toFixed(3) + ' MHz';
+            }
+        }
+
+        setInterval(processAFC, 1000);  // Run AFC every second
+
+        // Audio recording
+        let audioRecorder = null;
+        let audioRecordInterval = null;
+
+        function toggleAudioRecording() {
+            if (demodEnhanced.recording) {
+                stopAudioRecording();
+            } else {
+                startAudioRecording();
+            }
+        }
+
+        function startAudioRecording() {
+            if (!demodState.audioCtx) {
+                alert('Start demodulation first');
+                return;
+            }
+
+            demodEnhanced.recording = true;
+            demodEnhanced.recordedChunks = [];
+            demodEnhanced.recordStartTime = Date.now();
+
+            document.getElementById('audio_record_btn').textContent = '⏹ Stop Recording';
+            document.getElementById('audio_record_btn').style.borderColor = '#f00';
+            document.getElementById('audio_record_time').style.display = 'inline';
+
+            // Update record time display
+            audioRecordInterval = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - demodEnhanced.recordStartTime) / 1000);
+                const mins = Math.floor(elapsed / 60);
+                const secs = elapsed % 60;
+                document.getElementById('audio_record_time').textContent =
+                    `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            }, 1000);
+
+            console.log('Audio recording started');
+        }
+
+        function stopAudioRecording() {
+            if (!demodEnhanced.recording) return;
+
+            demodEnhanced.recording = false;
+            clearInterval(audioRecordInterval);
+
+            document.getElementById('audio_record_btn').textContent = '⏺ Record Audio';
+            document.getElementById('audio_record_btn').style.borderColor = '#666';
+            document.getElementById('audio_record_time').style.display = 'none';
+
+            // Export recorded audio as WAV
+            if (demodEnhanced.recordedChunks.length > 0) {
+                const blob = new Blob(demodEnhanced.recordedChunks, { type: 'audio/wav' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `demod_audio_${Date.now()}.wav`;
+                a.click();
+                URL.revokeObjectURL(url);
+                console.log('Audio exported');
+            }
+
+            demodEnhanced.recordedChunks = [];
+        }
+
+        // Export decoded data
+        function exportDecodedData() {
+            const messages = document.getElementById('decoded_messages');
+            if (!messages || messages.children.length === 0) {
+                alert('No decoded data to export');
+                return;
+            }
+
+            // Build CSV
+            let csv = 'Timestamp,Type,Data\n';
+            for (const child of messages.children) {
+                const text = child.textContent;
+                csv += `"${text}"\n`;
+            }
+
+            // Download
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `decoded_data_${Date.now()}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            console.log('Decoded data exported');
+        }
+
+        // Quick select mode buttons
+        let selectedMode = null;
+
+        function quickSelectMode(mode) {
+            // Update selected mode
+            selectedMode = mode;
+
+            // Update button styles
+            document.querySelectorAll('.demod-mode-btn').forEach(btn => {
+                btn.style.background = '#1a1a1a';
+                btn.style.borderColor = '#666';
+                btn.style.color = '#ccc';
+            });
+
+            const selectedBtn = document.getElementById('mode_' + mode);
+            if (selectedBtn) {
+                selectedBtn.style.background = '#0a5';
+                selectedBtn.style.borderColor = '#0f0';
+                selectedBtn.style.color = '#fff';
+            }
+
+            // Update display
+            document.getElementById('demod_mode_display').textContent = mode.toUpperCase();
+            document.getElementById('demod_status_text').textContent = `Mode: ${mode.toUpperCase()} selected - Click START to begin`;
+
+            // If already running, switch mode
+            if (demodState.active) {
+                stopDemod();
+                setTimeout(() => startDemodWithMode(mode), 100);
+            }
+        }
+
+        // Toggle demodulation on/off
+        function toggleDemodulation() {
+            if (demodState.active) {
+                stopDemod();
+                document.getElementById('demod_start_stop').textContent = 'START';
+                document.getElementById('demod_start_stop').style.background = '#0a5';
+                document.getElementById('demod_start_stop').style.borderColor = '#0f0';
+                document.getElementById('demod_status_indicator').style.background = '#666';
+                document.getElementById('demod_status_text').textContent = 'Stopped - Select mode and click START';
+            } else {
+                if (!selectedMode) {
+                    alert('Please select a demodulation mode first');
+                    return;
+                }
+                startDemodWithMode(selectedMode);
+                document.getElementById('demod_start_stop').textContent = 'STOP';
+                document.getElementById('demod_start_stop').style.background = '#a00';
+                document.getElementById('demod_start_stop').style.borderColor = '#f00';
+                document.getElementById('demod_status_indicator').style.background = '#0f0';
+                document.getElementById('demod_status_indicator').style.boxShadow = '0 0 8px #0f0';
+            }
+        }
+
+        // Start demodulation with specific mode
+        function startDemodWithMode(mode) {
+            // Initialize Web Audio API
+            if (!demodState.audioCtx) {
+                demodState.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                demodState.gainNode = demodState.audioCtx.createGain();
+                demodState.gainNode.connect(demodState.audioCtx.destination);
+            }
+
+            // Reset state
+            demodState.mode = mode;
+            demodState.active = true;
+            demodState.lastPhase = 0;
+            demodState.dcI = 0;
+            demodState.dcQ = 0;
+            demodState.agcGain = 1.0;
+            demodState.filterState = [0, 0];
+            demodState.bitBuffer = [];
+
+            // Set volume
+            const volume = document.getElementById('demod_volume_slider').value / 100.0;
+            demodState.gainNode.gain.value = volume;
+
+            // Enable protocol decoders based on mode
+            if (mode === 'psk') {
+                protocolDecoders.adsb.enabled = true;
+                document.getElementById('adsb_status').textContent = 'Active';
+                document.getElementById('adsb_status').style.color = '#0f0';
+            } else if (mode === 'fsk') {
+                protocolDecoders.ais.enabled = true;
+                document.getElementById('ais_status').textContent = 'Active';
+                document.getElementById('ais_status').style.color = '#0f0';
+            }
+
+            document.getElementById('demod_status_text').textContent = `Running ${mode.toUpperCase()} demodulation - Audio output enabled`;
+            console.log(`Demodulator started: ${mode.toUpperCase()} mode`);
+
+            // Start processing
+            processDemodulation();
+        }
+
+        // Volume slider update
+        document.getElementById('demod_volume_slider')?.addEventListener('input', (e) => {
+            const volume = e.target.value;
+            document.getElementById('demod_volume_value').textContent = volume + '%';
+            if (demodState.gainNode) {
+                demodState.gainNode.gain.value = volume / 100.0;
+            }
+        });
+
+        // Legacy volume control support
+        document.getElementById('demod_volume')?.addEventListener('input', (e) => {
+            if (demodState.gainNode) {
+                demodState.gainNode.gain.value = e.target.value / 100.0;
+            }
+        });
+
+        // Update audio level meter and AGC display
+        setInterval(() => {
+            if (demodState.active) {
+                const level = Math.min(100, demodState.audioLevel * 100);
+                document.getElementById('audio_level_bar').style.width = level + '%';
+                document.getElementById('audio_level_text').textContent = level.toFixed(0) + '%';
+                document.getElementById('agc_gain_display').textContent = demodState.agcGain.toFixed(1);
+            }
+        }, 100);
+
+        // Panel toggle functions
+        function toggleSignalTracker() {
+            const panel = document.getElementById('signal_tracker_panel');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        }
+
+        function toggleInterference() {
+            const panel = document.getElementById('interference_panel');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        }
+
+        function toggleDecoder() {
+            const panel = document.getElementById('decoder_panel');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        }
+
+        function clearSignalTracker() {
+            signalTracker.signals = [];
+            updateSignalTrackerDisplay();
+        }
+
+        function clearDecodedMessages() {
+            const output = document.getElementById('decoded_messages');
+            if (output) {
+                output.innerHTML = '<div style="text-align: center; margin-top: 20px;">No messages decoded yet</div>';
+            }
+        }
+
+        // Update signal tracker display
+        function updateSignalTrackerDisplay() {
+            const countSpan = document.getElementById('tracker_count');
+            const listDiv = document.getElementById('signal_list');
+            const hoppingDiv = document.getElementById('hopping_status');
+
+            if (!countSpan || !listDiv) return;
+
+            countSpan.textContent = signalTracker.signals.length;
+
+            if (signalTracker.signals.length === 0) {
+                listDiv.innerHTML = '<div style="color: #888;">No signals detected</div>';
+                return;
+            }
+
+            // Sort by power (strongest first)
+            const sorted = [...signalTracker.signals].sort((a, b) => b.power - a.power);
+
+            let html = '<table style="width: 100%; border-collapse: collapse;">';
+            html += '<tr style="color: #0ff; border-bottom: 1px solid #333;"><th>Freq (MHz)</th><th>Pwr</th><th>BW</th><th>Dur</th></tr>';
+
+            for (const sig of sorted) {
+                const age = ((Date.now() - sig.lastSeen) / 1000).toFixed(1);
+                const color = age < 0.5 ? '#0f0' : '#ff0';
+                html += `<tr style="color: ${color}; border-bottom: 1px solid #222;">`;
+                html += `<td>${sig.freq.toFixed(3)}</td>`;
+                html += `<td>${sig.power.toFixed(1)}</td>`;
+                html += `<td>${sig.bandwidth.toFixed(1)}k</td>`;
+                html += `<td>${sig.duration.toFixed(1)}s</td>`;
+                html += '</tr>';
+            }
+            html += '</table>';
+
+            listDiv.innerHTML = html;
+
+            // Update hopping detection display
+            const hoppingResult = signalTracker.detectHopping();
+            if (hoppingResult.detected) {
+                hoppingDiv.innerHTML = `
+                    <div style="color: #ff0; font-weight: bold;">HOPPING DETECTED</div>
+                    <div style="color: #0f0;">Rate: ${hoppingResult.hopRate.toFixed(1)} hops/sec</div>
+                    <div style="color: #888;">Channels: ${hoppingResult.channels.length}</div>
+                `;
+            } else {
+                hoppingDiv.innerHTML = '<div style="color: #888;">No hopping detected</div>';
+            }
+        }
+
+        // Update interference analysis display
+        function updateInterferenceDisplay() {
+            const harmonicsList = document.getElementById('harmonics_list');
+            const imdList = document.getElementById('imd_list');
+            const recommendations = document.getElementById('interference_recommendations');
+
+            if (!harmonicsList || !imdList || !recommendations) return;
+
+            // Update harmonics
+            if (interferenceAnalyzer.harmonics.length === 0) {
+                harmonicsList.innerHTML = '<div style="color: #888;">No harmonics detected</div>';
+            } else {
+                let html = '<table style="width: 100%; border-collapse: collapse;">';
+                html += '<tr style="color: #0ff; border-bottom: 1px solid #333;"><th>Order</th><th>Freq (MHz)</th><th>Power</th></tr>';
+
+                for (const h of interferenceAnalyzer.harmonics) {
+                    html += `<tr style="color: #ff0; border-bottom: 1px solid #222;">`;
+                    html += `<td>${h.order}x</td>`;
+                    html += `<td>${h.freq.toFixed(3)}</td>`;
+                    html += `<td>${h.power.toFixed(1)} dBm</td>`;
+                    html += '</tr>';
+                }
+                html += '</table>';
+                harmonicsList.innerHTML = html;
+            }
+
+            // Update IMD products
+            if (interferenceAnalyzer.imdProducts.length === 0) {
+                imdList.innerHTML = '<div style="color: #888;">No IMD products detected</div>';
+            } else {
+                let html = '<table style="width: 100%; border-collapse: collapse;">';
+                html += '<tr style="color: #0ff; border-bottom: 1px solid #333;"><th>Order</th><th>Freq (MHz)</th><th>Power</th></tr>';
+
+                for (const imd of interferenceAnalyzer.imdProducts) {
+                    html += `<tr style="color: #f80; border-bottom: 1px solid #222;">`;
+                    html += `<td>IM${imd.order}</td>`;
+                    html += `<td>${imd.freq.toFixed(3)}</td>`;
+                    html += `<td>${imd.power.toFixed(1)} dBm</td>`;
+                    html += '</tr>';
+                }
+                html += '</table>';
+                imdList.innerHTML = html;
+            }
+
+            // Update recommendations
+            const recs = interferenceAnalyzer.recommendMitigation();
+            if (recs.length === 0) {
+                recommendations.innerHTML = '<div style="color: #888;">No interference detected</div>';
+            } else {
+                let html = '';
+                for (const rec of recs) {
+                    const severityColor = rec.severity === 'High' ? '#f00' : '#ff0';
+                    html += `<div style="margin-bottom: 8px; padding: 5px; background: #111; border-left: 3px solid ${severityColor}; border-radius: 2px;">`;
+                    html += `<div style="color: ${severityColor}; font-weight: bold;">${rec.type}</div>`;
+                    html += `<div style="color: #888; margin-top: 3px;">${rec.suggestion}</div>`;
+                    html += '</div>';
+                }
+                recommendations.innerHTML = html;
+            }
+        }
+
+        // Periodic UI updates for signal tracker and interference analysis
+        setInterval(() => {
+            updateSignalTrackerDisplay();
+            updateInterferenceDisplay();
+        }, 200);
+
+        // Start signal tracking system
+        setInterval(() => {
+            if (!latestFFTData) return;
+
+            signalTracker.removeStale();
+
+            // Detect signals above threshold
+            const centerFreq = parseFloat(document.getElementById('freq')?.textContent) || 915;  // MHz
+            const sampleRate = parseFloat(document.getElementById('sample_rate')?.textContent) || 40;  // MHz
+            const binWidth = sampleRate / latestFFTData.length;
+
+            for (let i = 10; i < latestFFTData.length - 10; i++) {
+                const power = (latestFFTData[i] / 255.0) * 120 - 100;
+
+                if (power > signalTracker.detectionThreshold) {
+                    // Check if local maximum
+                    if (latestFFTData[i] > latestFFTData[i-1] && latestFFTData[i] > latestFFTData[i+1]) {
+                        const freq = centerFreq - sampleRate/2 + i * binWidth;
+
+                        // Estimate bandwidth (-3dB points)
+                        const threshold3db = latestFFTData[i] - 6.375;
+                        let bwLow = i, bwHigh = i;
+                        while (bwLow > 0 && latestFFTData[bwLow] > threshold3db) bwLow--;
+                        while (bwHigh < latestFFTData.length - 1 && latestFFTData[bwHigh] > threshold3db) bwHigh++;
+                        const bandwidth = (bwHigh - bwLow) * binWidth * 1000;  // kHz
+
+                        signalTracker.addSignal(freq, power, bandwidth);
+                    }
+                }
+            }
+
+            // Check for frequency hopping
+            const hoppingResult = signalTracker.detectHopping();
+            if (hoppingResult.detected) {
+                console.log(`Frequency hopping detected: ${hoppingResult.hopRate.toFixed(1)} hops/sec across ${hoppingResult.channels.length} channels`);
+            }
+        }, 100);
+
+        // Interference analysis update
+        setInterval(() => {
+            if (!latestFFTData || latestFFTData.length === 0) return;
+
+            const centerFreq = parseFloat(document.getElementById('freq')?.textContent) || 915;  // MHz
+            const sampleRate = parseFloat(document.getElementById('sample_rate')?.textContent) || 40;  // MHz
+
+            // Find strongest signal for harmonic analysis
+            let peakBin = 0, peakVal = 0;
+            for (let i = 0; i < latestFFTData.length; i++) {
+                if (latestFFTData[i] > peakVal) {
+                    peakVal = latestFFTData[i];
+                    peakBin = i;
+                }
+            }
+
+            const binWidth = sampleRate / latestFFTData.length;
+            const fundamentalFreq = centerFreq - sampleRate/2 + peakBin * binWidth;
+
+            // Detect harmonics
+            const harmonics = interferenceAnalyzer.detectHarmonics(latestFFTData, fundamentalFreq, centerFreq, sampleRate);
+
+            // Detect IMD if we have multiple strong signals
+            const strongSignals = [];
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const power = (latestFFTData[i] / 255.0) * 120 - 100;
+                if (power > -40 && latestFFTData[i] > latestFFTData[i-1] && latestFFTData[i] > latestFFTData[i+1]) {
+                    strongSignals.push(centerFreq - sampleRate/2 + i * binWidth);
+                }
+            }
+
+            if (strongSignals.length >= 2) {
+                interferenceAnalyzer.detectIMD(latestFFTData, strongSignals[0], strongSignals[1], centerFreq, sampleRate);
+            }
+        }, 500);
+
+        // ===== PANEL TOGGLE FUNCTIONS =====
+
+        function toggleSignalAnalysis() {
+            const panel = document.getElementById('signal_analysis');
+            const isVisible = panel.style.display !== 'none';
+            panel.style.display = isVisible ? 'none' : 'block';
+            document.getElementById('analysis_toggle').classList.toggle('active', !isVisible);
+            if (!isVisible) {
+                updateBookmarkList();
+            }
+        }
+
+        // ===== SIGNAL ACTIVITY TIMELINE =====
+
+        let activityTimeline = {
+            history: [],
+            startTime: Date.now(),
+            maxHistory: 300  // 300 samples (30 seconds at 10 Hz)
+        };
+
+        function toggleActivityTimeline() {
+            const panel = document.getElementById('activity_timeline');
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+            document.getElementById('timeline_toggle').classList.toggle('active', panel.style.display !== 'none');
+        }
+
+        function toggleRecorder() {
+            const panel = document.getElementById('recorder_panel');
+            const isVisible = panel.style.display !== 'none';
+            panel.style.display = isVisible ? 'none' : 'block';
+            document.getElementById('recorder_toggle').classList.toggle('active', !isVisible);
+        }
+
+        function toggleDoA() {
+            const panel = document.getElementById('doa_panel');
+            const isVisible = panel.style.display !== 'none';
+            panel.style.display = isVisible ? 'none' : 'block';
+            const toggleBtn = document.getElementById('doa_toggle');
+            if (toggleBtn) {
+                toggleBtn.classList.toggle('active', !isVisible);
+            }
+            if (!isVisible) {
+                initDoAPolar();
+            }
+        }
+
+        function updateActivityTimeline(data) {
+            if (!data || data.length === 0) return;
+
+            // Calculate peak power for this frame
+            let peak = 0;
+            for (let i = 0; i < data.length; i++) {
+                peak = Math.max(peak, data[i]);
+            }
+
+            activityTimeline.history.push({
+                time: (Date.now() - activityTimeline.startTime) / 1000,
+                peak: peak
+            });
+
+            // Limit history size
+            if (activityTimeline.history.length > activityTimeline.maxHistory) {
+                activityTimeline.history.shift();
+            }
+
+            // Update display if panel is visible
+            const panel = document.getElementById('activity_timeline');
+            if (panel.style.display !== 'none') {
+                drawActivityTimeline();
+            }
+
+            // Update duration display
+            document.getElementById('activity_duration').textContent =
+                Math.floor((Date.now() - activityTimeline.startTime) / 1000);
+        }
+
+        function drawActivityTimeline() {
+            const canvas = document.getElementById('timeline_canvas');
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, width, height);
+
+            if (activityTimeline.history.length < 2) return;
+
+            // Draw grid
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 5; i++) {
+                const y = (height / 5) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw activity line
+            ctx.strokeStyle = '#0ff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+
+            const history = activityTimeline.history;
+            for (let i = 0; i < history.length; i++) {
+                const x = (i / activityTimeline.maxHistory) * width;
+                const y = height - (history[i].peak / 255.0) * height;
+
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            ctx.stroke();
+
+            // Draw labels
+            ctx.fillStyle = '#888';
+            ctx.font = '10px monospace';
+            ctx.fillText('0 dB', 5, height - 5);
+            ctx.fillText('-100 dB', 5, 12);
+        }
+
+        function clearActivityHistory() {
+            activityTimeline.history = [];
+            activityTimeline.startTime = Date.now();
+            drawActivityTimeline();
+        }
+
+        // ===== SPECTRUM MASK TESTING =====
+
+        let spectrumMask = {
+            points: [],
+            enabled: false
+        };
+
+        function switchMeasTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.meas-content').forEach(tab => {
+                tab.style.display = 'none';
+            });
+            document.querySelectorAll('.meas-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+
+            // Show selected tab
+            document.getElementById('meas-content-' + tabName).style.display = 'block';
+            document.getElementById('tab-' + tabName).classList.add('active');
+        }
+
+        function loadMaskTemplate() {
+            const template = document.getElementById('mask_template').value;
+            spectrumMask.points = [];
+
+            const centerFreq = parseFloat(document.getElementById('freq').textContent) || 915;
+
+            if (template === 'fcc_part15') {
+                // FCC Part 15 ISM 915 MHz mask
+                spectrumMask.points = [
+                    { freq: centerFreq - 2.0, level: -50 },
+                    { freq: centerFreq - 0.5, level: 0 },
+                    { freq: centerFreq + 0.5, level: 0 },
+                    { freq: centerFreq + 2.0, level: -50 }
+                ];
+            } else if (template === 'etsi_300220') {
+                // ETSI 300 220 (868 MHz)
+                spectrumMask.points = [
+                    { freq: centerFreq - 0.2, level: -30 },
+                    { freq: centerFreq - 0.1, level: 0 },
+                    { freq: centerFreq + 0.1, level: 0 },
+                    { freq: centerFreq + 0.2, level: -30 }
+                ];
+            }
+
+            updateMaskTable();
+        }
+
+        function createMaskPoint() {
+            const freq = prompt('Frequency (MHz):');
+            const level = prompt('Level (dBm):');
+            if (freq && level) {
+                spectrumMask.points.push({
+                    freq: parseFloat(freq),
+                    level: parseFloat(level)
+                });
+                spectrumMask.points.sort((a, b) => a.freq - b.freq);
+                updateMaskTable();
+            }
+        }
+
+        function clearMask() {
+            spectrumMask.points = [];
+            updateMaskTable();
+        }
+
+        function updateMaskTable() {
+            const tbody = document.getElementById('mask_points_body');
+            if (spectrumMask.points.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: #888; padding: 10px;">No mask defined</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = '';
+            spectrumMask.points.forEach((point, idx) => {
+                const row = tbody.insertRow();
+                row.innerHTML = `
+                    <td>${point.freq.toFixed(3)}</td>
+                    <td style="text-align: right;">${point.level.toFixed(1)}</td>
+                    <td style="text-align: center;">
+                        <span onclick="deleteMaskPoint(${idx})" style="cursor: pointer; color: #f00;">&times;</span>
+                    </td>
+                `;
+            });
+        }
+
+        function deleteMaskPoint(idx) {
+            spectrumMask.points.splice(idx, 1);
+            updateMaskTable();
+        }
+
+        function testMask() {
+            if (!latestFFTData || spectrumMask.points.length === 0) return;
+
+            const sampleRate = 40000000; // 40 MHz
+            const centerFreq = parseFloat(document.getElementById('freq').textContent) * 1e6 || 915e6;
+
+            let violations = 0;
+            let maxMargin = -999;
+            let minMargin = 999;
+
+            // Test each FFT bin against mask
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const freq = (centerFreq - sampleRate / 2 + (i * sampleRate / FFT_SIZE)) / 1e6;
+                // Convert raw to dB using correct 120 dB range (-100 to +20 dB)
+                const power = latestFFTData[i] / 255.0 * 120 - 100;
+
+                // Find mask limit at this frequency (linear interpolation)
+                let maskLimit = -999;
+                for (let j = 0; j < spectrumMask.points.length - 1; j++) {
+                    const p1 = spectrumMask.points[j];
+                    const p2 = spectrumMask.points[j + 1];
+                    if (freq >= p1.freq && freq <= p2.freq) {
+                        const ratio = (freq - p1.freq) / (p2.freq - p1.freq);
+                        maskLimit = p1.level + ratio * (p2.level - p1.level);
+                        break;
+                    }
+                }
+
+                if (maskLimit > -999) {
+                    const margin = maskLimit - power;
+                    if (margin < 0) violations++;
+                    maxMargin = Math.max(maxMargin, margin);
+                    minMargin = Math.min(minMargin, margin);
+                }
+            }
+
+            // Update display
+            document.getElementById('mask_status').textContent = violations === 0 ? 'PASS' : 'FAIL';
+            document.getElementById('mask_status').style.color = violations === 0 ? '#0f0' : '#f00';
+            document.getElementById('mask_violations').textContent = violations;
+            document.getElementById('mask_max_margin').textContent = maxMargin.toFixed(1) + ' dB';
+            document.getElementById('mask_min_margin').textContent = minMargin.toFixed(1) + ' dB';
+        }
+
+        function toggleMaskOverlay() {
+            spectrumMask.enabled = !spectrumMask.enabled;
+            console.log('Mask overlay:', spectrumMask.enabled ? 'enabled' : 'disabled');
+        }
+
+        // ===== SIGNAL RECORDER =====
+
+        let recorder = {
+            recording: false,
+            startTime: 0,
+            samples: 0,
+            filename: '',
+            duration: 0,
+            statusInterval: null,
+            stopTimeout: null
+        };
+
+        function startRecording() {
+            if (recorder.recording) return;
+
+            const format = document.getElementById('record_format').value;
+            const duration = parseInt(document.getElementById('record_duration').value);
+            const trigger = document.getElementById('record_trigger').value;
+
+            // Generate filename with timestamp and format
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+            const freq = parseFloat(document.getElementById('freq')?.textContent) || 915;
+            recorder.filename = `bladerf_${freq}MHz_${timestamp}.bin`;
+
+            // Call backend to start recording
+            fetch('/start_recording', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    filename: recorder.filename
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    recorder.recording = true;
+                    recorder.startTime = Date.now();
+                    recorder.duration = duration;
+
+                    document.getElementById('record_state').textContent = 'Recording...';
+                    document.getElementById('record_state').style.color = '#f00';
+                    document.getElementById('record_filename').textContent = recorder.filename;
+
+                    console.log('Recording started:', recorder.filename);
+
+                    // Poll recording status
+                    recorder.statusInterval = setInterval(updateRecordingStatus, 100);
+
+                    // Auto-stop after duration
+                    recorder.stopTimeout = setTimeout(() => {
+                        stopRecording();
+                    }, duration * 1000);
+                } else {
+                    alert('Failed to start recording: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(err => {
+                console.error('Recording start error:', err);
+                alert('Failed to start recording');
+            });
+        }
+
+        function stopRecording() {
+            if (!recorder.recording) return;
+
+            // Clear timers
+            if (recorder.statusInterval) {
+                clearInterval(recorder.statusInterval);
+                recorder.statusInterval = null;
+            }
+            if (recorder.stopTimeout) {
+                clearTimeout(recorder.stopTimeout);
+                recorder.stopTimeout = null;
+            }
+
+            // Call backend to stop recording
+            fetch('/stop_recording', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'}
+            })
+            .then(response => response.json())
+            .then(data => {
+                recorder.recording = false;
+                document.getElementById('record_state').textContent = 'Stopped';
+                document.getElementById('record_state').style.color = '#888';
+
+                console.log('Recording stopped:', recorder.filename);
+
+                // Add to recordings list
+                const list = document.getElementById('recordings_list');
+                if (list.innerHTML.includes('No recordings')) {
+                    list.innerHTML = '';
+                }
+                const entry = document.createElement('div');
+                entry.style.cssText = 'padding: 5px; border-bottom: 1px solid #222; cursor: pointer;';
+                entry.innerHTML = `
+                    <div style="color: #0ff;">${recorder.filename}</div>
+                    <div style="color: #888; font-size: 8px;">${recorder.samples.toLocaleString()} samples, ${((recorder.samples * 4) / 1024 / 1024).toFixed(2)} MB</div>
+                `;
+                list.insertBefore(entry, list.firstChild);
+            })
+            .catch(err => {
+                console.error('Recording stop error:', err);
+                recorder.recording = false;
+            });
+        }
+
+        function updateRecordingStatus() {
+            if (!recorder.recording) return;
+
+            fetch('/recording_status')
+            .then(response => response.json())
+            .then(data => {
+                if (data.recording) {
+                    recorder.samples = data.samples;
+                    const sizeBytes = data.samples * 4; // 2 channels * 2 bytes per sample
+                    const sizeMB = sizeBytes / 1024 / 1024;
+
+                    document.getElementById('record_samples').textContent = data.samples.toLocaleString();
+                    document.getElementById('record_size').textContent = sizeMB.toFixed(2) + ' MB';
+                } else {
+                    // Recording stopped unexpectedly
+                    if (recorder.recording) {
+                        stopRecording();
+                    }
+                }
+            })
+            .catch(err => {
+                console.error('Status poll error:', err);
+            });
+        }
+
+        // ===== DIRECTION FINDING (DoA) =====
+
+        let doaCanvas = null;
+        let doaCtx = null;
+
+        function initDoAPolar() {
+            doaCanvas = document.getElementById('doa_polar');
+            if (!doaCanvas) return;
+            doaCtx = doaCanvas.getContext('2d');
+            drawDoAPolar();
+        }
+
+        function drawDoAPolar(azimuth = null) {
+            if (!doaCtx) return;
+
+            const width = doaCanvas.width;
+            const height = doaCanvas.height;
+            const centerX = width / 2;
+            const centerY = height / 2;
+            const radius = Math.min(width, height) / 2 - 20;
+
+            // Clear
+            doaCtx.fillStyle = '#0a0a0a';
+            doaCtx.fillRect(0, 0, width, height);
+
+            // Draw polar grid
+            doaCtx.strokeStyle = '#333';
+            doaCtx.lineWidth = 1;
+
+            // Circles
+            for (let r = radius / 4; r <= radius; r += radius / 4) {
+                doaCtx.beginPath();
+                doaCtx.arc(centerX, centerY, r, 0, 2 * Math.PI);
+                doaCtx.stroke();
+            }
+
+            // Radial lines
+            for (let angle = 0; angle < 360; angle += 30) {
+                const rad = angle * Math.PI / 180;
+                doaCtx.beginPath();
+                doaCtx.moveTo(centerX, centerY);
+                doaCtx.lineTo(centerX + radius * Math.cos(rad - Math.PI / 2),
+                            centerY + radius * Math.sin(rad - Math.PI / 2));
+                doaCtx.stroke();
+            }
+
+            // Labels
+            doaCtx.fillStyle = '#888';
+            doaCtx.font = '10px monospace';
+            doaCtx.fillText('0°', centerX - 5, centerY - radius - 5);
+            doaCtx.fillText('90°', centerX + radius + 5, centerY + 5);
+            doaCtx.fillText('180°', centerX - 10, centerY + radius + 15);
+            doaCtx.fillText('270°', centerX - radius - 25, centerY + 5);
+
+            // Draw azimuth indicator if provided
+            if (azimuth !== null) {
+                const rad = azimuth * Math.PI / 180;
+                doaCtx.strokeStyle = '#0ff';
+                doaCtx.lineWidth = 3;
+                doaCtx.beginPath();
+                doaCtx.moveTo(centerX, centerY);
+                doaCtx.lineTo(centerX + radius * 0.8 * Math.cos(rad - Math.PI / 2),
+                            centerY + radius * 0.8 * Math.sin(rad - Math.PI / 2));
+                doaCtx.stroke();
+
+                // Draw confidence cone (±10 degrees)
+                doaCtx.fillStyle = 'rgba(0, 255, 255, 0.2)';
+                doaCtx.beginPath();
+                doaCtx.moveTo(centerX, centerY);
+                doaCtx.arc(centerX, centerY, radius * 0.8,
+                          (azimuth - 10) * Math.PI / 180 - Math.PI / 2,
+                          (azimuth + 10) * Math.PI / 180 - Math.PI / 2);
+                doaCtx.closePath();
+                doaCtx.fill();
+            }
+        }
+
+        function updateDoA() {
+            // Fetch IQ data from both channels and calculate phase difference
+            fetch('/iq_data?t=' + Date.now())
+                .then(response => response.arrayBuffer())
+                .then(buffer => {
+                    const view = new DataView(buffer);
+                    const samplesPerChannel = 256;
+
+                    // Extract CH1 and CH2 I/Q
+                    let ch1_i = [], ch1_q = [], ch2_i = [], ch2_q = [];
+                    let offset = 0;
+
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch1_i.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch1_q.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch2_i.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch2_q.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+
+                    // Calculate average phase difference
+                    let phaseDiffSum = 0;
+                    let count = 0;
+
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        const phase1 = Math.atan2(ch1_q[i], ch1_i[i]);
+                        const phase2 = Math.atan2(ch2_q[i], ch2_i[i]);
+                        let diff = phase2 - phase1;
+
+                        // Wrap to [-π, π]
+                        while (diff > Math.PI) diff -= 2 * Math.PI;
+                        while (diff < -Math.PI) diff += 2 * Math.PI;
+
+                        phaseDiffSum += diff;
+                        count++;
+                    }
+
+                    const avgPhaseDiff = phaseDiffSum / count;
+                    const phaseDiffDeg = avgPhaseDiff * 180 / Math.PI;
+
+                    // Calculate azimuth from phase difference
+                    const spacing = parseFloat(document.getElementById('doa_spacing').value);
+                    const wavelength = 1.0; // Normalized
+                    const azimuth = Math.asin(avgPhaseDiff / (2 * Math.PI * spacing)) * 180 / Math.PI;
+
+                    // Update display
+                    document.getElementById('doa_azimuth').textContent = azimuth.toFixed(1) + '°';
+                    document.getElementById('doa_phase').textContent = phaseDiffDeg.toFixed(1) + '°';
+                    document.getElementById('doa_confidence').textContent = '75%';
+                    document.getElementById('doa_coherence').textContent = '0.85';
+
+                    // Draw polar display
+                    drawDoAPolar(azimuth);
+                })
+                .catch(err => console.error('DoA update failed:', err));
+        }
+
+        function calibrateDoA() {
+            console.log('DoA calibration started');
+            alert('Place a known signal source at 0° and click OK');
+            updateDoA();
+        }
+
+        // ===== DIRECTION FINDING WORKSPACE =====
+
+        let directionFinding = {
+            spectrumCanvas: null,
+            spectrumCtx: null,
+            polarCanvas: null,
+            polarCtx: null,
+            timelineCanvas: null,
+            timelineCtx: null,
+
+            selection: {
+                active: false,
+                centerFreq: 0,
+                bandwidth: 0,
+                leftCursor: 0,  // Percentage 0-100
+                rightCursor: 0,
+                dragging: null,  // 'left', 'right', 'selecting', or null
+                startX: 0
+            },
+
+            verticalOffset: 0,  // Vertical pan offset in dB
+            running: false,
+            updateInterval: null,
+            history: [],
+            maxHistory: 200,
+
+            calibration: {
+                phaseOffset: 0,
+                gainImbalance: 1.0
+            }
+        };
+
+        function initDirectionSpectrum() {
+            console.log('initDirectionSpectrum() called');
+
+            directionFinding.spectrumCanvas = document.getElementById('direction_spectrum');
+            if (!directionFinding.spectrumCanvas) {
+                console.error('Direction spectrum canvas not found!');
+                return;
+            }
+
+            console.log('Direction spectrum canvas found:', directionFinding.spectrumCanvas);
+
+            directionFinding.spectrumCtx = directionFinding.spectrumCanvas.getContext('2d');
+            console.log('Got 2D context:', directionFinding.spectrumCtx);
+
+            const parent = directionFinding.spectrumCanvas.parentElement;
+            directionFinding.spectrumCanvas.width = parent.clientWidth;
+            directionFinding.spectrumCanvas.height = parent.clientHeight;
+
+            console.log('Canvas size set to:', directionFinding.spectrumCanvas.width, 'x', directionFinding.spectrumCanvas.height);
+
+            // Draw test pattern to verify canvas works
+            directionFinding.spectrumCtx.fillStyle = '#f00';
+            directionFinding.spectrumCtx.fillRect(10, 10, 100, 100);
+            console.log('Drew test red rectangle at 10,10 100x100');
+
+            setupDirectionSpectrumMouseHandlers();
+
+            console.log('Direction spectrum initialized successfully');
+        }
+
+        function setupDirectionSpectrumMouseHandlers() {
+            const canvas = directionFinding.spectrumCanvas;
+            if (!canvas) {
+                console.error('Direction spectrum canvas not found for mouse handlers');
+                return;
+            }
+
+            console.log('Setting up direction spectrum mouse handlers');
+
+            const leftCursor = document.getElementById('doa_cursor_left');
+            const rightCursor = document.getElementById('doa_cursor_right');
+
+            if (!leftCursor || !rightCursor) {
+                console.error('Direction cursors not found');
+                return;
+            }
+
+            // Remove any existing handlers by cloning
+            const canvasClone = canvas.cloneNode(true);
+            canvas.parentNode.replaceChild(canvasClone, canvas);
+            directionFinding.spectrumCanvas = canvasClone;
+
+            // CRITICAL: Get new context from cloned canvas!
+            directionFinding.spectrumCtx = canvasClone.getContext('2d');
+            console.log('Canvas cloned, new context obtained');
+
+            // Also clone cursors to remove their handlers
+            const leftClone = leftCursor.cloneNode(true);
+            leftCursor.parentNode.replaceChild(leftClone, leftCursor);
+            const rightClone = rightCursor.cloneNode(true);
+            rightCursor.parentNode.replaceChild(rightClone, rightCursor);
+
+            // Canvas selection handlers
+            canvasClone.addEventListener('mousedown', (e) => {
+                console.log('Canvas mousedown at', e.clientX, e.clientY);
+                const rect = canvasClone.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const pct = (x / rect.width) * 100;
+
+                console.log('Starting selection at', pct.toFixed(1), '%');
+
+                directionFinding.selection.dragging = 'selecting';
+                directionFinding.selection.startX = pct;
+                directionFinding.selection.leftCursor = pct;
+                directionFinding.selection.rightCursor = pct;
+                directionFinding.selection.active = true;
+
+                updateDoACursors();
+            });
+
+            canvasClone.addEventListener('mousemove', (e) => {
+                if (directionFinding.selection.dragging !== 'selecting') return;
+
+                const rect = canvasClone.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const pct = Math.max(0, Math.min(100, (x / rect.width) * 100));
+
+                console.log('Selection dragging to', pct.toFixed(1), '%');
+
+                if (pct < directionFinding.selection.startX) {
+                    directionFinding.selection.leftCursor = pct;
+                    directionFinding.selection.rightCursor = directionFinding.selection.startX;
+                } else {
+                    directionFinding.selection.leftCursor = directionFinding.selection.startX;
+                    directionFinding.selection.rightCursor = pct;
+                }
+
+                updateDoACursors();
+                updateDoASelectionInfo();
+            });
+
+            canvasClone.addEventListener('mouseup', (e) => {
+                console.log('Canvas mouseup, dragging was:', directionFinding.selection.dragging);
+                if (directionFinding.selection.dragging === 'selecting') {
+                    directionFinding.selection.dragging = null;
+
+                    console.log('Selection complete:', directionFinding.selection.leftCursor.toFixed(1), '-', directionFinding.selection.rightCursor.toFixed(1), '%');
+
+                    updateDoACursors();
+                    updateDoASelectionInfo();
+                    hideDoAInstructions();
+                }
+            });
+
+            // Set up cursor dragging handlers
+            leftClone.addEventListener('mousedown', (e) => {
+                console.log('Left cursor mousedown');
+                e.stopPropagation();
+                e.preventDefault();
+                directionFinding.selection.dragging = 'left';
+                leftClone.style.background = '#ff0';
+            });
+
+            rightClone.addEventListener('mousedown', (e) => {
+                console.log('Right cursor mousedown');
+                e.stopPropagation();
+                e.preventDefault();
+                directionFinding.selection.dragging = 'right';
+                rightClone.style.background = '#ff0';
+            });
+
+            // Global handlers for cursor dragging (add only once)
+            if (!window.doaGlobalHandlersSetup) {
+                window.doaGlobalHandlersSetup = true;
+
+                document.addEventListener('mousemove', (e) => {
+                    if (directionFinding.selection.dragging === 'left' || directionFinding.selection.dragging === 'right') {
+                        const canvas = directionFinding.spectrumCanvas;
+                        if (!canvas) return;
+
+                        const rect = canvas.getBoundingClientRect();
+                        const x = e.clientX - rect.left;
+                        const pct = Math.max(0, Math.min(100, (x / rect.width) * 100));
+
+                        console.log('Cursor drag to', pct.toFixed(1), '%');
+
+                        if (directionFinding.selection.dragging === 'left') {
+                            directionFinding.selection.leftCursor = Math.min(pct, directionFinding.selection.rightCursor - 1);
+                        } else {
+                            directionFinding.selection.rightCursor = Math.max(pct, directionFinding.selection.leftCursor + 1);
+                        }
+
+                        updateDoACursors();
+                        updateDoASelectionInfo();
+                    }
+                });
+
+                document.addEventListener('mouseup', (e) => {
+                    console.log('Global mouseup, dragging was:', directionFinding.selection.dragging);
+                    if (directionFinding.selection.dragging === 'left' || directionFinding.selection.dragging === 'right') {
+                        console.log('Cursor drag ended');
+                        const leftCursor = document.getElementById('doa_cursor_left');
+                        const rightCursor = document.getElementById('doa_cursor_right');
+                        if (leftCursor) leftCursor.style.background = '#0ff';
+                        if (rightCursor) rightCursor.style.background = '#0ff';
+                        directionFinding.selection.dragging = null;
+                    }
+                });
+            }
+
+            // Add wheel event listener for Y-axis zoom/scroll (same as LIVE tab)
+            canvasClone.addEventListener('wheel', (e) => {
+                e.preventDefault();
+
+                if (e.ctrlKey) {
+                    // Ctrl+wheel = zoom Y-axis
+                    const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+                    const oldRange = spectrumMaxDb - spectrumMinDb;
+                    const newRange = Math.max(20, Math.min(400, oldRange * zoomFactor));
+                    const center = (spectrumMinDb + spectrumMaxDb) / 2;
+
+                    spectrumMinDb = Math.max(-50, center - newRange / 2);
+                    spectrumMaxDb = Math.min(350, center + newRange / 2);
+                } else {
+                    // Regular wheel = scroll Y-axis up/down
+                    const scrollAmount = e.deltaY * 0.5;
+                    const range = spectrumMaxDb - spectrumMinDb;
+
+                    let newMin = spectrumMinDb + scrollAmount;
+                    let newMax = spectrumMaxDb + scrollAmount;
+
+                    // Clamp to extended range
+                    const minLimit = -50;
+                    const maxLimit = 350;
+
+                    if (newMin < minLimit) {
+                        newMin = minLimit;
+                        newMax = minLimit + range;
+                    }
+                    if (newMax > maxLimit) {
+                        newMax = maxLimit;
+                        newMin = maxLimit - range;
+                    }
+
+                    spectrumMinDb = newMin;
+                    spectrumMaxDb = newMax;
+                }
+
+                // Redraw direction spectrum with new range
+                updateDirectionSpectrum();
+            });
+
+            // Double-click to reset Y-axis to default range
+            canvasClone.addEventListener('dblclick', () => {
+                spectrumMinDb = 75;
+                spectrumMaxDb = 225;
+                updateDirectionSpectrum();
+            });
+
+            console.log('Direction spectrum mouse handlers setup complete');
+        }
+
+        function hideDoAInstructions() {
+            const instructions = document.getElementById('doa_instructions');
+            if (instructions && directionFinding.selection.active) {
+                instructions.style.display = 'none';
+            }
+        }
+
+        function showDoAInstructions() {
+            const instructions = document.getElementById('doa_instructions');
+            if (instructions && !directionFinding.selection.active) {
+                instructions.style.display = 'block';
+            }
+        }
+
+        function adjustSpectrumOffset(delta) {
+            directionFinding.verticalOffset += delta;
+            console.log('Spectrum vertical offset:', directionFinding.verticalOffset);
+        }
+
+        function resetSpectrumOffset() {
+            directionFinding.verticalOffset = 0;
+            console.log('Spectrum vertical offset reset');
+        }
+
+        function updateDirectionSpectrum() {
+            if (!directionFinding.spectrumCtx) {
+                console.log('Direction spectrum: no context');
+                return;
+            }
+            if (!latestFFTData || latestFFTData.length === 0) {
+                console.log('Direction spectrum: no FFT data');
+                return;
+            }
+
+            const canvas = directionFinding.spectrumCanvas;
+            const ctx = directionFinding.spectrumCtx;
+            const data = latestFFTData;
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear with dark background
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw horizontal grid lines (more visible)
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw vertical grid lines
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
+            for (let i = 0; i <= 10; i++) {
+                const x = (width / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, height);
+                ctx.stroke();
+            }
+
+            // Enable smoothing
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+
+            // Calculate Y-axis mapping
+            const dbRange = spectrumMaxDb - spectrumMinDb;
+
+            // Store path for gradient fill
+            ctx.beginPath();
+            ctx.moveTo(0, height);
+
+            // Draw spectrum line with gradient color
+            const points = [];
+            for (let x = 0; x < width; x++) {
+                // Map canvas X to FFT bin, respecting zoom
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const fftIdx = zoomState.zoomStartBin + Math.floor((x / width) * zoomedBins);
+                const raw = data[fftIdx];
+                const magDb = rawToDb(raw);
+
+                // Map magnitude to visible range
+                const normalizedMag = Math.max(0, Math.min(1, (magDb - spectrumMinDb) / dbRange));
+                const y = height - (normalizedMag * height);
+                points.push({ x: x, y: y, mag: normalizedMag });
+
+                ctx.lineTo(x, y);
+            }
+
+            // Complete the path for fill
+            ctx.lineTo(width, height);
+            ctx.closePath();
+
+            // Create gradient fill (green-yellow gradient like SDR++)
+            const gradient = ctx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');
+            gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');
+            gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');
+            gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');
+
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Draw spectrum line with variable color
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.lineWidth = 1.5;
+
+            for (let i = 0; i < points.length - 1; i++) {
+                const p1 = points[i];
+                const p2 = points[i + 1];
+
+                // Color based on magnitude
+                const mag = (p1.mag + p2.mag) / 2;
+                if (mag > 0.8) {
+                    ctx.strokeStyle = '#ffff00';  // Yellow for strong signals
+                } else if (mag > 0.5) {
+                    ctx.strokeStyle = '#88ff00';  // Yellow-green
+                } else if (mag > 0.3) {
+                    ctx.strokeStyle = '#00ff88';  // Green-cyan
+                } else {
+                    ctx.strokeStyle = '#00ffff';  // Cyan for weak signals
+                }
+
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.stroke();
+            }
+
+            // Draw dB scale labels
+            ctx.fillStyle = '#888';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'right';
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
+                ctx.fillText(dbValue + ' dB', width - 5, y + 3);
+            }
+
+            // Draw selection region with enhanced visuals
+            if (directionFinding.selection.active) {
+                const left = (directionFinding.selection.leftCursor / 100) * width;
+                const right = (directionFinding.selection.rightCursor / 100) * width;
+
+                // Highlighted region background
+                ctx.fillStyle = 'rgba(0, 255, 255, 0.15)';
+                ctx.fillRect(left, 0, right - left, height);
+
+                // Selection borders with glow
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = '#0ff';
+                ctx.strokeStyle = '#0ff';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(left, 0);
+                ctx.lineTo(left, height);
+                ctx.moveTo(right, 0);
+                ctx.lineTo(right, height);
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+
+                // Redraw spectrum in selection region with highlighted color
+                const leftIdx = Math.floor((directionFinding.selection.leftCursor / 100) * data.length);
+                const rightIdx = Math.ceil((directionFinding.selection.rightCursor / 100) * data.length);
+
+                for (let i = leftIdx; i < rightIdx - 1; i++) {
+                    const x1 = Math.floor((i / data.length) * width);
+                    const x2 = Math.floor(((i + 1) / data.length) * width);
+
+                    const raw1 = data[i];
+                    const raw2 = data[i + 1];
+                    const magDb1 = rawToDb(raw1);
+                    const magDb2 = rawToDb(raw2);
+
+                    const normalizedMag1 = Math.max(0, Math.min(1, (magDb1 - spectrumMinDb) / dbRange));
+                    const normalizedMag2 = Math.max(0, Math.min(1, (magDb2 - spectrumMinDb) / dbRange));
+
+                    const y1 = height - (normalizedMag1 * height);
+                    const y2 = height - (normalizedMag2 * height);
+
+                    // Brighter color for selection
+                    ctx.strokeStyle = '#00ff00';  // Bright green
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(x1, y1);
+                    ctx.lineTo(x2, y2);
+                    ctx.stroke();
+                }
+            }
+
+            // Debug: Log successful render (throttled)
+            if (!window.directionSpectrumRenderCount) window.directionSpectrumRenderCount = 0;
+            if (++window.directionSpectrumRenderCount % 100 === 0) {
+                console.log('Direction spectrum rendered',  window.directionSpectrumRenderCount, 'times. Canvas:', canvas.width, 'x', canvas.height, 'Data points:', data.length);
+            }
+        }
+
+        function updateDoACursors() {
+            const leftCursor = document.getElementById('doa_cursor_left');
+            const rightCursor = document.getElementById('doa_cursor_right');
+
+            if (!leftCursor || !rightCursor) return;
+
+            // Show cursors if we have a selection
+            if (directionFinding.selection.leftCursor !== 0 || directionFinding.selection.rightCursor !== 0) {
+                leftCursor.style.display = 'block';
+                rightCursor.style.display = 'block';
+                leftCursor.style.left = directionFinding.selection.leftCursor + '%';
+                rightCursor.style.left = directionFinding.selection.rightCursor + '%';
+            } else {
+                leftCursor.style.display = 'none';
+                rightCursor.style.display = 'none';
+            }
+        }
+
+        function updateDoASelectionInfo() {
+            const sampleRate = 40000000; // 40 MHz
+            const centerFreq = parseFloat(document.getElementById('freq').textContent) * 1e6 || 915e6;
+
+            const leftFreq = centerFreq - sampleRate / 2 + (directionFinding.selection.leftCursor / 100) * sampleRate;
+            const rightFreq = centerFreq - sampleRate / 2 + (directionFinding.selection.rightCursor / 100) * sampleRate;
+
+            directionFinding.selection.centerFreq = (leftFreq + rightFreq) / 2;
+            directionFinding.selection.bandwidth = rightFreq - leftFreq;
+
+            document.getElementById('doa_sel_center').textContent = (directionFinding.selection.centerFreq / 1e6).toFixed(3) + ' MHz';
+            document.getElementById('doa_sel_bw').textContent = (directionFinding.selection.bandwidth / 1e3).toFixed(1) + ' kHz';
+        }
+
+        function initDoAPolarMain() {
+            directionFinding.polarCanvas = document.getElementById('doa_polar_main');
+            if (!directionFinding.polarCanvas) return;
+
+            directionFinding.polarCtx = directionFinding.polarCanvas.getContext('2d');
+
+            const parent = directionFinding.polarCanvas.parentElement;
+            directionFinding.polarCanvas.width = parent.clientWidth - 20;
+            directionFinding.polarCanvas.height = parent.clientHeight - 80;
+
+            drawDoAPolarMain();
+        }
+
+        function drawDoAPolarMain(azimuth = null, backAzimuth = null, sources = []) {
+            if (!directionFinding.polarCtx) return;
+
+            const canvas = directionFinding.polarCanvas;
+            const ctx = directionFinding.polarCtx;
+            const width = canvas.width;
+            const height = canvas.height;
+            const centerX = width / 2;
+            const centerY = height / 2;
+            const radius = Math.min(width, height) / 2 - 30;
+
+            // Clear
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw polar grid
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 1;
+
+            // Circles with labels
+            for (let i = 1; i <= 4; i++) {
+                const r = (radius / 4) * i;
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, r, 0, 2 * Math.PI);
+                ctx.stroke();
+            }
+
+            // Radial lines with angle labels
+            ctx.font = '10px monospace';
+            for (let angle = 0; angle < 360; angle += 30) {
+                const rad = angle * Math.PI / 180;
+                const x1 = centerX + radius * Math.cos(rad - Math.PI / 2);
+                const y1 = centerY + radius * Math.sin(rad - Math.PI / 2);
+
+                ctx.strokeStyle = '#333';
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.lineTo(x1, y1);
+                ctx.stroke();
+
+                // Angle labels
+                const labelDist = radius + 15;
+                const lx = centerX + labelDist * Math.cos(rad - Math.PI / 2);
+                const ly = centerY + labelDist * Math.sin(rad - Math.PI / 2);
+
+                ctx.fillStyle = '#888';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(angle + '°', lx, ly);
+            }
+
+            // Draw BACK azimuth indicator (180° ambiguity) - dotted/dim
+            if (backAzimuth !== null) {
+                const rad = backAzimuth * Math.PI / 180;
+
+                // Back beam (dashed, dimmer)
+                ctx.strokeStyle = '#f80'; // Orange for back azimuth
+                ctx.lineWidth = 3;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.lineTo(centerX + radius * 0.75 * Math.cos(rad - Math.PI / 2),
+                          centerY + radius * 0.75 * Math.sin(rad - Math.PI / 2));
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Back cone (dimmer)
+                ctx.fillStyle = 'rgba(255, 128, 0, 0.15)';
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.arc(centerX, centerY, radius * 0.75,
+                      (backAzimuth - 5) * Math.PI / 180 - Math.PI / 2,
+                      (backAzimuth + 5) * Math.PI / 180 - Math.PI / 2);
+                ctx.closePath();
+                ctx.fill();
+
+                // End point marker
+                const endX = centerX + radius * 0.75 * Math.cos(rad - Math.PI / 2);
+                const endY = centerY + radius * 0.75 * Math.sin(rad - Math.PI / 2);
+                ctx.fillStyle = '#f80';
+                ctx.beginPath();
+                ctx.arc(endX, endY, 5, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+
+            // Draw PRIMARY azimuth indicator (solid, bright)
+            if (azimuth !== null) {
+                const rad = azimuth * Math.PI / 180;
+
+                // Main beam
+                ctx.strokeStyle = '#0ff';
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.lineTo(centerX + radius * 0.85 * Math.cos(rad - Math.PI / 2),
+                          centerY + radius * 0.85 * Math.sin(rad - Math.PI / 2));
+                ctx.stroke();
+
+                // Confidence cone (±5 degrees)
+                ctx.fillStyle = 'rgba(0, 255, 255, 0.25)';
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.arc(centerX, centerY, radius * 0.85,
+                      (azimuth - 5) * Math.PI / 180 - Math.PI / 2,
+                      (azimuth + 5) * Math.PI / 180 - Math.PI / 2);
+                ctx.closePath();
+                ctx.fill();
+
+                // End point marker
+                const endX = centerX + radius * 0.85 * Math.cos(rad - Math.PI / 2);
+                const endY = centerY + radius * 0.85 * Math.sin(rad - Math.PI / 2);
+                ctx.fillStyle = '#0f0';
+                ctx.beginPath();
+                ctx.arc(endX, endY, 6, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+
+            // Draw multiple sources if detected
+            sources.forEach((src, idx) => {
+                const rad = src.azimuth * Math.PI / 180;
+                const color = ['#f00', '#ff0', '#0f0', '#0ff'][idx % 4];
+
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.lineTo(centerX + radius * 0.7 * Math.cos(rad - Math.PI / 2),
+                          centerY + radius * 0.7 * Math.sin(rad - Math.PI / 2));
+                ctx.stroke();
+
+                const endX = centerX + radius * 0.7 * Math.cos(rad - Math.PI / 2);
+                const endY = centerY + radius * 0.7 * Math.sin(rad - Math.PI / 2);
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(endX, endY, 4, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+        }
+
+        function initDoATimeline() {
+            directionFinding.timelineCanvas = document.getElementById('doa_timeline');
+            if (!directionFinding.timelineCanvas) return;
+
+            directionFinding.timelineCtx = directionFinding.timelineCanvas.getContext('2d');
+
+            const parent = directionFinding.timelineCanvas.parentElement;
+            directionFinding.timelineCanvas.width = parent.clientWidth - 20;
+            directionFinding.timelineCanvas.height = parent.clientHeight - 60;
+
+            drawDoATimeline();
+        }
+
+        function drawDoATimeline() {
+            if (!directionFinding.timelineCtx || directionFinding.history.length === 0) return;
+
+            const canvas = directionFinding.timelineCanvas;
+            const ctx = directionFinding.timelineCtx;
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw grid
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 1;
+
+            for (let i = 0; i <= 4; i++) {
+                const y = (height / 4) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw azimuth history
+            ctx.strokeStyle = '#0ff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+
+            const history = directionFinding.history;
+            for (let i = 0; i < history.length; i++) {
+                const x = (i / directionFinding.maxHistory) * width;
+                const y = height - ((history[i].azimuth + 180) / 360) * height;
+
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+
+            // Draw labels
+            ctx.fillStyle = '#888';
+            ctx.font = '10px monospace';
+            ctx.fillText('+180°', 5, 12);
+            ctx.fillText('0°', 5, height / 2 + 5);
+            ctx.fillText('-180°', 5, height - 5);
+        }
+
+        function startDoA() {
+            if (directionFinding.running) return;
+            if (!directionFinding.selection.active) {
+                alert('Please select a frequency range by clicking and dragging on the spectrum');
+                return;
+            }
+
+            directionFinding.running = true;
+            document.getElementById('doa_status_live').textContent = 'Running';
+            document.getElementById('doa_status_live').style.color = '#0f0';
+
+            const updateRate = parseInt(document.getElementById('doa_update_rate').value);
+            directionFinding.updateInterval = setInterval(performDoAUpdate, updateRate);
+
+            console.log('Direction finding started');
+        }
+
+        function stopDoA() {
+            if (!directionFinding.running) return;
+
+            directionFinding.running = false;
+            clearInterval(directionFinding.updateInterval);
+
+            document.getElementById('doa_status_live').textContent = 'Stopped';
+            document.getElementById('doa_status_live').style.color = '#888';
+
+            console.log('Direction finding stopped');
+        }
+
+        function performDoAUpdate() {
+            // Fetch DoA result calculated by backend (C++ phase-based interferometry)
+            fetch('/doa_result?t=' + Date.now())
+                .then(response => response.json())
+                .then(result => {
+                    // Update displays with backend-calculated result
+                    updateDoADisplays(result);
+
+                    // Add to history with full signal data
+                    directionFinding.history.push({
+                        timestamp: Date.now(),
+                        azimuth: result.azimuth,
+                        backAzimuth: result.backAzimuth,
+                        hasAmbiguity: result.hasAmbiguity,
+                        confidence: result.confidence,
+                        frequency: directionFinding.selection.centerFreq,
+                        bandwidth: directionFinding.selection.bandwidth,
+                        snr: result.snr,
+                        phaseDiff: result.phaseDiff,
+                        phaseStd: result.phaseStd,
+                        coherence: result.coherence
+                    });
+
+                    if (directionFinding.history.length > directionFinding.maxHistory) {
+                        directionFinding.history.shift();
+                    }
+
+                    drawDoATimeline();
+                })
+                .catch(err => {
+                    if (err.name !== 'AbortError') {
+                        console.error('DoA update failed:', err);
+                    }
+                });
+        }
+
+        function updateDoADisplays(result) {
+            const elem = (id) => document.getElementById(id);
+
+            // Display primary azimuth with ambiguity warning
+            if (elem('doa_azimuth_main')) {
+                let displayText = result.azimuth.toFixed(1) + '°';
+                if (result.hasAmbiguity) {
+                    displayText += ' / ' + result.backAzimuth.toFixed(1) + '°';
+                }
+                elem('doa_azimuth_main').textContent = displayText;
+                elem('doa_azimuth_main').title = result.hasAmbiguity ?
+                    'Primary: ' + result.azimuth.toFixed(1) + '° | Back: ' + result.backAzimuth.toFixed(1) + '° (180° ambiguity)' :
+                    '';
+            }
+
+            if (elem('doa_confidence_main')) elem('doa_confidence_main').textContent = result.confidence.toFixed(0) + '%';
+            if (elem('doa_snr')) elem('doa_snr').textContent = result.snr.toFixed(1) + ' dB';
+
+            if (elem('doa_phase_diff')) elem('doa_phase_diff').textContent = result.phaseDiff.toFixed(1) + '°';
+            if (elem('doa_phase_unwrap')) elem('doa_phase_unwrap').textContent = result.phaseDiff.toFixed(1) + '°';
+            if (elem('doa_phase_std')) elem('doa_phase_std').textContent = result.phaseStd.toFixed(2) + '°';
+
+            if (elem('doa_coherence_mag')) elem('doa_coherence_mag').textContent = result.coherence.toFixed(3);
+
+            // Update quality with ambiguity warning
+            let quality = result.confidence > 70 ? 'Good' : result.confidence > 40 ? 'Fair' : 'Poor';
+            if (result.hasAmbiguity) quality += ' ⚠';
+            if (elem('doa_quality')) {
+                elem('doa_quality').textContent = quality;
+                elem('doa_quality').title = result.hasAmbiguity ? '2-channel DF has 180° ambiguity' : '';
+            }
+
+            if (elem('doa_samples')) elem('doa_samples').textContent = directionFinding.history.length;
+
+            // Update polar display with both bearings
+            drawDoAPolarMain(result.azimuth, result.backAzimuth, result.sources);
+        }
+
+        function calibrateDoAMain() {
+            if (!confirm('Place a known signal source directly at 0° (north) and click OK to calibrate')) {
+                return;
+            }
+
+            // Perform calibration measurement
+            fetch('/iq_data?t=' + Date.now())
+                .then(response => response.arrayBuffer())
+                .then(buffer => {
+                    const view = new DataView(buffer);
+                    const samplesPerChannel = 256;
+
+                    let ch1_i = [], ch1_q = [], ch2_i = [], ch2_q = [];
+                    let offset = 0;
+
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch1_i.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch1_q.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch2_i.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        ch2_q.push(view.getInt16(offset, true));
+                        offset += 2;
+                    }
+
+                    // Calculate phase offset
+                    let phaseDiffSum = 0;
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        const phase1 = Math.atan2(ch1_q[i], ch1_i[i]);
+                        const phase2 = Math.atan2(ch2_q[i], ch2_i[i]);
+                        let diff = phase2 - phase1;
+
+                        while (diff > Math.PI) diff -= 2 * Math.PI;
+                        while (diff < -Math.PI) diff += 2 * Math.PI;
+
+                        phaseDiffSum += diff;
+                    }
+
+                    directionFinding.calibration.phaseOffset = phaseDiffSum / samplesPerChannel;
+
+                    alert('Calibration complete!\nPhase offset: ' + (directionFinding.calibration.phaseOffset * 180 / Math.PI).toFixed(2) + '°');
+                    console.log('DoA calibrated. Phase offset:', directionFinding.calibration.phaseOffset);
+                })
+                .catch(err => console.error('Calibration failed:', err));
+        }
+
+        function clearDoAHistory() {
+            directionFinding.history = [];
+            drawDoATimeline();
+        }
+
+        function exportDoAData() {
+            if (directionFinding.history.length === 0) {
+                alert('No data to export');
+                return;
+            }
+
+            let csv = 'Timestamp,Azimuth (deg),Confidence (%)\n';
+            directionFinding.history.forEach(entry => {
+                csv += entry.timestamp + ',' + entry.azimuth.toFixed(2) + ',' + entry.confidence.toFixed(1) + '\n';
+            });
+
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'doa_data_' + Date.now() + '.csv';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        // ===== STREAM OUT FUNCTIONALITY =====
+
+        // MGRS to Lat/Lon converter
+        function mgrsToLatLon(mgrs) {
+            // Remove spaces
+            mgrs = mgrs.replace(/\s+/g, '').toUpperCase();
+
+            // Parse MGRS: GridZone(2-3) + 100kmSquare(2) + Easting(variable) + Northing(variable)
+            const match = mgrs.match(/^(\d{1,2})([C-X])([A-Z]{2})(\d+)(\d+)$/);
+            if (!match) {
+                throw new Error('Invalid MGRS format');
+            }
+
+            const zone = parseInt(match[1]);
+            const latBand = match[2];
+            const square100km = match[3];
+            const easting = match[4];
+            const northing = match[5];
+
+            // Ensure easting and northing have same length
+            if (easting.length !== northing.length) {
+                throw new Error('Easting and Northing must have same precision');
+            }
+
+            const precision = easting.length;
+            const factor = Math.pow(10, 5 - precision);
+
+            // Convert to meters within 100km square
+            let eastingM = parseInt(easting) * factor;
+            let northingM = parseInt(northing) * factor;
+
+            // Add 100km square offsets (simplified approximation)
+            const square1 = square100km.charCodeAt(0) - 65; // A=0, B=1, etc
+            const square2 = square100km.charCodeAt(1) - 65;
+
+            // Simplified 100km square calculation (this is an approximation)
+            eastingM += (square1 % 8) * 100000;
+            northingM += Math.floor(square2 / 2) * 100000;
+
+            // Convert UTM to Lat/Lon (simplified)
+            const k0 = 0.9996;
+            const a = 6378137; // WGS84 semi-major axis
+            const e = 0.081819190842622; // WGS84 eccentricity
+            const e1sq = e * e / (1 - e * e);
+
+            const x = eastingM - 500000;
+            const y = northingM;
+
+            const M = y / k0;
+            const mu = M / (a * (1 - e * e / 4 - 3 * e * e * e * e / 64));
+
+            const phi1 = mu + (3 * e1sq / 2 - 27 * e1sq * e1sq * e1sq / 32) * Math.sin(2 * mu);
+            const lat = phi1 * 180 / Math.PI;
+
+            const centralMeridian = (zone - 1) * 6 - 180 + 3;
+            const lon = centralMeridian + (x / (a * k0)) * 180 / Math.PI;
+
+            return { lat, lon };
+        }
+
+        // Protobuf encoder for DF bearing message
+        function encodeProtobuf(doaData) {
+            // Simple protobuf-like binary format
+            // Field 1: timestamp (uint64)
+            // Field 2: sensor_uid (string)
+            // Field 3: lat (double)
+            // Field 4: lon (double)
+            // Field 5: alt (float)
+            // Field 6: azimuth (float)
+            // Field 7: confidence (float)
+
+            const encoder = new DataView(new ArrayBuffer(1024));
+            let offset = 0;
+
+            // Helper functions
+            function writeVarint(value) {
+                while (value >= 128) {
+                    encoder.setUint8(offset++, (value & 127) | 128);
+                    value >>>= 7;
+                }
+                encoder.setUint8(offset++, value & 127);
+            }
+
+            function writeFieldHeader(fieldNum, wireType) {
+                writeVarint((fieldNum << 3) | wireType);
+            }
+
+            function writeString(fieldNum, str) {
+                writeFieldHeader(fieldNum, 2); // Wire type 2 = length-delimited
+                const bytes = new TextEncoder().encode(str);
+                writeVarint(bytes.length);
+                for (let i = 0; i < bytes.length; i++) {
+                    encoder.setUint8(offset++, bytes[i]);
+                }
+            }
+
+            function writeDouble(fieldNum, value) {
+                writeFieldHeader(fieldNum, 1); // Wire type 1 = 64-bit
+                encoder.setFloat64(offset, value, true); // little-endian
+                offset += 8;
+            }
+
+            function writeFloat(fieldNum, value) {
+                writeFieldHeader(fieldNum, 5); // Wire type 5 = 32-bit
+                encoder.setFloat32(offset, value, true); // little-endian
+                offset += 4;
+            }
+
+            function writeUint64(fieldNum, value) {
+                writeFieldHeader(fieldNum, 0); // Wire type 0 = varint
+                // Simplified for values < 2^32
+                writeVarint(Math.floor(value));
+            }
+
+            // Encode fields
+            writeUint64(1, doaData.timestamp); // timestamp
+            writeString(2, streamOutConfig.sensorUid); // sensor_uid
+            writeDouble(3, streamOutConfig.position.lat); // lat
+            writeDouble(4, streamOutConfig.position.lon); // lon
+            writeFloat(5, streamOutConfig.position.alt); // alt
+            writeFloat(6, doaData.azimuth); // azimuth
+            writeFloat(7, doaData.confidence); // confidence
+
+            // Return as Uint8Array
+            return new Uint8Array(encoder.buffer, 0, offset);
+        }
+
+        let streamOutConfig = {
+            active: false,
+            interval: null,
+            platformInterval: null,
+            protocol: 'http',
+            endpoint: '',
+            port: 8089,
+            format: 'cot',
+            rate: 500,
+            sensorUid: 'DF-SENSOR-001',
+            platformType: 'ugv',  // ugv, uav-fixed, uav-rotary, usv, ground-station
+            lobRange: 10000,  // LoB range in meters (default 10km)
+            position: {
+                mode: 'static',
+                lat: 37.7749,
+                lon: -122.4194,
+                alt: 10,
+                mgrs: ''
+            },
+            stats: {
+                sent: 0,
+                errors: 0
+            }
+        };
+
+        function openStreamOutConfig() {
+            const modal = document.getElementById('streamout_modal');
+            if (modal) {
+                modal.style.display = 'flex';
+
+                // Load current config into form
+                document.getElementById('stream_endpoint').value = streamOutConfig.endpoint || '127.0.0.1';
+                document.getElementById('stream_port').value = streamOutConfig.port;
+                document.getElementById('stream_format').value = streamOutConfig.format;
+                document.getElementById('stream_rate').value = streamOutConfig.rate;
+                document.getElementById('sensor_uid').value = streamOutConfig.sensorUid;
+                document.getElementById('platform_type').value = streamOutConfig.platformType;
+                document.getElementById('lob_range').value = streamOutConfig.lobRange;
+                document.getElementById('sensor_lat').value = streamOutConfig.position.lat;
+                document.getElementById('sensor_lon').value = streamOutConfig.position.lon;
+                document.getElementById('sensor_alt').value = streamOutConfig.position.alt;
+            }
+        }
+
+        function closeStreamOutConfig() {
+            const modal = document.getElementById('streamout_modal');
+            if (modal) {
+                modal.style.display = 'none';
+            }
+        }
+
+        function togglePositionMode() {
+            const mode = document.querySelector('input[name="position_mode"]:checked').value;
+            const staticInputs = document.getElementById('static_position_inputs');
+            const dynamicInfo = document.getElementById('dynamic_position_info');
+
+            if (mode === 'static') {
+                staticInputs.style.display = 'block';
+                dynamicInfo.style.display = 'none';
+            } else {
+                staticInputs.style.display = 'none';
+                dynamicInfo.style.display = 'block';
+            }
+        }
+
+        function toggleCoordFormat() {
+            const format = document.getElementById('coord_format').value;
+            const latlonInputs = document.getElementById('latlon_inputs');
+            const mgrsInputs = document.getElementById('mgrs_inputs');
+
+            if (format === 'latlon') {
+                latlonInputs.style.display = 'block';
+                mgrsInputs.style.display = 'none';
+            } else {
+                latlonInputs.style.display = 'none';
+                mgrsInputs.style.display = 'block';
+            }
+        }
+
+        function toggleStreamOut() {
+            if (streamOutConfig.active) {
+                stopStreamOut();
+            } else {
+                startStreamOut();
+            }
+        }
+
+        function startStreamOut() {
+            // Read configuration from form
+            streamOutConfig.protocol = document.getElementById('stream_protocol').value;
+            streamOutConfig.endpoint = document.getElementById('stream_endpoint').value;
+            streamOutConfig.port = parseInt(document.getElementById('stream_port').value);
+            streamOutConfig.format = document.getElementById('stream_format').value;
+            streamOutConfig.rate = parseInt(document.getElementById('stream_rate').value);
+            streamOutConfig.sensorUid = document.getElementById('sensor_uid').value;
+            streamOutConfig.platformType = document.getElementById('platform_type').value;
+            streamOutConfig.lobRange = parseInt(document.getElementById('lob_range').value);
+
+            const posMode = document.querySelector('input[name="position_mode"]:checked').value;
+            streamOutConfig.position.mode = posMode;
+
+            if (posMode === 'static') {
+                const coordFormat = document.getElementById('coord_format').value;
+                if (coordFormat === 'latlon') {
+                    streamOutConfig.position.lat = parseFloat(document.getElementById('sensor_lat').value);
+                    streamOutConfig.position.lon = parseFloat(document.getElementById('sensor_lon').value);
+                    streamOutConfig.position.alt = parseFloat(document.getElementById('sensor_alt').value);
+                } else {
+                    // Convert MGRS to Lat/Lon
+                    streamOutConfig.position.mgrs = document.getElementById('sensor_mgrs').value;
+                    streamOutConfig.position.alt = parseFloat(document.getElementById('sensor_alt_mgrs').value);
+
+                    try {
+                        const converted = mgrsToLatLon(streamOutConfig.position.mgrs);
+                        streamOutConfig.position.lat = converted.lat;
+                        streamOutConfig.position.lon = converted.lon;
+                        console.log('MGRS converted:', streamOutConfig.position.mgrs, '→', converted.lat.toFixed(6), converted.lon.toFixed(6));
+                    } catch (e) {
+                        alert('Invalid MGRS coordinate: ' + e.message);
+                        return;
+                    }
+                }
+            }
+
+            // Validate
+            if (!streamOutConfig.endpoint || streamOutConfig.port < 1 || streamOutConfig.port > 65535) {
+                alert('Please enter valid endpoint and port');
+                return;
+            }
+
+            // Start streaming
+            streamOutConfig.active = true;
+            streamOutConfig.stats.sent = 0;
+            streamOutConfig.stats.errors = 0;
+
+            // Send platform position immediately and every 10 seconds
+            sendPlatformPosition();
+            streamOutConfig.platformInterval = setInterval(sendPlatformPosition, 10000);
+
+            // Send LoB updates at configured rate
+            streamOutConfig.interval = setInterval(() => {
+                if (directionFinding.history.length > 0) {
+                    const latest = directionFinding.history[directionFinding.history.length - 1];
+                    sendDoAStream(latest);
+                }
+            }, streamOutConfig.rate);
+
+            // Update UI
+            document.getElementById('stream_toggle_btn').textContent = 'Stop Streaming';
+            document.getElementById('stream_toggle_btn').style.background = '#3a0a0a';
+            document.getElementById('stream_toggle_btn').style.borderColor = '#f00';
+            document.getElementById('stream_toggle_btn').style.color = '#f00';
+            document.getElementById('doa_stream_status').textContent = 'Active';
+            document.getElementById('doa_stream_status').style.color = '#0f0';
+
+            console.log('Stream Out started:', streamOutConfig.endpoint + ':' + streamOutConfig.port, 'format:', streamOutConfig.format);
+            closeStreamOutConfig();
+        }
+
+        function stopStreamOut() {
+            if (streamOutConfig.interval) {
+                clearInterval(streamOutConfig.interval);
+                streamOutConfig.interval = null;
+            }
+            if (streamOutConfig.platformInterval) {
+                clearInterval(streamOutConfig.platformInterval);
+                streamOutConfig.platformInterval = null;
+            }
+
+            streamOutConfig.active = false;
+
+            // Update UI
+            document.getElementById('stream_toggle_btn').textContent = 'Start Streaming';
+            document.getElementById('stream_toggle_btn').style.background = '#0a3a0a';
+            document.getElementById('stream_toggle_btn').style.borderColor = '#0ff';
+            document.getElementById('stream_toggle_btn').style.color = '#0ff';
+            document.getElementById('doa_stream_status').textContent = 'Off';
+            document.getElementById('doa_stream_status').style.color = '#888';
+
+            console.log('Stream Out stopped. Sent:', streamOutConfig.stats.sent, 'Errors:', streamOutConfig.stats.errors);
+        }
+
+        function sendPlatformPosition() {
+            const now = new Date();
+            const time = now.toISOString();
+            const stale = new Date(now.getTime() + 300000).toISOString(); // 5 min stale
+
+            const lat = streamOutConfig.position.lat;
+            const lon = streamOutConfig.position.lon;
+            const alt = Math.round(streamOutConfig.position.alt);
+            const uid = streamOutConfig.sensorUid;
+
+            // Platform type to CoT type mapping
+            const platformTypes = {
+                'ugv': 'a-f-G-E-V',
+                'uav-fixed': 'a-f-A-M-F-Q',
+                'uav-rotary': 'a-f-A-M-H-Q',
+                'usv': 'a-f-S-E-V',
+                'ground-station': 'a-f-G-E-S'
+            };
+            const cotType = platformTypes[streamOutConfig.platformType] || 'a-f-G-E-S';
+
+            const platformNames = {
+                'ugv': 'UGV',
+                'uav-fixed': 'UAV (Fixed)',
+                'uav-rotary': 'UAV (Rotary)',
+                'usv': 'USV',
+                'ground-station': 'Ground Station'
+            };
+            const platformName = platformNames[streamOutConfig.platformType] || 'Sensor';
+
+            // Platform Position CoT Event
+            const platformCot = `<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<event version='2.0' uid='${uid}' type='${cotType}' time='${time}' start='${time}' stale='${stale}' how='m-g'>
+    <point lat='${lat}' lon='${lon}' hae='${alt}' ce='10' le='10'/>
+    <detail>
+        <contact callsign='${platformName}-DF'/>
+        <remarks>Direction Finding Sensor Platform</remarks>
+        <track speed='0' course='0'/>
+        <precisionlocation altsrc='GPS' geopointsrc='GPS'/>
+    </detail>
+</event>`;
+
+            // Send platform position
+            if (streamOutConfig.protocol === 'udp') {
+                fetch('/stream_udp_relay', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        endpoint: streamOutConfig.endpoint,
+                        port: streamOutConfig.port,
+                        data: platformCot,
+                        format: 'cot'
+                    })
+                }).catch(err => console.error('Platform position send failed:', err));
+            }
+        }
+
+        function sendDoAStream(doaData) {
+            let payload;
+            let contentType;
+            let isBinary = false;
+
+            // Format the data based on selected format
+            switch (streamOutConfig.format) {
+                case 'cot':
+                    payload = formatCoT(doaData);
+                    contentType = 'application/xml';
+                    break;
+                case 'json':
+                    payload = formatJSON(doaData);
+                    contentType = 'application/json';
+                    break;
+                case 'proto':
+                    payload = formatProtobuf(doaData);
+                    contentType = 'application/x-protobuf';
+                    isBinary = true;
+                    break;
+                case 'csv':
+                    payload = formatCSV(doaData);
+                    contentType = 'text/csv';
+                    break;
+                case 'nmea':
+                    payload = formatNMEA(doaData);
+                    contentType = 'text/plain';
+                    break;
+                default:
+                    console.error('Unknown format:', streamOutConfig.format);
+                    return;
+            }
+
+            // Send based on protocol
+            if (streamOutConfig.protocol === 'udp') {
+                // Send via UDP relay endpoint on server
+                fetch('/stream_udp_relay', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        endpoint: streamOutConfig.endpoint,
+                        port: streamOutConfig.port,
+                        data: isBinary ? Array.from(payload) : payload,
+                        format: streamOutConfig.format
+                    })
+                })
+                .then(response => {
+                    if (response.ok) {
+                        streamOutConfig.stats.sent++;
+                        if (streamOutConfig.stats.sent % 10 === 0) {
+                            console.log('Streamed', streamOutConfig.stats.sent, 'DF reports via UDP');
+                        }
+                    } else {
+                        streamOutConfig.stats.errors++;
+                        console.error('UDP relay error:', response.status, response.statusText);
+                    }
+                })
+                .catch(err => {
+                    streamOutConfig.stats.errors++;
+                    if (streamOutConfig.stats.errors % 10 === 0) {
+                        console.error('UDP relay failed:', err.message, '(', streamOutConfig.stats.errors, 'errors)');
+                    }
+                });
+            } else {
+                // Send via HTTP
+                const url = 'http://' + streamOutConfig.endpoint + ':' + streamOutConfig.port;
+
+                fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': contentType
+                    },
+                    body: payload
+                })
+                .then(response => {
+                    if (response.ok) {
+                        streamOutConfig.stats.sent++;
+                        if (streamOutConfig.stats.sent % 10 === 0) {
+                            console.log('Streamed', streamOutConfig.stats.sent, 'DF reports via HTTP');
+                        }
+                    } else {
+                        streamOutConfig.stats.errors++;
+                        console.error('HTTP stream error:', response.status, response.statusText);
+                    }
+                })
+                .catch(err => {
+                    streamOutConfig.stats.errors++;
+                    if (streamOutConfig.stats.errors % 10 === 0) {
+                        console.error('HTTP stream failed:', err.message, '(', streamOutConfig.stats.errors, 'errors)');
+                    }
+                });
+            }
+        }
+
+        function formatCoT(doaData) {
+            const now = new Date();
+            const time = now.toISOString();
+            const stale = new Date(now.getTime() + 86400000).toISOString(); // 24 hour stale
+            const deviceTime = now.toISOString();
+
+            const lat = streamOutConfig.position.lat;
+            const lon = streamOutConfig.position.lon;
+            const alt = Math.round(streamOutConfig.position.alt);
+            const uid = streamOutConfig.sensorUid;
+            const bearing = doaData.azimuth.toFixed(1);
+            const confidence = doaData.confidence ? doaData.confidence.toFixed(0) : '50';
+
+            // Get actual frequency from DoA data (must be integer for TAKX-RF)
+            const frequency = Math.round(doaData.frequency || 100000000);
+            const bandwidth = Math.round(doaData.bandwidth || 1000000);
+
+            // Calculate RSSI from SNR if available
+            const snr = doaData.snr || 10;
+            const rssi = (-100 + snr).toFixed(1);
+
+            // Calculate error estimates
+            const phaseStd = doaData.phaseStd || 5.0;
+            const coherence = doaData.coherence || 0.8;
+
+            // Error radius based on phase standard deviation (degrees to meters at range)
+            const lobRange = streamOutConfig.lobRange;
+            const errorAngleDeg = phaseStd;
+            const errorRadius = Math.round(lobRange * Math.tan(errorAngleDeg * Math.PI / 180));
+
+            // Platform type to CoT type mapping
+            const platformTypes = {
+                'ugv': 'a-f-G-E-V',           // Friendly Ground Equipment Vehicle
+                'uav-fixed': 'a-f-A-M-F-Q',   // Friendly Air Military Fixed-wing UAV
+                'uav-rotary': 'a-f-A-M-H-Q',  // Friendly Air Military Rotary-wing UAV
+                'usv': 'a-f-S-E-V',           // Friendly Surface Equipment Vehicle
+                'ground-station': 'a-f-G-E-S' // Friendly Ground Equipment Sensor
+            };
+            const cotType = platformTypes[streamOutConfig.platformType] || 'a-f-G-E-S';
+
+            // Platform display name
+            const platformNames = {
+                'ugv': 'UGV',
+                'uav-fixed': 'UAV (Fixed)',
+                'uav-rotary': 'UAV (Rotary)',
+                'usv': 'USV',
+                'ground-station': 'Ground Station'
+            };
+            const platformName = platformNames[streamOutConfig.platformType] || 'Sensor';
+
+            // TAKX-RF LoB format - just send LoB, platform icon from deviceType
+            return `<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<event version='2.0' uid='${uid}-lob-${Date.now()}' type='b-d' time='${time}' start='${time}' stale='${stale}' how='m-p'>
+    <point lat='0.0' lon='0.0' hae='9999999.0' ce='9999999.0' le='9999999.0'/>
+    <detail>
+        <__lob deviceType='bladeRF xA9' rssi='${rssi}' confidence='${confidence}' unitId='${uid}' azimuth='${bearing}' family='com.nuand.bladerf' deviceTime='${deviceTime}' elevationAngle='0' frequency='${frequency}' range='${lobRange}'>
+            <startLocation ce='0' le='0' lon='${lon}' hae='${alt}' lat='${lat}'/>
+            <__rf rssi='${rssi}' uplinkRssi='${rssi}' comments='2-ch DF SNR:${snr.toFixed(1)}dB Coh:${(coherence*100).toFixed(0)}% BW:${(bandwidth/1e3).toFixed(1)}kHz' downlinkRssi='-999.0' tag='${platformName} - ${(frequency/1e6).toFixed(3)} MHz' errorRadius='${errorRadius}' frequency='${frequency}'/>
+        </__lob>
+        <contact callsign='${platformName}-DF-${bearing}°'/>
+    </detail>
+</event>`;
+        }
+
+        function formatJSON(doaData) {
+            return JSON.stringify({
+                timestamp: doaData.timestamp,
+                sensor: {
+                    uid: streamOutConfig.sensorUid,
+                    position: {
+                        lat: streamOutConfig.position.lat,
+                        lon: streamOutConfig.position.lon,
+                        alt: streamOutConfig.position.alt
+                    }
+                },
+                bearing: {
+                    azimuth: doaData.azimuth,
+                    confidence: doaData.confidence,
+                    unit: 'degrees_true'
+                }
+            });
+        }
+
+        function formatCSV(doaData) {
+            return `${doaData.timestamp},${streamOutConfig.sensorUid},${streamOutConfig.position.lat},${streamOutConfig.position.lon},${streamOutConfig.position.alt},${doaData.azimuth.toFixed(2)},${doaData.confidence.toFixed(1)}`;
+        }
+
+        function formatNMEA(doaData) {
+            // Custom NMEA-like sentence for DF bearing
+            // $DFBR,timestamp,azimuth,confidence,lat,lon*checksum
+            const lat = Math.abs(streamOutConfig.position.lat).toFixed(6);
+            const latDir = streamOutConfig.position.lat >= 0 ? 'N' : 'S';
+            const lon = Math.abs(streamOutConfig.position.lon).toFixed(6);
+            const lonDir = streamOutConfig.position.lon >= 0 ? 'E' : 'W';
+            const azimuth = doaData.azimuth.toFixed(1);
+            const confidence = doaData.confidence.toFixed(1);
+
+            const sentence = `DFBR,${Date.now()},${azimuth},${confidence},${lat},${latDir},${lon},${lonDir}`;
+            const checksum = sentence.split('').reduce((acc, char) => acc ^ char.charCodeAt(0), 0).toString(16).toUpperCase().padStart(2, '0');
+
+            return `$${sentence}*${checksum}`;
+        }
+
+        function formatProtobuf(doaData) {
+            return encodeProtobuf(doaData);
+        }
+
+        // ===== SIGNAL CLASSIFIER =====
+
+        function toggleClassifier() {
+            const panel = document.getElementById('classifier_panel');
+            const toggle = document.getElementById('classifier_toggle');
+            if (!panel || !toggle) return;  // Elements don't exist
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+            toggle.classList.toggle('active', panel.style.display !== 'none');
+        }
+
+        function classifySignal() {
+            if (!latestFFTData || latestFFTData.length === 0) {
+                alert('No signal data available');
+                return;
+            }
+
+            const data = latestFFTData;
+            const results = analyzeSignalCharacteristics(data);
+
+            // Display results
+            const resultsDiv = document.getElementById('classifier_results');
+            if (!resultsDiv) return;  // Element doesn't exist
+
+            let html = '<div style="color: #0f0;">';
+            html += `<strong>Signal Type:</strong> ${results.type}<br>`;
+            html += `<strong>Confidence:</strong> ${results.confidence}%<br><br>`;
+            html += `<strong>Bandwidth:</strong> ${results.bandwidth.toFixed(2)} MHz<br>`;
+            html += `<strong>Peak Power:</strong> ${results.peakPower.toFixed(1)} dBFS<br>`;
+            html += `<strong>SNR:</strong> ${results.snr.toFixed(1)} dB<br>`;
+            html += `<strong>Spectral Flatness:</strong> ${results.spectralFlatness.toFixed(3)}<br>`;
+            html += '</div>';
+
+            resultsDiv.innerHTML = html;
+
+            // Display features
+            let featuresHtml = '<div style="display: flex; flex-wrap: wrap; gap: 5px;">';
+            results.features.forEach(f => {
+                featuresHtml += `<span style="background: #222; padding: 2px 6px; border-radius: 2px; color: #0ff;">${f}</span>`;
+            });
+            featuresHtml += '</div>';
+            document.getElementById('signal_features').innerHTML = featuresHtml;
+
+            console.log('Signal classification:', results);
+        }
+
+        function analyzeSignalCharacteristics(data) {
+            // Calculate various signal characteristics
+            let peakIdx = 0;
+            let peakVal = 0;
+            let sumPower = 0;
+            let sumMagnitude = 0;
+
+            for (let i = 0; i < data.length; i++) {
+                const val = data[i];
+                sumMagnitude += val;
+                sumPower += val * val;
+                if (val > peakVal) {
+                    peakVal = val;
+                    peakIdx = i;
+                }
+            }
+
+            const avgMagnitude = sumMagnitude / data.length;
+            const avgPower = sumPower / data.length;
+
+            // Spectral flatness (Wiener entropy)
+            let geometricMean = 1;
+            let count = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > 0) {
+                    geometricMean *= Math.pow(data[i], 1.0 / data.length);
+                    count++;
+                }
+            }
+            const spectralFlatness = geometricMean / avgMagnitude;
+
+            // Estimate noise floor
+            const sorted = Array.from(data).sort((a, b) => a - b);
+            const noiseFloorRaw = sorted[Math.floor(sorted.length * 0.1)];
+            const noiseFloorDb = rawToDb(noiseFloorRaw);
+            const peakDb = rawToDb(peakVal);
+            const snr = peakDb - noiseFloorDb;
+
+            // Calculate -3dB bandwidth
+            // Raw data is quantized dB: raw = (dB + 100) / 120 * 255
+            // For -3dB: threshold_raw = peakVal - 6.375
+            const threshold3db = peakVal - 6.375;
+            let firstIdx = -1, lastIdx = -1;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] >= threshold3db) {
+                    if (firstIdx === -1) firstIdx = i;
+                    lastIdx = i;
+                }
+            }
+            const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
+            const bandwidth = firstIdx >= 0 ? ((lastIdx - firstIdx) * sr / FFT_SIZE) / 1e6 : 0;
+
+            // Count peaks
+            let numPeaks = 0;
+            for (let i = 5; i < data.length - 5; i++) {
+                if (data[i] > avgMagnitude * 1.5) {
+                    let isLocalMax = true;
+                    for (let j = i - 3; j <= i + 3; j++) {
+                        if (j !== i && data[j] > data[i]) {
+                            isLocalMax = false;
+                            break;
+                        }
+                    }
+                    if (isLocalMax) numPeaks++;
+                }
+            }
+
+            // Classify based on characteristics
+            let type = 'Unknown';
+            let confidence = 0;
+            let features = [];
+
+            if (spectralFlatness > 0.8) {
+                type = 'Wideband Noise / OFDM';
+                confidence = 70;
+                features.push('Flat Spectrum');
+            } else if (numPeaks === 1 && bandwidth < 0.1) {
+                type = 'Narrowband (CW / Carrier)';
+                confidence = 85;
+                features.push('Single Carrier');
+            } else if (numPeaks === 1 && bandwidth > 0.1 && bandwidth < 2) {
+                if (spectralFlatness > 0.4) {
+                    type = 'Digital Modulation (PSK/QAM)';
+                    confidence = 65;
+                    features.push('Moderate BW');
+                } else {
+                    type = 'Analog FM / AM';
+                    confidence = 60;
+                    features.push('Voice-like');
+                }
+            } else if (numPeaks > 1 && numPeaks < 10) {
+                type = 'Multi-carrier (FSK / Tones)';
+                confidence = 70;
+                features.push(`${numPeaks} Carriers`);
+            } else if (bandwidth > 5) {
+                type = 'Wideband Spread Spectrum';
+                confidence = 60;
+                features.push('Wide BW');
+            }
+
+            if (snr > 30) features.push('High SNR');
+            else if (snr > 15) features.push('Good SNR');
+            else if (snr > 5) features.push('Low SNR');
+            else features.push('Poor SNR');
+
+            if (bandwidth < 0.01) features.push('Very Narrow');
+            else if (bandwidth < 0.1) features.push('Narrow');
+            else if (bandwidth < 1) features.push('Medium BW');
+            else features.push('Wide');
+
+            return {
+                type: type,
+                confidence: confidence,
+                bandwidth: bandwidth,
+                peakPower: peakDb,
+                snr: snr,
+                spectralFlatness: spectralFlatness,
+                numPeaks: numPeaks,
+                features: features
+            };
+        }
+
+        // ===== ENHANCED EXPORT FUNCTIONS =====
+
+        function exportSigMF() {
+            if (!latestFFTData || latestFFTData.length === 0) {
+                alert('No spectrum data available to export');
+                return;
+            }
+
+            const timestamp = new Date().toISOString();
+            const freq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+            const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
+
+            // Create SigMF metadata
+            const sigmf = {
+                global: {
+                    "core:datatype": "rf32_le",
+                    "core:sample_rate": sr,
+                    "core:version": "1.0.0",
+                    "core:description": "bladeRF spectrum capture",
+                    "core:author": "bladeRF Sensor System",
+                    "core:recorder": "bladeRF xA9",
+                    "core:hw": "bladeRF xA9"
+                },
+                captures: [{
+                    "core:sample_start": 0,
+                    "core:frequency": freq,
+                    "core:datetime": timestamp
+                }],
+                annotations: []
+            };
+
+            // Add bookmarks as annotations
+            signalAnalysis.bookmarks.forEach(b => {
+                sigmf.annotations.push({
+                    "core:sample_start": 0,
+                    "core:sample_count": FFT_SIZE,
+                    "core:freq_lower_edge": b.freq * 1e6 - 10000,
+                    "core:freq_upper_edge": b.freq * 1e6 + 10000,
+                    "core:label": b.name
+                });
+            });
+
+            const sigmfStr = JSON.stringify(sigmf, null, 2);
+            const blob = new Blob([sigmfStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `spectrum_${Date.now()}.sigmf-meta`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            console.log('Exported SigMF metadata');
+        }
+
+        // Hook up new toggle buttons
+        // Note: analysis_toggle, demod_toggle, timeline_toggle removed in favor of workspace tabs
+        // document.getElementById('analysis_toggle').addEventListener('click', toggleSignalAnalysis);
+        // document.getElementById('demod_toggle').addEventListener('click', toggleDemod);
+        document.getElementById('cursor_toggle').addEventListener('click', toggleCursors);
+        // document.getElementById('timeline_toggle').addEventListener('click', toggleActivityTimeline);
+
+        // ========================================================================
+        // DRAGGABLE PANEL SYSTEM
+        // ========================================================================
+
+        function makePanelDraggable(panel) {
+            const header = panel.querySelector('.panel-header');
+            if (!header) return;
+
+            let isDragging = false;
+            let currentX, currentY, initialX, initialY;
+            let xOffset = 0, yOffset = 0;
+
+            header.addEventListener('mousedown', dragStart);
+            document.addEventListener('mousemove', drag);
+            document.addEventListener('mouseup', dragEnd);
+
+            function dragStart(e) {
+                if (e.target.classList.contains('panel-close')) return;
+
+                initialX = e.clientX - xOffset;
+                initialY = e.clientY - yOffset;
+
+                if (e.target === header || e.target.classList.contains('panel-title')) {
+                    isDragging = true;
+                    panel.classList.add('active');
+                }
+            }
+
+            function drag(e) {
+                if (isDragging) {
+                    e.preventDefault();
+                    currentX = e.clientX - initialX;
+                    currentY = e.clientY - initialY;
+
+                    xOffset = currentX;
+                    yOffset = currentY;
+
+                    setTranslate(currentX, currentY, panel);
+                }
+            }
+
+            function dragEnd(e) {
+                initialX = currentX;
+                initialY = currentY;
+                isDragging = false;
+                panel.classList.remove('active');
+            }
+
+            function setTranslate(xPos, yPos, el) {
+                el.style.transform = `translate3d(${xPos}px, ${yPos}px, 0)`;
+            }
+        }
+
+        // Initialize bookmarks on load
+        updateBookmarkList();
+
+        // Update activity timeline on each frame
+        setInterval(() => {
+            if (latestFFTData) {
+                updateActivityTimeline(latestFFTData);
+            }
+        }, 100);
+
+        console.log('Advanced signal analysis features loaded');
+        console.log('Signal classifier ready');
+        console.log('Activity timeline ready');
+
+        // ========================================================================
+        // ADVANCED ANALYTICS - Burst, Hopping, Interference Detection
+        // ========================================================================
+
+        let advancedAnalysisState = {
+            burstHistory: [],
+            freqHoppingHistory: [],
+            interferenceDetected: [],
+            lastAnalysisTime: 0
+        };
+
+        function runAdvancedAnalysis() {
+            if (!latestFFTData || latestFFTData.length === 0) {
+                alert('No spectrum data available');
+                return;
+            }
+
+            const data = latestFFTData;
+            const threshold = parseFloat(document.getElementById('burst_threshold').value);
+            const minDuration = parseFloat(document.getElementById('burst_min_duration').value);
+
+            // Burst Detection
+            detectBursts(data, threshold, minDuration);
+
+            // Frequency Hopping Detection
+            if (document.getElementById('fh_detect_enable').checked) {
+                detectFrequencyHopping(data);
+            }
+
+            // Interference Analysis
+            analyzeInterference(data);
+
+            console.log('Advanced analysis complete');
+        }
+
+        function detectBursts(data, thresholdDb, minDurationMs) {
+            const avgPower = data.reduce((a, b) => a + b, 0) / data.length;
+            const thresholdRaw = avgPower + ((thresholdDb + 100) / 120 * 255);
+
+            let bursts = [];
+            let inBurst = false;
+            let burstStart = 0;
+            let burstSum = 0;
+
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > thresholdRaw && !inBurst) {
+                    inBurst = true;
+                    burstStart = i;
+                    burstSum = 0;
+                } else if (data[i] < thresholdRaw && inBurst) {
+                    inBurst = false;
+                    const burstLength = i - burstStart;
+                    if (burstLength > 0) {
+                        bursts.push({
+                            start: burstStart,
+                            length: burstLength,
+                            avgPower: burstSum / burstLength
+                        });
+                    }
+                }
+
+                if (inBurst) {
+                    burstSum += data[i];
+                }
+            }
+
+            // Update UI
+            document.getElementById('burst_count').textContent = bursts.length;
+
+            if (bursts.length > 0) {
+                const avgDuration = bursts.reduce((a, b) => a + b.length, 0) / bursts.length;
+                const binTime = 1000.0 / (40e6 / 4096); // Approximate
+                document.getElementById('burst_avg_duration').textContent = (avgDuration * binTime).toFixed(2) + ' ms';
+
+                // Calculate burst rate (assuming data is from recent time period)
+                const burstRate = bursts.length / 0.1; // Assume 100ms observation window
+                document.getElementById('burst_rate').textContent = burstRate.toFixed(1) + ' Hz';
+            }
+
+            advancedAnalysisState.burstHistory.push({
+                timestamp: Date.now(),
+                count: bursts.length
+            });
+
+            // Keep only last 100 entries
+            if (advancedAnalysisState.burstHistory.length > 100) {
+                advancedAnalysisState.burstHistory.shift();
+            }
+        }
+
+        function detectFrequencyHopping(data) {
+            const historyLength = parseInt(document.getElementById('fh_history').value);
+
+            // Find peak frequency
+            let peakIdx = 0;
+            let peakVal = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > peakVal) {
+                    peakVal = data[i];
+                    peakIdx = i;
+                }
+            }
+
+            const centerFreq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+            const sampleRate = parseFloat(document.getElementById('srInput').value) * 1e6;
+            const peakFreq = centerFreq - (sampleRate / 2) + (peakIdx * sampleRate / FFT_SIZE);
+
+            advancedAnalysisState.freqHoppingHistory.push({
+                timestamp: Date.now(),
+                frequency: peakFreq,
+                power: peakVal
+            });
+
+            // Keep only specified history
+            while (advancedAnalysisState.freqHoppingHistory.length > historyLength) {
+                advancedAnalysisState.freqHoppingHistory.shift();
+            }
+
+            // Analyze hopping pattern
+            if (advancedAnalysisState.freqHoppingHistory.length > 10) {
+                const history = advancedAnalysisState.freqHoppingHistory;
+                const recentHistory = history.slice(-20);
+
+                // Count unique channels
+                const channels = new Set(recentHistory.map(h => Math.round(h.frequency / 1e6)));
+                document.getElementById('fh_channels').textContent = channels.size;
+
+                // Calculate hop rate
+                let hops = 0;
+                for (let i = 1; i < recentHistory.length; i++) {
+                    const freqDiff = Math.abs(recentHistory[i].frequency - recentHistory[i-1].frequency);
+                    if (freqDiff > 100e3) { // 100 kHz threshold
+                        hops++;
+                    }
+                }
+
+                const timeSpan = (recentHistory[recentHistory.length-1].timestamp - recentHistory[0].timestamp) / 1000;
+                const hopRate = hops / timeSpan;
+                document.getElementById('fh_hop_rate').textContent = hopRate.toFixed(1);
+
+                // Determine pattern type
+                if (channels.size > 15) {
+                    document.getElementById('fh_pattern').textContent = 'Pseudo-Random';
+                } else if (channels.size > 5) {
+                    document.getElementById('fh_pattern').textContent = 'Sequential';
+                } else if (channels.size > 1) {
+                    document.getElementById('fh_pattern').textContent = 'Alternating';
+                } else {
+                    document.getElementById('fh_pattern').textContent = 'Fixed Freq';
+                }
+            }
+        }
+
+        function analyzeInterference(data) {
+            const avgPower = data.reduce((a, b) => a + b, 0) / data.length;
+            const threshold = avgPower * 1.5;
+
+            // Detect narrowband interference (single bin spikes)
+            let narrowbandCount = 0;
+            for (let i = 1; i < data.length - 1; i++) {
+                if (data[i] > threshold && data[i] > data[i-1] * 2 && data[i] > data[i+1] * 2) {
+                    narrowbandCount++;
+                }
+            }
+
+            document.getElementById('interf_narrowband').textContent = narrowbandCount;
+
+            // Detect wideband interference (wide elevated floor)
+            let wideCount = 0;
+            let windowSize = 50;
+            for (let i = 0; i < data.length - windowSize; i++) {
+                let windowAvg = 0;
+                for (let j = 0; j < windowSize; j++) {
+                    windowAvg += data[i + j];
+                }
+                windowAvg /= windowSize;
+
+                if (windowAvg > threshold) {
+                    wideCount++;
+                }
+            }
+
+            const widePercent = (wideCount / (data.length - windowSize) * 100).toFixed(1);
+            document.getElementById('interf_wideband').textContent = widePercent + '%';
+
+            // Calculate duty cycle (% time signal is present)
+            let activeCount = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > avgPower * 1.2) {
+                    activeCount++;
+                }
+            }
+
+            const dutyCycle = (activeCount / data.length * 100).toFixed(1);
+            document.getElementById('interf_duty_cycle').textContent = dutyCycle + '%';
+        }
+
+        // ========================================================================
+        // LIVE WORKSPACE DISPLAYS
+        // ========================================================================
+
+        let liveStatsInterval = null;
+
+        function updateLiveStats() {
+            if (!latestFFTData || latestFFTData.length === 0) return;
+
+            const data = latestFFTData;
+
+            // Find peak
+            let peakIdx = 0;
+            let peakVal = 0;
+            let sum = 0;
+            for (let i = 0; i < data.length; i++) {
+                if (data[i] > peakVal) {
+                    peakVal = data[i];
+                    peakIdx = i;
+                }
+                sum += data[i];
+            }
+
+            const avgVal = sum / data.length;
+
+            // Noise floor (10th percentile)
+            const sorted = Array.from(data).sort((a, b) => a - b);
+            const noiseFloor = sorted[Math.floor(sorted.length * 0.1)];
+
+            // Convert to dBm (assuming 50 ohm, 0dBFS = 0dBm for simplicity)
+            const peakDbm = rawToDb(peakVal);
+            const avgDbm = rawToDb(avgVal);
+            const floorDbm = rawToDb(noiseFloor);
+
+            document.getElementById('live_peak_power').textContent = peakDbm.toFixed(1) + ' dBm';
+            document.getElementById('live_avg_power').textContent = avgDbm.toFixed(1) + ' dBm';
+            document.getElementById('live_noise_floor').textContent = floorDbm.toFixed(1) + ' dBm';
+
+            // FPS is already updated elsewhere
+            const fpsElement = document.getElementById('fps');
+            if (fpsElement) {
+                document.getElementById('live_fps_display').textContent = fpsElement.textContent;
+            }
+        }
+
+        // ========================================================================
+        // MEASUREMENTS WORKSPACE - Live Spectrum Display
+        // ========================================================================
+
+        let measurementsSpectrumCanvas = null;
+        let measurementsSpectrumCtx = null;
+
+        function initMeasurementsSpectrum() {
+            measurementsSpectrumCanvas = document.getElementById('measurements_spectrum');
+            if (!measurementsSpectrumCanvas) {
+                console.log('Measurements spectrum canvas not found');
+                return;
+            }
+
+            measurementsSpectrumCtx = measurementsSpectrumCanvas.getContext('2d');
+
+            // Force proper sizing from parent
+            const parent = measurementsSpectrumCanvas.parentElement;
+            measurementsSpectrumCanvas.width = parent ? parent.clientWidth : 1200;
+            measurementsSpectrumCanvas.height = parent ? parent.clientHeight : 400;
+
+            // Add wheel event listener for Y-axis zoom/scroll (same as LIVE and DIRECTION tabs)
+            measurementsSpectrumCanvas.addEventListener('wheel', (e) => {
+                e.preventDefault();
+
+                if (e.ctrlKey) {
+                    // Ctrl+wheel = zoom Y-axis
+                    const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+                    const oldRange = spectrumMaxDb - spectrumMinDb;
+                    const newRange = Math.max(20, Math.min(400, oldRange * zoomFactor));
+                    const center = (spectrumMinDb + spectrumMaxDb) / 2;
+
+                    spectrumMinDb = Math.max(-50, center - newRange / 2);
+                    spectrumMaxDb = Math.min(350, center + newRange / 2);
+                } else {
+                    // Regular wheel = scroll Y-axis up/down
+                    const scrollAmount = e.deltaY * 0.5;
+                    const range = spectrumMaxDb - spectrumMinDb;
+
+                    let newMin = spectrumMinDb + scrollAmount;
+                    let newMax = spectrumMaxDb + scrollAmount;
+
+                    // Clamp to extended range
+                    const minLimit = -50;
+                    const maxLimit = 350;
+
+                    if (newMin < minLimit) {
+                        newMin = minLimit;
+                        newMax = minLimit + range;
+                    }
+                    if (newMax > maxLimit) {
+                        newMax = maxLimit;
+                        newMin = maxLimit - range;
+                    }
+
+                    spectrumMinDb = newMin;
+                    spectrumMaxDb = newMax;
+                }
+
+                // Redraw measurements spectrum with new range
+                updateMeasurementsSpectrum();
+            });
+
+            // Double-click to reset Y-axis to default range
+            measurementsSpectrumCanvas.addEventListener('dblclick', () => {
+                spectrumMinDb = 75;
+                spectrumMaxDb = 225;
+                updateMeasurementsSpectrum();
+            });
+
+            console.log('Measurements spectrum canvas initialized:', measurementsSpectrumCanvas.width, 'x', measurementsSpectrumCanvas.height);
+        }
+
+        function updateMeasurementsSpectrum() {
+            if (!measurementsSpectrumCtx || !latestFFTData || latestFFTData.length === 0) return;
+
+            const canvas = measurementsSpectrumCanvas;
+            const ctx = measurementsSpectrumCtx;
+            const data = latestFFTData;
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear with dark background
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw horizontal grid lines (more visible)
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw vertical grid lines
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
+            for (let i = 0; i <= 10; i++) {
+                const x = (width / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, height);
+                ctx.stroke();
+            }
+
+            // Enable smoothing
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+
+            // Calculate Y-axis mapping
+            const dbRange = spectrumMaxDb - spectrumMinDb;
+
+            // Store path for gradient fill
+            ctx.beginPath();
+            ctx.moveTo(0, height);
+
+            // Draw spectrum line with gradient color
+            const points = [];
+            for (let x = 0; x < width; x++) {
+                // Map canvas X to FFT bin, respecting zoom
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const fftIdx = zoomState.zoomStartBin + Math.floor((x / width) * zoomedBins);
+                const raw = data[fftIdx];
+                const magDb = rawToDb(raw);
+
+                // Map magnitude to visible range
+                const normalizedMag = Math.max(0, Math.min(1, (magDb - spectrumMinDb) / dbRange));
+                const y = height - (normalizedMag * height);
+                points.push({ x: x, y: y, mag: normalizedMag });
+
+                ctx.lineTo(x, y);
+            }
+
+            // Complete the path for fill
+            ctx.lineTo(width, height);
+            ctx.closePath();
+
+            // Create gradient fill (green-yellow gradient like SDR++)
+            const gradient = ctx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');
+            gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');
+            gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');
+            gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');
+
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Draw spectrum line with variable color
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.lineWidth = 1.5;
+
+            for (let i = 0; i < points.length - 1; i++) {
+                const p1 = points[i];
+                const p2 = points[i + 1];
+
+                // Color based on magnitude
+                const mag = (p1.mag + p2.mag) / 2;
+                if (mag > 0.8) {
+                    ctx.strokeStyle = '#ffff00';  // Yellow for strong signals
+                } else if (mag > 0.5) {
+                    ctx.strokeStyle = '#88ff00';  // Yellow-green
+                } else if (mag > 0.3) {
+                    ctx.strokeStyle = '#00ff88';  // Green-cyan
+                } else {
+                    ctx.strokeStyle = '#00ffff';  // Cyan for weak signals
+                }
+
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.stroke();
+            }
+
+            // Draw dB scale labels
+            ctx.fillStyle = '#888';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'right';
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
+                ctx.fillText(dbValue + ' dB', width - 5, y + 3);
+            }
+
+            // Find and mark peak (within zoomed region only)
+            let peakIdx = zoomState.zoomStartBin;
+            let peakVal = 0;
+            let sum = 0;
+            for (let i = zoomState.zoomStartBin; i <= zoomState.zoomEndBin; i++) {
+                if (data[i] > peakVal) {
+                    peakVal = data[i];
+                    peakIdx = i;
+                }
+                sum += data[i];
+            }
+
+            // Draw peak marker (mapped to zoomed coordinates)
+            const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+            const peakX = Math.floor(((peakIdx - zoomState.zoomStartBin) / zoomedBins) * width);
+            const peakDb = rawToDb(peakVal);
+            const peakNormalized = Math.max(0, Math.min(1, (peakDb - spectrumMinDb) / dbRange));
+            const peakY = height - (peakNormalized * height);
+
+            ctx.fillStyle = '#0f0';
+            ctx.beginPath();
+            ctx.arc(peakX, peakY, 5, 0, 2 * Math.PI);
+            ctx.fill();
+
+            ctx.strokeStyle = '#0f0';
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(peakX, peakY);
+            ctx.lineTo(peakX, height);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Update info overlay
+            const centerFreq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+            const sampleRate = parseFloat(document.getElementById('srInput').value) * 1e6;
+            const peakFreq = centerFreq - (sampleRate / 2) + (peakIdx * sampleRate / data.length);
+
+            const peakDbm = rawToDb(peakVal);
+            const avgDbm = rawToDb(sum / zoomedBins);  // Average within zoomed region
+
+            document.getElementById('meas_peak_display').textContent = (peakFreq / 1e6).toFixed(3) + ' MHz @ ' + peakDbm.toFixed(1) + ' dBm';
+            document.getElementById('meas_avg_display').textContent = avgDbm.toFixed(1) + ' dBm';
+        }
+
+        // ========================================================================
+        // DEMOD WORKSPACE - Live IQ and Waveform Displays
+        // ========================================================================
+
+        let demodIqCanvas = null;
+        let demodIqCtx = null;
+        let demodWaveformCanvas = null;
+        let demodWaveformCtx = null;
+
+        function initDemodDisplays() {
+            demodIqCanvas = document.getElementById('demod_iq_live');
+            demodWaveformCanvas = document.getElementById('demod_waveform');
+
+            if (demodIqCanvas) {
+                demodIqCtx = demodIqCanvas.getContext('2d');
+                const parent = demodIqCanvas.parentElement;
+                demodIqCanvas.width = parent ? parent.clientWidth : 500;
+                demodIqCanvas.height = parent ? parent.clientHeight : 400;
+                console.log('IQ canvas sized:', demodIqCanvas.width, 'x', demodIqCanvas.height);
+            }
+
+            if (demodWaveformCanvas) {
+                demodWaveformCtx = demodWaveformCanvas.getContext('2d');
+                const parent = demodWaveformCanvas.parentElement;
+                demodWaveformCanvas.width = parent ? parent.clientWidth : 500;
+                demodWaveformCanvas.height = parent ? parent.clientHeight : 400;
+                console.log('Waveform canvas sized:', demodWaveformCanvas.width, 'x', demodWaveformCanvas.height);
+            }
+
+            console.log('Demod displays initialized');
+        }
+
+        function updateDemodIqDisplay() {
+            if (!demodIqCtx) return;
+
+            // Fetch binary IQ data and render
+            fetch('/iq_data?t=' + Date.now())
+                .then(response => response.arrayBuffer())
+                .then(buffer => {
+                    // Parse binary data: CH1_I, CH1_Q, CH2_I, CH2_Q (256 int16 samples each)
+                    const view = new DataView(buffer);
+                    const samplesPerChannel = 256;
+
+                    const data = {
+                        i: new Array(samplesPerChannel),
+                        q: new Array(samplesPerChannel)
+                    };
+
+                    // Extract CH1 I and Q (first 512 bytes each)
+                    let offset = 0;
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.i[i] = view.getInt16(offset, true) / 2048.0; // Normalize to ±1.0
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.q[i] = view.getInt16(offset, true) / 2048.0;
+                        offset += 2;
+                    }
+
+                    const canvas = demodIqCanvas;
+                    const ctx = demodIqCtx;
+
+                    // Clear
+                    ctx.fillStyle = '#000';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    // Draw grid and axes
+                    ctx.strokeStyle = '#222';
+                    ctx.lineWidth = 1;
+
+                    // Vertical axis
+                    ctx.beginPath();
+                    ctx.moveTo(canvas.width / 2, 0);
+                    ctx.lineTo(canvas.width / 2, canvas.height);
+                    ctx.stroke();
+
+                    // Horizontal axis
+                    ctx.beginPath();
+                    ctx.moveTo(0, canvas.height / 2);
+                    ctx.lineTo(canvas.width, canvas.height / 2);
+                    ctx.stroke();
+
+                    // Draw IQ points
+                    const centerX = canvas.width / 2;
+                    const centerY = canvas.height / 2;
+                    const scale = Math.min(canvas.width, canvas.height) / 2 * 0.8;
+
+                    ctx.fillStyle = 'rgba(0, 255, 255, 0.3)';
+                    for (let i = 0; i < Math.min(data.i.length, 1000); i++) {
+                        const x = centerX + data.i[i] * scale;
+                        const y = centerY - data.q[i] * scale;
+
+                        ctx.fillRect(x - 1, y - 1, 2, 2);
+                    }
+                })
+                .catch(err => console.error('Failed to fetch IQ data:', err));
+        }
+
+        function updateDemodWaveform() {
+            if (!demodWaveformCtx) return;
+
+            fetch('/iq_data?t=' + Date.now())
+                .then(response => response.arrayBuffer())
+                .then(buffer => {
+                    // Parse binary data
+                    const view = new DataView(buffer);
+                    const samplesPerChannel = 256;
+
+                    const data = {
+                        i: new Array(samplesPerChannel),
+                        q: new Array(samplesPerChannel)
+                    };
+
+                    // Extract CH1 I and Q
+                    let offset = 0;
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.i[i] = view.getInt16(offset, true) / 2048.0;
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.q[i] = view.getInt16(offset, true) / 2048.0;
+                        offset += 2;
+                    }
+
+                    const canvas = demodWaveformCanvas;
+                    const ctx = demodWaveformCtx;
+
+                    // Clear
+                    ctx.fillStyle = '#000';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    // Draw I channel (cyan)
+                    ctx.strokeStyle = '#0ff';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+
+                    const centerY = canvas.height / 2;
+                    const yScale = canvas.height / 2 * 0.8;
+                    const xScale = canvas.width / Math.min(data.i.length, 500);
+
+                    for (let i = 0; i < Math.min(data.i.length, 500); i++) {
+                        const x = i * xScale;
+                        const y = centerY - data.i[i] * yScale;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.stroke();
+
+                    // Draw Q channel (orange)
+                    ctx.strokeStyle = '#ff8800';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+
+                    for (let i = 0; i < Math.min(data.q.length, 500); i++) {
+                        const x = i * xScale;
+                        const y = centerY - data.q[i] * yScale;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.stroke();
+
+                    // Draw center line
+                    ctx.strokeStyle = '#222';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(0, centerY);
+                    ctx.lineTo(canvas.width, centerY);
+                    ctx.stroke();
+                })
+                .catch(err => console.error('Failed to fetch IQ data:', err));
+        }
+
+        // Start update intervals when page loads
+        setTimeout(() => {
+            // Try initial canvas setup
+            initMeasurementsSpectrum();
+            initDemodDisplays();
+            initDemodSpectrum();
+            initSMeter();
+
+            // Update live stats in LIVE workspace
+            setInterval(updateLiveStats, 500);
+
+            // Update measurements spectrum
+            setInterval(() => {
+                const workspace = document.getElementById('workspace-measurements');
+                if (workspace && workspace.classList.contains('active')) {
+                    if (!measurementsSpectrumCtx) initMeasurementsSpectrum();
+                    updateMeasurementsSpectrum();
+                }
+            }, 100);
+
+            // Update demod displays
+            setInterval(() => {
+                const workspace = document.getElementById('workspace-demod');
+                if (workspace && workspace.classList.contains('active')) {
+                    if (!demodIqCtx || !demodWaveformCtx) initDemodDisplays();
+                    if (!demodSpectrumCtx) initDemodSpectrum();
+                    if (!sMeterCtx) initSMeter();
+
+                    updateDemodIqDisplay();
+                    updateDemodWaveform();
+                    updateDemodSpectrum();
+                    updateSMeter();
+                }
+            }, 100);
+
+            // Update direction finding spectrum
+            let directionUpdateCount = 0;
+            let directionIntervalStarted = false;
+            setInterval(() => {
+                const workspace = document.getElementById('workspace-direction');
+
+                // Log first time interval runs
+                if (!directionIntervalStarted) {
+                    directionIntervalStarted = true;
+                    console.log('Direction spectrum update interval started');
+                    console.log('workspace-direction element:', workspace);
+                    console.log('workspace active?', workspace ? workspace.classList.contains('active') : 'N/A');
+                    console.log('latestFFTData available?', latestFFTData ? latestFFTData.length + ' points' : 'null');
+                }
+
+                if (workspace && workspace.classList.contains('active')) {
+                    directionUpdateCount++;
+
+                    // Log every 10 updates instead of 100 for better visibility
+                    if (directionUpdateCount % 10 === 0) {
+                        console.log('Direction spectrum update #' + directionUpdateCount + ', latestFFTData:', latestFFTData ? latestFFTData.length + ' points' : 'null');
+                    }
+
+                    if (!directionFinding.spectrumCtx) {
+                        console.log('No spectrum context, initializing...');
+                        initDirectionSpectrum();
+                    }
+                    updateDirectionSpectrum();
+                }
+            }, 100);
+
+            console.log('Live workspace displays initialized');
+        }, 1000);
+
+        // Reinitialize canvases on window resize
+        window.addEventListener('resize', () => {
+            if (document.getElementById('workspace-measurements').classList.contains('active')) {
+                initMeasurementsSpectrum();
+            }
+            if (document.getElementById('workspace-demod').classList.contains('active')) {
+                initDemodDisplays();
+                initDemodSpectrum();
+                initSMeter();
+            }
+            if (document.getElementById('workspace-direction').classList.contains('active')) {
+                initDirectionSpectrum();
+                initDoAPolarMain();
+                initDoATimeline();
+            }
+        });
+
+    </script>
+
+    <!-- Load modular JavaScript components -->
+    <script src="/js/rf_measurements.js"></script>
+    <script src="/js/marker_system.js"></script>
+    <script src="/js/vsa_analysis.js"></script>
+    <script src="/js/statistics.js"></script>
+
+    <!-- Attach event listeners AFTER modules load -->
+    <script>
+        // Event listeners for modular panel toggles (now that functions are defined)
+        // Note: marker_toggle, vsa_toggle, stats_toggle removed in favor of workspace tabs
+        // document.getElementById('marker_toggle').addEventListener('click', toggleMarkerPanel);
+        // document.getElementById('vsa_toggle').addEventListener('click', toggleVSA);
+        // document.getElementById('stats_toggle').addEventListener('click', toggleStatsPanel);
+
+        // Event listeners for panel close buttons
+        document.getElementById('marker_panel_close').addEventListener('click', toggleMarkerPanel);
+        document.getElementById('vsa_panel_close').addEventListener('click', toggleVSA);
+        document.getElementById('stats_panel_close').addEventListener('click', toggleStatsPanel);
+
+        console.log('Modular panel event listeners attached');
+
+        // Make ALL panels draggable (including those from external modules and in workspaces)
+        document.querySelectorAll('.draggable-panel').forEach(panel => {
+            makePanelDraggable(panel);
+        });
+
+        // Make panel headers in workspace slots also draggable (to drag OUT of slots)
+        document.querySelectorAll('.workspace-panel-slot .panel-header').forEach(header => {
+            header.style.cursor = 'move';
+        });
+
+        console.log('Draggable panels initialized');
+
+        // ========================================================================
+        // WORKSPACE TAB SWITCHING
+        // ========================================================================
+
+        function switchWorkspace(tabName) {
+            // Hide all workspace content
+            document.querySelectorAll('.workspace-content').forEach(content => {
+                content.classList.remove('active');
+            });
+
+            // Remove active class from all tabs
+            document.querySelectorAll('.workspace-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+
+            // Show selected workspace
+            const workspace = document.getElementById('workspace-' + tabName);
+            if (workspace) {
+                workspace.classList.add('active');
+            }
+
+            // Activate selected tab
+            const tab = document.querySelector(`.workspace-tab[data-tab="${tabName}"]`);
+            if (tab) {
+                tab.classList.add('active');
+            }
+
+            // Move panels to their workspace slots
+            if (tabName === 'live') {
+                // Live workspace - hide all panels
+                document.getElementById('signal_analysis').style.display = 'none';
+                document.getElementById('marker_panel').style.display = 'none';
+                document.getElementById('stats_panel').style.display = 'none';
+                document.getElementById('activity_timeline').style.display = 'none';
+                document.getElementById('iq_constellation').style.display = 'none';
+                document.getElementById('xcorr_display').style.display = 'none';
+                document.getElementById('vsa_panel').style.display = 'none';
+                document.getElementById('demod_panel').style.display = 'none';
+
+                // Disable IQ and cross-correlation updates
+                showIQ = false;
+                showXCorr = false;
+            } else if (tabName === 'measurements') {
+                // Move measurement panels into their slots
+                const slot1 = document.getElementById('measurements-slot-1');
+                const slot2 = document.getElementById('measurements-slot-2');
+                const slot3 = document.getElementById('measurements-slot-3');
+                const slot4 = document.getElementById('measurements-slot-4');
+
+                const rfPanel = document.getElementById('signal_analysis');
+                const markerPanel = document.getElementById('marker_panel');
+                const statsPanel = document.getElementById('stats_panel');
+                const timelinePanel = document.getElementById('activity_timeline');
+
+                // Clear slots first
+                slot1.innerHTML = '';
+                slot2.innerHTML = '';
+                slot3.innerHTML = '';
+                slot4.innerHTML = '';
+
+                // Move panels into slots and show them
+                slot1.appendChild(rfPanel);
+                slot2.appendChild(markerPanel);
+                slot3.appendChild(statsPanel);
+                slot4.appendChild(timelinePanel);
+
+                rfPanel.style.display = 'flex';
+                rfPanel.style.flexDirection = 'column';
+                rfPanel.style.position = 'relative';
+                rfPanel.style.width = '100%';
+                rfPanel.style.height = '100%';
+                rfPanel.style.top = 'auto';
+                rfPanel.style.left = 'auto';
+                rfPanel.style.right = 'auto';
+                rfPanel.style.bottom = 'auto';
+
+                markerPanel.style.display = 'flex';
+                markerPanel.style.flexDirection = 'column';
+                markerPanel.style.position = 'relative';
+                markerPanel.style.width = '100%';
+                markerPanel.style.height = '100%';
+                markerPanel.style.top = 'auto';
+                markerPanel.style.left = 'auto';
+                markerPanel.style.right = 'auto';
+                markerPanel.style.bottom = 'auto';
+
+                statsPanel.style.display = 'flex';
+                statsPanel.style.flexDirection = 'column';
+                statsPanel.style.position = 'relative';
+                statsPanel.style.width = '100%';
+                statsPanel.style.height = '100%';
+                statsPanel.style.top = 'auto';
+                statsPanel.style.left = 'auto';
+                statsPanel.style.right = 'auto';
+                statsPanel.style.bottom = 'auto';
+
+                timelinePanel.style.display = 'flex';
+                timelinePanel.style.flexDirection = 'column';
+                timelinePanel.style.position = 'relative';
+                timelinePanel.style.width = '100%';
+                timelinePanel.style.height = '100%';
+                timelinePanel.style.top = 'auto';
+                timelinePanel.style.left = 'auto';
+                timelinePanel.style.right = 'auto';
+                timelinePanel.style.bottom = 'auto';
+
+                // Hide demod panels
+                document.getElementById('iq_constellation').style.display = 'none';
+                document.getElementById('xcorr_display').style.display = 'none';
+                document.getElementById('vsa_panel').style.display = 'none';
+                document.getElementById('demod_panel').style.display = 'none';
+                document.getElementById('stats_panel').style.display = 'none';
+
+                // Disable IQ and cross-correlation updates
+                showIQ = false;
+                showXCorr = false;
+            } else if (tabName === 'demod') {
+                // Move demod panels into their slots (Phase 3 enhanced layout)
+                const slotTracker = document.getElementById('demod-slot-tracker');
+                const slotInterference = document.getElementById('demod-slot-interference');
+                const slotDecoder = document.getElementById('demod-slot-decoder');
+
+                const trackerPanel = document.getElementById('signal_tracker_panel');
+                const interferencePanel = document.getElementById('interference_panel');
+                const decoderPanel = document.getElementById('decoder_panel');
+
+                // Clear slots first
+                slotTracker.innerHTML = '';
+                slotInterference.innerHTML = '';
+                slotDecoder.innerHTML = '';
+
+                // Move panels into slots: Signal Tracker | Interference | Decoder
+                slotTracker.appendChild(trackerPanel);
+                slotInterference.appendChild(interferencePanel);
+                slotDecoder.appendChild(decoderPanel);
+
+                // Style tracker panel (spans 2 rows)
+                trackerPanel.style.display = 'flex';
+                trackerPanel.style.flexDirection = 'column';
+                trackerPanel.style.position = 'relative';
+                trackerPanel.style.width = '100%';
+                trackerPanel.style.height = '100%';
+                trackerPanel.style.top = 'auto';
+                trackerPanel.style.left = 'auto';
+                trackerPanel.style.right = 'auto';
+                trackerPanel.style.bottom = 'auto';
+
+                // Style interference panel
+                interferencePanel.style.display = 'flex';
+                interferencePanel.style.flexDirection = 'column';
+                interferencePanel.style.position = 'relative';
+                interferencePanel.style.width = '100%';
+                interferencePanel.style.height = '100%';
+                interferencePanel.style.top = 'auto';
+                interferencePanel.style.left = 'auto';
+                interferencePanel.style.right = 'auto';
+                interferencePanel.style.bottom = 'auto';
+
+                // Style decoder panel
+                decoderPanel.style.display = 'flex';
+                decoderPanel.style.flexDirection = 'column';
+                decoderPanel.style.position = 'relative';
+                decoderPanel.style.width = '100%';
+                decoderPanel.style.height = '100%';
+                decoderPanel.style.top = 'auto';
+                decoderPanel.style.left = 'auto';
+                decoderPanel.style.right = 'auto';
+                decoderPanel.style.bottom = 'auto';
+
+                // Enable IQ and cross-correlation updates for demod workspace
+                showIQ = true;
+                showXCorr = true;
+
+                // Hide measurement panels and duplicate IQ panel
+                document.getElementById('signal_analysis').style.display = 'none';
+                document.getElementById('marker_panel').style.display = 'none';
+                document.getElementById('activity_timeline').style.display = 'none';
+                document.getElementById('iq_constellation').style.display = 'none';
+            } else if (tabName === 'direction') {
+                // Direction finding workspace - no panels to move, just hide all
+                document.getElementById('signal_analysis').style.display = 'none';
+                document.getElementById('marker_panel').style.display = 'none';
+                document.getElementById('stats_panel').style.display = 'none';
+                document.getElementById('activity_timeline').style.display = 'none';
+                document.getElementById('iq_constellation').style.display = 'none';
+                document.getElementById('xcorr_display').style.display = 'none';
+                document.getElementById('vsa_panel').style.display = 'none';
+                document.getElementById('demod_panel').style.display = 'none';
+
+                // Disable IQ and cross-correlation panel updates
+                showIQ = false;
+                showXCorr = false;
+
+                // Initialize direction finding canvases
+                setTimeout(() => {
+                    initDirectionSpectrum();
+                    initDoAPolarMain();
+                    initDoATimeline();
+                    showDoAInstructions();
+                }, 100);
+            }
+
+            console.log('Switched to workspace:', tabName);
+        }
+
+        // Detach panel from workspace slot back to floating mode
+        function detachPanel(panelId) {
+            const panel = document.getElementById(panelId);
+            if (!panel) return;
+
+            // Move panel to body (out of workspace slot)
+            document.body.appendChild(panel);
+
+            // Restore floating styles
+            panel.style.position = 'fixed';
+            panel.style.display = 'block';
+            panel.style.width = '450px';
+            panel.style.height = 'auto';
+            panel.style.maxHeight = '80vh';
+
+            // Position in center-ish of screen
+            panel.style.top = '100px';
+            panel.style.left = '50%';
+            panel.style.transform = 'translateX(-50%)';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+
+            // Restore border and shadow
+            panel.style.border = '1px solid #333';
+            panel.style.borderRadius = '4px';
+            panel.style.boxShadow = '0 4px 6px rgba(0, 0, 0, 0.5)';
+
+            console.log('Detached panel:', panelId);
+        }
+
+        // Attach click handlers to workspace tabs
+        document.querySelectorAll('.workspace-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const tabName = tab.getAttribute('data-tab');
+                switchWorkspace(tabName);
+
+                // Reinitialize canvases when switching tabs
+                setTimeout(() => {
+                    if (tabName === 'measurements') {
+                        initMeasurementsSpectrum();
+                    } else if (tabName === 'demod') {
+                        initDemodDisplays();
+                        initDemodSpectrum();
+                        initSMeter();
+                    } else if (tabName === 'direction') {
+                        initDirectionSpectrum();
+                        initDoAPolarMain();
+                        initDoATimeline();
+                        showDoAInstructions();
+                    }
+                }, 100);
+            });
+        });
+
+        // Initialize LIVE workspace as default (already active in HTML)
+        console.log('Workspace tab system initialized - LIVE workspace active by default');
+
+        // ===== FREQUENCY SCANNER FUNCTIONS =====
+        let scannerUpdateInterval = null;
+
+        function startScanner() {
+            const params = {
+                start_freq: parseInt(document.getElementById('scan_start').value),
+                stop_freq: parseInt(document.getElementById('scan_stop').value),
+                step: parseInt(document.getElementById('scan_step').value),
+                threshold: parseInt(document.getElementById('scan_threshold').value),
+                dwell_ms: parseInt(document.getElementById('scan_dwell').value)
+            };
+
+            fetch('/start_scanner', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(params)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    document.getElementById('scan_start_btn').style.display = 'none';
+                    document.getElementById('scan_stop_btn').style.display = 'block';
+                    document.getElementById('scan_status').textContent = 'Scanning...';
+                    document.getElementById('scan_status').style.color = '#0f0';
+
+                    // Start polling for updates
+                    scannerUpdateInterval = setInterval(updateScannerStatus, 500);
+                }
+            });
+        }
+
+        function stopScanner() {
+            fetch('/stop_scanner', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'}
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('scan_start_btn').style.display = 'block';
+                document.getElementById('scan_stop_btn').style.display = 'none';
+                document.getElementById('scan_status').textContent = 'Stopped';
+                document.getElementById('scan_status').style.color = '#888';
+
+                // Stop polling
+                if (scannerUpdateInterval) {
+                    clearInterval(scannerUpdateInterval);
+                    scannerUpdateInterval = null;
+                }
+            });
+        }
+
+        function clearScanner() {
+            fetch('/clear_scanner', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'}
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('scanner_signal_list').innerHTML = '<div style="color: #888; text-align: center; padding: 20px;">No signals detected</div>';
+                document.getElementById('scan_count').textContent = '0';
+                document.getElementById('scan_signal_count').textContent = '0';
+            });
+        }
+
+        function updateScannerStatus() {
+            fetch('/scanner_status')
+            .then(response => response.json())
+            .then(data => {
+                // Update status
+                document.getElementById('scan_current_freq').textContent = data.current_freq.toFixed(1);
+                document.getElementById('scan_count').textContent = data.scan_count;
+                document.getElementById('scan_signal_count').textContent = data.signals.length;
+
+                // Update signal list
+                const listDiv = document.getElementById('scanner_signal_list');
+                if (data.signals.length === 0) {
+                    listDiv.innerHTML = '<div style="color: #888; text-align: center; padding: 20px;">No signals detected</div>';
+                } else {
+                    // Sort by power (strongest first)
+                    const sorted = data.signals.sort((a, b) => b.power - a.power);
+                    let html = '<div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; padding-bottom: 5px; border-bottom: 1px solid #333; font-weight: bold; color: #0ff;">';
+                    html += '<div>Frequency</div><div>Power</div><div>BW</div><div>Hits</div></div>';
+
+                    sorted.forEach(sig => {
+                        html += '<div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; padding: 5px; border-bottom: 1px solid #222;">';
+                        html += '<div style="color: #0ff;">' + sig.freq.toFixed(3) + ' MHz</div>';
+                        html += '<div style="color: ' + (sig.power > -60 ? '#0f0' : sig.power > -80 ? '#ff0' : '#888') + ';">' + sig.power.toFixed(1) + ' dBm</div>';
+                        html += '<div style="color: #888;">' + (sig.bw / 1000).toFixed(1) + ' kHz</div>';
+                        html += '<div style="color: #888;">' + sig.hits + '</div>';
+                        html += '</div>';
+                    });
+                    listDiv.innerHTML = html;
+                }
+
+                // If stopped, stop updating
+                if (!data.scanning && scannerUpdateInterval) {
+                    clearInterval(scannerUpdateInterval);
+                    scannerUpdateInterval = null;
+                    document.getElementById('scan_status').textContent = 'Stopped';
+                    document.getElementById('scan_status').style.color = '#888';
+                }
+            });
+        }
+
+    </script>
+
+</body>
+</html>
+)HTMLDELIM";
+
+// Helper function to read JavaScript files
+static std::string read_js_file(const char* filepath) {
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        std::cerr << "JS file not found: " << filepath << std::endl;
+        return "";
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+// HTTP request handler
+void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
+#ifdef USE_MONGOOSE
+    if (ev == MG_EV_HTTP_MSG) {
+        struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+
+        // Serve main HTML page
+        if (mg_strcmp(hm->uri, mg_str("/")) == 0) {
+            mg_http_reply(c, 200,
+                "Content-Type: text/html\r\n"
+                "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                "Pragma: no-cache\r\n"
+                "Expires: 0\r\n",
+                "%s", html_page);
+        }
+        // FFT data request
+        else if (mg_strcmp(hm->uri, mg_str("/fft")) == 0) {
+            char channel_str[8] = "1";
+            mg_http_get_var(&hm->query, "ch", channel_str, sizeof(channel_str));
+            int channel = atoi(channel_str);
+
+            std::lock_guard<std::mutex> lock(g_waterfall.mutex);
+            const auto& history = (channel == 1) ? g_waterfall.ch1_history : g_waterfall.ch2_history;
+            int latest_idx = (g_waterfall.write_index - 1 + WATERFALL_HEIGHT) % WATERFALL_HEIGHT;
+
+            // Send raw magnitude data as binary
+            mg_printf(c, "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/octet-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Content-Length: %d\r\n"
+                        "\r\n", WATERFALL_WIDTH);
+            mg_send(c, history[latest_idx].data(), WATERFALL_WIDTH);
+            g_http_bytes_sent.fetch_add(WATERFALL_WIDTH);
+            c->is_draining = 1;
+        }
+        // Serve status JSON
+        else if (mg_strcmp(hm->uri, mg_str("/status")) == 0) {
+            char json[256];
+            snprintf(json, sizeof(json),
+                    "{\"freq\":%llu,\"sr\":%u,\"bw\":%u,\"g1\":%u,\"g2\":%u}",
+                    (unsigned long long)g_center_freq.load(),
+                    g_sample_rate.load(),
+                    g_bandwidth.load(),
+                    g_gain_rx1.load(),
+                    g_gain_rx2.load());
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n",
+                "%s", json);
+        }
+        // Serve IQ constellation data
+        else if (mg_strcmp(hm->uri, mg_str("/iq_data")) == 0) {
+            std::lock_guard<std::mutex> lock(g_iq_data.mutex);
+
+            // Calculate total data size: 4 arrays * 256 samples * 2 bytes per sample = 2048 bytes
+            const size_t sample_bytes = IQ_SAMPLES * sizeof(int16_t);
+            const size_t total_bytes = sample_bytes * 4;
+
+            // Send headers with exact Content-Length
+            mg_printf(c, "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/octet-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Content-Length: %zu\r\n"
+                        "\r\n", total_bytes);
+
+            // Send data in order: CH1_I, CH1_Q, CH2_I, CH2_Q
+            mg_send(c, g_iq_data.ch1_i, sample_bytes);
+            mg_send(c, g_iq_data.ch1_q, sample_bytes);
+            mg_send(c, g_iq_data.ch2_i, sample_bytes);
+            mg_send(c, g_iq_data.ch2_q, sample_bytes);
+            g_http_bytes_sent.fetch_add(total_bytes);
+            c->is_draining = 1;
+        }
+        // Serve cross-correlation data
+        else if (mg_strcmp(hm->uri, mg_str("/xcorr_data")) == 0) {
+            std::lock_guard<std::mutex> lock(g_xcorr_data.mutex);
+
+            // Calculate data size: magnitude + phase arrays (4096 floats each)
+            const size_t array_size = g_xcorr_data.magnitude.size();
+            const size_t mag_bytes = array_size * sizeof(float);
+            const size_t total_bytes = mag_bytes * 2;
+
+            // Send headers with exact Content-Length
+            mg_printf(c, "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/octet-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Content-Length: %zu\r\n"
+                        "\r\n", total_bytes);
+
+            // Send binary data - magnitude then phase
+            mg_send(c, g_xcorr_data.magnitude.data(), mag_bytes);
+            mg_send(c, g_xcorr_data.phase.data(), mag_bytes);
+            g_http_bytes_sent.fetch_add(total_bytes);
+            c->is_draining = 1;
+        }
+        // Serve Direction of Arrival result as JSON
+        else if (mg_strcmp(hm->uri, mg_str("/doa_result")) == 0) {
+            std::lock_guard<std::mutex> lock(g_doa_result.mutex);
+
+            // Format DoA result as JSON
+            char json[512];
+            snprintf(json, sizeof(json),
+                    "{\"azimuth\":%.2f,"
+                    "\"backAzimuth\":%.2f,"
+                    "\"hasAmbiguity\":%s,"
+                    "\"phaseDiff\":%.2f,"
+                    "\"phaseStd\":%.2f,"
+                    "\"confidence\":%.1f,"
+                    "\"snr\":%.1f,"
+                    "\"coherence\":%.3f}",
+                    g_doa_result.azimuth,
+                    g_doa_result.back_azimuth,
+                    g_doa_result.has_ambiguity ? "true" : "false",
+                    g_doa_result.phase_diff_deg,
+                    g_doa_result.phase_std_deg,
+                    g_doa_result.confidence,
+                    g_doa_result.snr_db,
+                    g_doa_result.coherence);
+
+            mg_http_reply(c, 200,
+                         "Content-Type: application/json\r\n"
+                         "Cache-Control: no-cache\r\n",
+                         "%s", json);
+            g_http_bytes_sent.fetch_add(strlen(json));
+        }
+        // Serve link quality metrics as JSON
+        else if (mg_strcmp(hm->uri, mg_str("/link_quality")) == 0) {
+            std::lock_guard<std::mutex> lock(g_link_quality.mutex);
+
+            // Calculate bandwidth in kbps (bytes_sent is already per-second from update)
+            float bandwidth_kbps = (g_link_quality.bytes_sent.load() * 8.0f) / 1000.0f;
+
+            char json[256];
+            snprintf(json, sizeof(json),
+                    "{\"rtt_ms\":%.1f,\"packet_loss\":%.3f,\"fps\":%.1f,\"bandwidth_kbps\":%.1f}",
+                    g_link_quality.rtt_ms.load(),
+                    g_link_quality.packet_loss.load(),
+                    g_link_quality.fps.load(),
+                    bandwidth_kbps);
+
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n",
+                "%s", json);
+        }
+        // Handle control commands (zoom and parameter changes)
+        else if (mg_strcmp(hm->uri, mg_str("/control")) == 0) {
+            // Parse JSON body using mg_json_get_long
+            double freq_val = mg_json_get_long(hm->body, "$.freq", -1);
+            double sr_val = mg_json_get_long(hm->body, "$.sr", -1);
+            double bw_val = mg_json_get_long(hm->body, "$.bw", -1);
+            double gain1_val = mg_json_get_long(hm->body, "$.gain1", -1);
+            double gain2_val = mg_json_get_long(hm->body, "$.gain2", -1);
+
+            // Only log significant parameter changes
+            if (freq_val >= 0 || sr_val >= 0 || bw_val >= 0) {
+                std::cout << "RF: ";
+                if (freq_val >= 0) std::cout << freq_val << "MHz ";
+                if (sr_val >= 0) std::cout << "SR:" << sr_val << "M ";
+                if (bw_val >= 0) std::cout << "BW:" << bw_val << "M ";
+                if (gain1_val >= 0 || gain2_val >= 0) std::cout << "G:" << gain1_val << "/" << gain2_val << "dB";
+                std::cout << std::endl;
+            }
+
+            bool has_update = false;
+            bool valid = true;
+            std::string update_msg = "Updated: ";
+
+            std::lock_guard<std::mutex> lock(g_config_mutex);
+
+            // Update frequency if provided
+            if (freq_val > 0) {
+                uint64_t new_freq = (uint64_t)freq_val;
+                if (new_freq >= 47000000ULL && new_freq <= 6000000000ULL) {
+                    g_center_freq.store(new_freq);
+                    has_update = true;
+                    update_msg += "freq=" + std::to_string(new_freq / 1e6) + "MHz ";
+                } else {
+                    valid = false;
+                }
+            }
+
+            // Update sample rate if provided
+            if (sr_val > 0) {
+                uint32_t new_sr = (uint32_t)sr_val;
+                if (new_sr >= 520000 && new_sr <= 61440000) {
+                    g_sample_rate.store(new_sr);
+                    has_update = true;
+                    update_msg += "sr=" + std::to_string(new_sr / 1e6) + "MHz ";
+                } else {
+                    valid = false;
+                }
+            }
+
+            // Update bandwidth if provided
+            if (bw_val > 0) {
+                uint32_t new_bw = (uint32_t)bw_val;
+                if (new_bw >= 520000 && new_bw <= 61440000) {
+                    g_bandwidth.store(new_bw);
+                    has_update = true;
+                    update_msg += "bw=" + std::to_string(new_bw / 1e6) + "MHz ";
+                } else {
+                    valid = false;
+                }
+            }
+
+            // Update gain RX1 if provided
+            if (gain1_val >= 0) {
+                uint32_t new_gain = (uint32_t)gain1_val;
+                if (new_gain <= 60) {
+                    g_gain_rx1.store(new_gain);
+                    has_update = true;
+                    update_msg += "RX1=" + std::to_string(new_gain) + "dB ";
+                } else {
+                    valid = false;
+                }
+            }
+
+            // Update gain RX2 if provided
+            if (gain2_val >= 0) {
+                uint32_t new_gain = (uint32_t)gain2_val;
+                if (new_gain <= 60) {
+                    g_gain_rx2.store(new_gain);
+                    has_update = true;
+                    update_msg += "RX2=" + std::to_string(new_gain) + "dB ";
+                } else {
+                    valid = false;
+                }
+            }
+
+            if (has_update && valid) {
+                g_params_changed.store(true);
+                mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                             "{\"status\":\"ok\"}");
+            } else if (!valid) {
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Invalid parameters\"}");
+            } else {
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"No parameters provided\"}");
+            }
+        }
+        // Start Recording Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/start_recording")) == 0) {
+            // Parse JSON body for filename
+            char *filename_str = mg_json_get_str(hm->body, "$.filename");
+
+            if (!filename_str) {
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Missing filename\"}");
+                return;
+            }
+
+            // Start recording
+            bool success = start_recording(filename_str);
+            free(filename_str);
+
+            if (success) {
+                std::lock_guard<std::mutex> lock(g_recording_mutex);
+                char json_buf[256];
+                snprintf(json_buf, sizeof(json_buf),
+                        "{\"status\":\"ok\",\"recording\":true,\"samples\":0}");
+                mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", json_buf);
+            } else {
+                mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Failed to start recording\"}");
+            }
+        }
+        // Stop Recording Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/stop_recording")) == 0) {
+            stop_recording();
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                         "{\"status\":\"ok\",\"recording\":false}");
+        }
+        // Get Recording Status Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/recording_status")) == 0) {
+            std::lock_guard<std::mutex> lock(g_recording_mutex);
+            char json_buf[256];
+            snprintf(json_buf, sizeof(json_buf),
+                    "{\"recording\":%s,\"samples\":%llu,\"duration_sec\":%.1f}",
+                    g_recording.active ? "true" : "false",
+                    (unsigned long long)g_recording.samples_written,
+                    g_recording.samples_written / (float)g_sample_rate.load());
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", json_buf);
+        }
+        // Start Scanner Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/start_scanner")) == 0) {
+            // Parse scan parameters
+            double start_freq_mhz = mg_json_get_long(hm->body, "$.start_freq", 400);
+            double stop_freq_mhz = mg_json_get_long(hm->body, "$.stop_freq", 6000);
+            double step_mhz = mg_json_get_long(hm->body, "$.step", 40);
+            double threshold = mg_json_get_long(hm->body, "$.threshold", -80);
+            long dwell = mg_json_get_long(hm->body, "$.dwell_ms", 100);
+
+            std::lock_guard<std::mutex> lock(g_scanner.mutex);
+            g_scanner.start_freq = (uint64_t)(start_freq_mhz * 1e6);
+            g_scanner.stop_freq = (uint64_t)(stop_freq_mhz * 1e6);
+            g_scanner.step_size = (uint64_t)(step_mhz * 1e6);
+            g_scanner.threshold_dbm = (float)threshold;
+            g_scanner.dwell_ms = (uint32_t)dwell;
+            g_scanner.current_freq = g_scanner.start_freq;
+            g_scanner.signals.clear();
+            g_scanner.scan_count = 0;
+            g_scanner.active = true;
+
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                         "{\"status\":\"ok\",\"scanning\":true}");
+        }
+        // Stop Scanner Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/stop_scanner")) == 0) {
+            std::lock_guard<std::mutex> lock(g_scanner.mutex);
+            g_scanner.active = false;
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                         "{\"status\":\"ok\",\"scanning\":false}");
+        }
+        // Get Scanner Status and Results
+        else if (mg_strcmp(hm->uri, mg_str("/scanner_status")) == 0) {
+            std::lock_guard<std::mutex> lock(g_scanner.mutex);
+
+            // Build JSON with signal list
+            std::string json = "{\"scanning\":";
+            json += g_scanner.active ? "true" : "false";
+            json += ",\"current_freq\":" + std::to_string(g_scanner.current_freq / 1e6);
+            json += ",\"scan_count\":" + std::to_string(g_scanner.scan_count);
+            json += ",\"signals\":[";
+
+            for (size_t i = 0; i < g_scanner.signals.size(); i++) {
+                if (i > 0) json += ",";
+                const auto& sig = g_scanner.signals[i];
+                json += "{\"freq\":" + std::to_string(sig.frequency / 1e6);
+                json += ",\"power\":" + std::to_string(sig.power_dbm);
+                json += ",\"bw\":" + std::to_string(sig.bandwidth_hz);
+                json += ",\"hits\":" + std::to_string(sig.hit_count) + "}";
+            }
+            json += "]}";
+
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", json.c_str());
+        }
+        // Clear Scanner Results
+        else if (mg_strcmp(hm->uri, mg_str("/clear_scanner")) == 0) {
+            std::lock_guard<std::mutex> lock(g_scanner.mutex);
+            g_scanner.signals.clear();
+            g_scanner.scan_count = 0;
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                         "{\"status\":\"ok\"}");
+        }
+        // UDP Stream Relay Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/stream_udp_relay")) == 0) {
+            // Parse JSON body using mg_json_get
+            char *endpoint_str = mg_json_get_str(hm->body, "$.endpoint");
+            long port_val = mg_json_get_long(hm->body, "$.port", 0);
+            char *data_str = mg_json_get_str(hm->body, "$.data");
+
+            if (!endpoint_str || port_val <= 0 || !data_str) {
+                if (endpoint_str) free(endpoint_str);
+                if (data_str) free(data_str);
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Missing endpoint, port, or data\"}");
+                return;
+            }
+
+            // Create UDP socket
+            int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (sockfd < 0) {
+                free(endpoint_str);
+                free(data_str);
+                mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Failed to create UDP socket\"}");
+                return;
+            }
+
+            struct sockaddr_in dest_addr;
+            memset(&dest_addr, 0, sizeof(dest_addr));
+            dest_addr.sin_family = AF_INET;
+            dest_addr.sin_port = htons((uint16_t)port_val);
+
+            if (inet_pton(AF_INET, endpoint_str, &dest_addr.sin_addr) <= 0) {
+                close(sockfd);
+                free(endpoint_str);
+                free(data_str);
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Invalid IP address\"}");
+                return;
+            }
+
+            // Send data via UDP
+            ssize_t sent = sendto(sockfd, data_str, strlen(data_str), 0,
+                                  (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+
+            close(sockfd);
+            // Only log errors, not every successful send
+            if (sent < 0) {
+                std::cerr << "UDP send failed to " << endpoint_str << ":" << port_val << std::endl;
+            }
+            free(endpoint_str);
+            free(data_str);
+
+            if (sent < 0) {
+                mg_http_reply(c, 500, "Content-Type: application/json\r\n",
+                             "{\"error\":\"UDP send failed\"}");
+            } else {
+                mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                             "{\"status\":\"ok\",\"sent\":%d}", (int)sent);
+            }
+        }
+        // Serve JavaScript modules from web_assets/js/
+        else if (mg_strcmp(hm->uri, mg_str("/js/rf_measurements.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/rf_measurements.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/marker_system.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/marker_system.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/vsa_analysis.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/vsa_analysis.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/statistics.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/statistics.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else {
+            mg_http_reply(c, 404, "Content-Type: text/plain\r\n", "Not Found");
+        }
+    }
+#else
+    (void)c; (void)ev; (void)ev_data;
+#endif
+}
+
+// Removed TX endpoints - keeping code minimal and RX-focused
+
+void start_web_server() {
+#ifdef USE_MONGOOSE
+    g_web_running = true;
+
+    // Start web server thread
+    g_web_thread = std::thread([]() {
+        // Reduce mongoose logging verbosity (only show errors)
+        mg_log_set(MG_LL_ERROR);
+
+        mg_mgr_init(&g_mgr);
+
+        char url[64];
+        snprintf(url, sizeof(url), "http://0.0.0.0:%d", WEB_SERVER_PORT);
+
+        if (mg_http_listen(&g_mgr, url, web_server_handler, nullptr) == nullptr) {
+            std::cerr << "Web server failed to start on port " << WEB_SERVER_PORT << std::endl;
+            g_web_running = false;
+            return;
+        }
+
+        std::cout << "Web server ready: http://localhost:" << WEB_SERVER_PORT << std::endl;
+
+        while (g_web_running) {
+            mg_mgr_poll(&g_mgr, 100);  // Poll every 100ms
+        }
+
+        mg_mgr_free(&g_mgr);
+    });
+#else
+    std::cout << "Web server disabled (USE_MONGOOSE not defined)" << std::endl;
+#endif
+}
+
+void stop_web_server() {
+    if (g_web_running) {
+        g_web_running = false;
+        if (g_web_thread.joinable()) {
+            g_web_thread.join();
+        }
+    }
+}
+

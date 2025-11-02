@@ -1,0 +1,62 @@
+# Build directories
+build/
+server/build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Compiled C/C++ files
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Python
+venv/
+env/
+ENV/
+client/venv/
+__pycache__/
+client/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+*.egg
+dist/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.settings/
+.project
+.cproject
+
+# OS
+.DS_Store
+Thumbs.db
+*.bak
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Compiled binaries
+bladerf_server

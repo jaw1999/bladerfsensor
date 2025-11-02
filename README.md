@@ -2,6 +2,26 @@
 
 Advanced RF spectrum monitoring and direction finding system using bladeRF xA9 for coherent dual-channel acquisition
 
+## Recent Updates (January 2025)
+
+**Major UI/UX Quality Improvements:**
+- ✅ Replaced 38 blocking alert() dialogs with professional toast notifications
+- ✅ Added real-time connection status monitoring
+- ✅ Implemented request throttling on all data endpoints
+- ✅ Added keyboard shortcuts for zoom and navigation
+- ✅ UI state persistence between page reloads
+- ✅ Enhanced error handling with specific messages
+- ✅ localStorage safety with quota management
+- ✅ DOM null safety throughout
+- ✅ 5-second fetch timeout protection on all requests
+- ✅ Centralized configuration constants
+
+**Workspace Updates:**
+- Streamlined to 3 core workspaces: LIVE, DIRECTION, SCANNER
+- Removed MEASUREMENTS and DEMOD tabs (experimental features)
+- Enhanced LIVE workspace with improved controls
+- Better preset management with validation
+
 ## Overview
 
 This system provides real-time RF spectrum monitoring, signal analysis, and 2-channel direction finding using a bladeRF xA9 SDR. The server runs on a LattePanda Sigma or similar platform, performs coherent dual-channel sampling at 40 MHz, FFT processing, cross-correlation analysis, and serves an advanced web interface with multiple workspaces over HTTP. Features include TAKX-RF integration for tactical systems, real-time spectrum analysis, and recording capabilities.
@@ -38,9 +58,12 @@ This system provides real-time RF spectrum monitoring, signal analysis, and 2-ch
 │  Ground Station - Web Browser UI                   │
 │  ┌──────────────────────────────────────────────┐  │
 │  │  LIVE: Waterfall + Spectrum + IQ + Controls  │  │
-│  │  MEASUREMENTS: Signal Analysis + Mask Tests  │  │
 │  │  DIRECTION: Phase-Based DF + CoT Streaming   │  │
-│  │  DEMOD: IQ Visualization (Placeholder)       │  │
+│  │  SCANNER: Frequency Scanning & Detection     │  │
+│  │  • Toast notifications                       │  │
+│  │  • Connection status monitoring              │  │
+│  │  • Request throttling & error handling       │  │
+│  │  • Keyboard shortcuts & state persistence    │  │
 │  └──────────────────────────────────────────────┘  │
 └─────────────┬──────────────────────────────────────┘
               │
@@ -85,19 +108,16 @@ This system provides real-time RF spectrum monitoring, signal analysis, and 2-ch
 ### Web Interface - Multiple Workspaces
 
 #### LIVE Tab
-- **Real-time waterfall display** with color gradients
+- **Real-time waterfall display** with color gradients (Viridis palette)
 - **Spectrum analyzer** with gradient fill and color-coded traces
 - **Dual-channel display** (RX1/RX2/Both)
-- **Interactive zoom** (mouse selection, scroll/zoom)
-- **IQ constellation plots**
+- **Interactive zoom** (mouse selection, keyboard shortcuts)
+- **IQ constellation plots** for both channels
+- **Cross-correlation visualization**
 - **RF parameter controls** (frequency, gain, sample rate, bandwidth)
-
-#### MEASUREMENTS Tab
-- **Signal measurements**: Peak, Average, Noise Floor, OBUE
-- **Occupied bandwidth** (-3dB calculation)
-- **SNR calculations**
-- **Peak detection** with threshold control
-- **Spectrum analyzer** with peak markers
+- **Preset management** with import/export
+- **Link quality monitoring** (RTT, bandwidth, packet loss)
+- **Connection status indicator** (real-time monitoring)
 
 #### DIRECTION Tab
 - **Interactive spectrum display** with frequency selection
@@ -108,11 +128,49 @@ This system provides real-time RF spectrum monitoring, signal analysis, and 2-ch
 - **CoT streaming configuration** (UDP/TCP)
 - **Platform position** (static or MGRS)
 - **Calibration controls**
+- **DoA polar plot** and **timeline visualization**
 
-#### DEMOD Tab
-- **Live IQ display**
-- **Waveform visualization**
-- **Placeholder for future demodulation** (AM/FM/PSK/FSK)
+#### SCANNER Tab
+- **Frequency scanning** with configurable parameters
+- **Dwell time control** per frequency
+- **Signal detection** and logging
+- **Scan result visualization**
+
+### UI/UX Enhancements
+
+#### Professional Error Handling
+- **Toast notification system** - Non-blocking notifications (info, success, warning, error)
+- **Connection status indicator** - Real-time monitoring with color-coded states
+- **Loading indicators** - Visual feedback for async operations
+- **Enhanced input validation** - Clear, specific error messages
+- **DOM safety** - Null pointer protection throughout
+
+#### Performance Optimizations
+- **Request throttling** - Prevents request pile-ups on all endpoints
+- **Automatic timeout handling** - 5-second timeout on all fetch operations
+- **Connection recovery** - Automatic reconnection detection
+- **Bandwidth monitoring** - Real-time link quality metrics
+
+#### User Experience
+- **Keyboard shortcuts**:
+  - `-` : Zoom out to full spectrum
+  - `0` : Reset zoom
+  - `Escape` : Cancel selection / Reset zoom
+  - `?` : Show keyboard shortcuts help
+- **UI state persistence** - Settings saved between page reloads:
+  - Waterfall intensity & contrast
+  - Spectrum min/max dB range
+  - Channel selection
+  - Display visibility states
+  - Signal analysis preferences
+- **Preset management** - Import/export with validation
+- **localStorage safety** - Quota handling with 5MB limit
+
+#### Developer Features
+- **Configuration constants** - Centralized CONFIG object
+- **Safe storage operations** - Quota and validation checks
+- **Comprehensive logging** - Console messages for debugging
+- **Error recovery** - Graceful degradation on failures
 
 ### Recording & Playback
 - **Spectrum recording** to WAV format
@@ -426,8 +484,13 @@ As link quality degrades:
 2. Navigate to **LIVE** tab
 3. Adjust frequency, gain, and sample rate as needed
 4. Enable **Spectrum** view for real-time analysis
-5. Use mouse to **zoom into signals** (drag to select, right-click to zoom out)
-6. Use **Ctrl+Scroll** to zoom Y-axis, **Scroll** to pan
+5. Use mouse to **zoom into signals** (drag to select)
+6. **Keyboard shortcuts**:
+   - Press `-` to zoom out
+   - Press `0` to reset zoom
+   - Press `Esc` to cancel selection
+   - Press `?` for help
+7. Settings automatically save on page unload
 
 ### Direction Finding
 1. Navigate to **DIRECTION** tab
@@ -458,19 +521,26 @@ As link quality degrades:
 
 - **2-Channel DF**: Inherent 180° ambiguity (requires 3+ channels to resolve)
 - **MGRS Conversion**: Uses simplified approximation (errors of 100m-1km depending on location)
-- **Demodulation**: UI placeholder only, no actual AM/FM/PSK/FSK demodulation implemented
-- **Multi-client**: Single client recommended for best performance
+- **Multi-client**: Single client recommended for best performance (connection sharing not optimized)
 
 ## Future Enhancements
 
+### Planned Features
 - **Automatic signal classification** using ML
 - **GPS integration** for dynamic platform positioning
-- **Real-time demodulation** (AM/FM/PSK/FSK)
 - **Adaptive streaming** based on link quality
 - **Multi-client support** with bandwidth sharing
-- **CUDA/OpenCL FFT** acceleration
+- **CUDA/OpenCL FFT** acceleration for higher update rates
 - **Persistent storage** of spectrum recordings
 - **Replay mode** from recorded files
+- **3+ channel support** for DF ambiguity resolution
+- **Advanced demodulation** (AM/FM/PSK/FSK) - currently experimental
+
+### Performance Enhancements
+- Canvas double-buffering for smoother rendering
+- WebAssembly FFT processing in browser
+- WebGL-accelerated waterfall rendering
+- Compressed binary protocol (beyond current 8-bit)
 
 ## References
 

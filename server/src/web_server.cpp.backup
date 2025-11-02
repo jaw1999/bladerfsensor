@@ -769,124 +769,6 @@ const char* html_page = R"HTMLDELIM(
             padding-right: 5px;
             transition: top 0.3s ease;
         }
-        /* Toast Notification System */
-        .notification-container {
-            position: fixed;
-            top: 60px;
-            right: 20px;
-            z-index: 10000;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            pointer-events: none;
-        }
-        .notification {
-            min-width: 300px;
-            max-width: 400px;
-            padding: 12px 16px;
-            border-radius: 4px;
-            font-size: 12px;
-            color: #fff;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            animation: slideIn 0.3s ease-out, fadeOut 0.3s ease-in 2.7s;
-            pointer-events: auto;
-            border: 1px solid;
-        }
-        .notification-info {
-            background: rgba(0, 170, 255, 0.2);
-            border-color: #0af;
-        }
-        .notification-success {
-            background: rgba(0, 255, 100, 0.2);
-            border-color: #0f0;
-        }
-        .notification-warning {
-            background: rgba(255, 200, 0, 0.2);
-            border-color: #fc0;
-        }
-        .notification-error {
-            background: rgba(255, 50, 50, 0.2);
-            border-color: #f33;
-        }
-        @keyframes slideIn {
-            from {
-                transform: translateX(400px);
-                opacity: 0;
-            }
-            to {
-                transform: translateX(0);
-                opacity: 1;
-            }
-        }
-        @keyframes fadeOut {
-            to {
-                opacity: 0;
-                transform: translateX(400px);
-            }
-        }
-        /* Connection Status Indicator */
-        .connection-status {
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            padding: 3px 8px;
-            border-radius: 3px;
-            font-size: 10px;
-            font-weight: bold;
-        }
-        .connection-status.connected {
-            background: rgba(0, 255, 0, 0.2);
-            color: #0f0;
-            border: 1px solid #0f0;
-        }
-        .connection-status.disconnected {
-            background: rgba(255, 0, 0, 0.2);
-            color: #f33;
-            border: 1px solid #f33;
-        }
-        .connection-status.connecting {
-            background: rgba(255, 200, 0, 0.2);
-            color: #fc0;
-            border: 1px solid #fc0;
-        }
-        .connection-status::before {
-            content: '●';
-            animation: pulse 2s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        /* Loading Indicator */
-        .loading-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.5);
-            display: none;
-            justify-content: center;
-            align-items: center;
-            z-index: 9999;
-        }
-        .loading-overlay.active {
-            display: flex;
-        }
-        .loading-spinner {
-            width: 60px;
-            height: 60px;
-            border: 4px solid rgba(0, 255, 255, 0.2);
-            border-top-color: #0ff;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-        }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
     </style>
 </head>
 <body>
@@ -902,8 +784,6 @@ const char* html_page = R"HTMLDELIM(
             <span>LINK: <span class="status-value" id="link_quality_bar">●●●●●</span></span>
             <span>RTT: <span class="status-value" id="rtt">--</span></span>
             <span>BW: <span class="status-value" id="bandwidth">--</span></span>
-            <span style="color: #888; margin-left: 10px;">|</span>
-            <span class="connection-status connecting" id="connectionStatus">CONNECTING</span>
         </div>
         <div class="controls">
             <div class="workspace-tabs">
@@ -969,6 +849,166 @@ const char* html_page = R"HTMLDELIM(
         </div> <!-- End workspace-live -->
 
         <!-- TAB 2: DIRECTION FINDING -->
+        <div class="workspace-content" id="workspace-demod">
+            <div style="display: flex; flex-direction: column; height: 100%; overflow: hidden;">
+
+                <!-- Top Control Bar: Demodulation Mode Selection -->
+                <div style="flex: 0 0 auto; background: #111; padding: 12px; border-bottom: 2px solid #0ff; display: flex; flex-direction: column; gap: 8px;">
+                    <!-- Row 1: Mode Selection + Presets -->
+                    <div style="display: flex; gap: 15px; align-items: center; justify-content: space-between;">
+                        <!-- Left: Mode Selection -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <div style="color: #0ff; font-weight: bold; font-size: 11px;">MODE:</div>
+                            <button id="mode_am" onclick="quickSelectMode('am')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">AM</button>
+                            <button id="mode_fm" onclick="quickSelectMode('fm')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">NFM</button>
+                            <button id="mode_wfm" onclick="quickSelectMode('wfm')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">WFM</button>
+                            <button id="mode_usb" onclick="quickSelectMode('usb')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">USB</button>
+                            <button id="mode_lsb" onclick="quickSelectMode('lsb')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">LSB</button>
+                            <button id="mode_fsk" onclick="quickSelectMode('fsk')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">FSK</button>
+                            <button id="mode_psk" onclick="quickSelectMode('psk')" class="demod-mode-btn" style="padding: 6px 12px; background: #1a1a1a; border: 2px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 10px; font-weight: bold;">PSK</button>
+                        </div>
+
+                        <!-- Center: Presets -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <div style="color: #888; font-size: 10px; font-weight: bold;">PRESETS:</div>
+                            <button onclick="loadPreset('broadcast_fm')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">FM Broadcast</button>
+                            <button onclick="loadPreset('aircraft')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">Aircraft</button>
+                            <button onclick="loadPreset('marine')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">Marine VHF</button>
+                            <button onclick="loadPreset('weather')" style="padding: 6px 12px; background: #1a1a1a; border: 1px solid #888; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 9px;">Weather</button>
+                        </div>
+
+                        <!-- Right: Start/Stop Control -->
+                        <div style="display: flex; gap: 10px; align-items: center;">
+                            <div id="demod_status_indicator" style="width: 12px; height: 12px; border-radius: 50%; background: #666; border: 1px solid #888;"></div>
+                            <button id="demod_start_stop" onclick="toggleDemodulation()" style="padding: 8px 20px; background: #0a5; border: 2px solid #0f0; color: #fff; cursor: pointer; border-radius: 5px; font-size: 11px; font-weight: bold;">START</button>
+                        </div>
+                    </div>
+
+                    <!-- Row 2: Volume, AFC, Record -->
+                    <div style="display: flex; gap: 20px; align-items: center;">
+                        <!-- Volume Control -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <div style="color: #888; font-size: 10px;">VOL:</div>
+                            <input type="range" id="demod_volume_slider" min="0" max="100" value="50" style="width: 100px;">
+                            <span id="demod_volume_value" style="color: #0f0; font-family: monospace; font-size: 10px; min-width: 30px;">50%</span>
+                        </div>
+
+                        <!-- AFC Toggle -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;">
+                                <input type="checkbox" id="afc_enable" onchange="toggleAFC()" style="cursor: pointer;">
+                                <span style="color: #888; font-size: 10px;">AFC (Auto Frequency Control)</span>
+                            </label>
+                        </div>
+
+                        <!-- Audio Recording -->
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <button id="audio_record_btn" onclick="toggleAudioRecording()" style="padding: 5px 12px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">⏺ Record Audio</button>
+                            <span id="audio_record_time" style="color: #f00; font-family: monospace; font-size: 10px; display: none;">00:00</span>
+                        </div>
+
+                        <!-- Export Button -->
+                        <button onclick="exportDecodedData()" style="padding: 5px 12px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">📥 Export Data</button>
+                    </div>
+                </div>
+
+                <!-- Middle: Live Displays (50%) -->
+                <div style="flex: 0 0 50%; display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr auto; gap: 10px; padding: 10px; background: #0a0a0a; border-bottom: 1px solid #333;">
+                    <!-- Spectrum Display with Signal Selection (spans top row, left 2 columns) -->
+                    <div style="grid-column: span 2; background: #000; border: 1px solid #0ff; border-radius: 4px; position: relative;">
+                        <canvas id="demod_spectrum" style="width: 100%; height: 100%; display: block; cursor: crosshair;"></canvas>
+                        <div style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.9); padding: 6px; border: 1px solid #0ff; border-radius: 3px; font-size: 10px;">
+                            <div style="color: #0ff; font-weight: bold; margin-bottom: 3px;">SPECTRUM - CLICK TO TUNE</div>
+                            <div style="color: #888; font-family: monospace; font-size: 9px;">
+                                <div>Tuned: <span style="color: #0f0;" id="demod_tuned_freq">-- MHz</span></div>
+                                <div>BW: <span style="color: #ff0;" id="demod_bandwidth">15 kHz</span></div>
+                                <div>Signal: <span style="color: #0ff;" id="demod_signal_power">-- dBm</span></div>
+                            </div>
+                        </div>
+                        <!-- Selection marker -->
+                        <div id="demod_tune_marker" style="position: absolute; top: 0; bottom: 0; width: 2px; background: #0f0; box-shadow: 0 0 8px #0f0; display: none; pointer-events: none;"></div>
+                    </div>
+
+                    <!-- S-Meter (top right) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; padding: 8px; display: flex; flex-direction: column; gap: 5px;">
+                        <div style="color: #0ff; font-size: 9px; font-weight: bold;">SIGNAL STRENGTH</div>
+                        <canvas id="s_meter_canvas" style="width: 100%; height: 80px;"></canvas>
+                        <div style="display: flex; justify-content: space-between; font-family: monospace; font-size: 8px; color: #888;">
+                            <span>S1</span>
+                            <span>S5</span>
+                            <span>S9</span>
+                            <span>+20</span>
+                        </div>
+                        <div style="text-align: center;">
+                            <span style="color: #0f0; font-family: monospace; font-size: 14px; font-weight: bold;" id="s_meter_value">S0</span>
+                        </div>
+                    </div>
+
+                    <!-- IQ Constellation (bottom left) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; position: relative;">
+                        <canvas id="demod_iq_live" style="width: 100%; height: 100%; display: block;"></canvas>
+                        <div style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.9); padding: 4px; border: 1px solid #0ff; border-radius: 3px; font-size: 9px;">
+                            <div style="color: #0ff; font-weight: bold; margin-bottom: 2px;">IQ CONSTELLATION</div>
+                            <div style="color: #888; font-family: monospace; font-size: 8px;">
+                                <div>EVM: <span style="color: #0f0;" id="demod_evm_live">--%</span></div>
+                                <div>SNR: <span style="color: #0ff;" id="demod_snr_live">-- dB</span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Audio Level + Controls (bottom center) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; padding: 8px; display: flex; flex-direction: column; gap: 8px;">
+                        <div>
+                            <div style="color: #0ff; font-size: 9px; font-weight: bold; margin-bottom: 4px;">AUDIO LEVEL</div>
+                            <div style="display: flex; gap: 5px; align-items: center;">
+                                <div style="flex: 1; background: #111; height: 20px; border: 1px solid #333; border-radius: 2px; position: relative; overflow: hidden;">
+                                    <div id="audio_level_bar" style="height: 100%; background: linear-gradient(to right, #0f0, #ff0, #f00); width: 0%; transition: width 0.1s;"></div>
+                                    <div style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; color: #fff; font-weight: bold; text-shadow: 1px 1px 2px #000;" id="audio_level_text">0%</div>
+                                </div>
+                            </div>
+                            <div style="text-align: center; margin-top: 2px;">
+                                <span style="color: #888; font-size: 8px;">AGC: </span>
+                                <span style="color: #0f0; font-family: monospace; font-size: 9px;" id="agc_gain_display">1.0x</span>
+                            </div>
+                        </div>
+                        <div>
+                            <div style="color: #0ff; font-size: 9px; font-weight: bold; margin-bottom: 4px;">SQUELCH</div>
+                            <input type="range" id="squelch_slider" min="-100" max="-20" value="-100" style="width: 100%;">
+                            <div style="text-align: center; margin-top: 2px;">
+                                <span style="color: #ff0; font-family: monospace; font-size: 9px;" id="squelch_value">OFF</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Time Domain + Info (bottom right) -->
+                    <div style="background: #000; border: 1px solid #0ff; border-radius: 4px; position: relative;">
+                        <canvas id="demod_waveform" style="width: 100%; height: 100%; display: block;"></canvas>
+                        <div style="position: absolute; top: 5px; left: 5px; background: rgba(0,0,0,0.9); padding: 4px; border: 1px solid #0ff; border-radius: 3px; font-size: 9px;">
+                            <div style="color: #0ff; font-weight: bold; margin-bottom: 2px;">TIME DOMAIN</div>
+                            <div style="color: #888; font-family: monospace; font-size: 8px;">
+                                <div>Mode: <span style="color: #0f0;" id="demod_mode_display">OFF</span></div>
+                                <div>AFC: <span style="color: #ff0;" id="afc_status">OFF</span></div>
+                                <div id="demod_status_text" style="margin-top: 4px; color: #888;">Ready</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Bottom: Analysis Panels (50%) -->
+                <div style="flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 10px; padding: 10px; overflow: auto; min-height: 0;">
+                    <!-- Signal Tracker Panel -->
+                    <div id="demod-slot-tracker" class="workspace-panel-slot" style="grid-row: span 2;"></div>
+
+                    <!-- Interference Analysis Panel -->
+                    <div id="demod-slot-interference" class="workspace-panel-slot"></div>
+
+                    <!-- Protocol Decoder Output Panel -->
+                    <div id="demod-slot-decoder" class="workspace-panel-slot"></div>
+                </div>
+            </div>
+        </div> <!-- End workspace-demod -->
+
+        <!-- TAB 4: DIRECTION FINDING -->
         <div class="workspace-content" id="workspace-direction">
             <div style="display: flex; flex-direction: column; height: 100%; gap: 8px;">
 
@@ -1146,7 +1186,7 @@ const char* html_page = R"HTMLDELIM(
             </div>
         </div> <!-- End workspace-direction -->
 
-        <!-- TAB 3: SCANNER -->
+        <!-- TAB 5: SCANNER -->
         <div class="workspace-content" id="workspace-scanner">
             <div style="display: grid; grid-template-columns: 350px 1fr; gap: 15px; height: 100%; padding: 15px;">
                 <!-- Left Panel: Scanner Controls -->
@@ -2195,14 +2235,6 @@ const char* html_page = R"HTMLDELIM(
     <!-- Measurement Cursors Canvas Overlay -->
     <canvas id="cursor_overlay" style="position: fixed; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 500;"></canvas>
 
-    <!-- Notification Container -->
-    <div id="notificationContainer" class="notification-container"></div>
-
-    <!-- Loading Overlay -->
-    <div id="loadingOverlay" class="loading-overlay">
-        <div class="loading-spinner"></div>
-    </div>
-
     <!-- Global UI elements (outside workspaces) -->
     <div class="fps" id="fps">-- FPS</div>
     <div class="resolution-info" id="resolution">--</div>
@@ -2401,227 +2433,6 @@ const char* html_page = R"HTMLDELIM(
             cursorPos: { x: null, y: null },
             peakMarkers: []
         };
-
-        // Configuration Constants
-        const CONFIG = {
-            DEFAULT_SAMPLE_RATE: 40e6,           // 40 MHz
-            FETCH_TIMEOUT_MS: 5000,              // 5 second timeout
-            WATERFALL_UPDATE_INTERVAL_MS: 100,   // 10 Hz
-            STATUS_UPDATE_INTERVAL_MS: 2000,     // 2 seconds
-            IQ_UPDATE_INTERVAL_MS: 100,          // 10 Hz
-            XCORR_UPDATE_INTERVAL_MS: 500,       // 2 Hz
-            LINK_QUALITY_UPDATE_MS: 1000,        // 1 Hz
-            DEFAULT_FPS: 20,
-            FREQ_MIN_MHZ: 47,
-            FREQ_MAX_MHZ: 6000,
-            SR_MIN_MHZ: 0.52,
-            SR_MAX_MHZ: 61.44,
-            GAIN_MIN_DB: 0,
-            GAIN_MAX_DB: 60,
-            NOTIFICATION_DURATION_MS: 3000,
-            MAX_STORAGE_SIZE_BYTES: 5000000      // 5MB localStorage limit
-        };
-
-        // Connection state
-        let connectionState = {
-            isConnected: false,
-            lastSuccessfulFetch: Date.now(),
-            consecutiveFailures: 0
-        };
-
-        /**
-         * Toast Notification System
-         * Displays non-blocking notifications to the user
-         * @param {string} message - The message to display
-         * @param {string} type - Notification type: 'info', 'success', 'warning', 'error'
-         * @param {number} duration - Duration in ms (default: 3000)
-         */
-        function showNotification(message, type = 'info', duration = CONFIG.NOTIFICATION_DURATION_MS) {
-            const container = document.getElementById('notificationContainer');
-            if (!container) {
-                console.warn('Notification container not found');
-                return;
-            }
-
-            const notification = document.createElement('div');
-            notification.className = `notification notification-${type}`;
-
-            // Add icon based on type
-            const icons = {
-                info: 'ℹ️',
-                success: '✓',
-                warning: '⚠️',
-                error: '✕'
-            };
-
-            notification.innerHTML = `
-                <span style="font-size: 16px;">${icons[type] || ''}</span>
-                <span>${message}</span>
-            `;
-
-            container.appendChild(notification);
-
-            // Auto-remove after duration
-            setTimeout(() => {
-                notification.style.animation = 'fadeOut 0.3s ease-in forwards';
-                setTimeout(() => notification.remove(), 300);
-            }, duration);
-        }
-
-        /**
-         * Update connection status indicator
-         * @param {string} status - 'connected', 'disconnected', or 'connecting'
-         */
-        function updateConnectionStatus(status) {
-            const indicator = document.getElementById('connectionStatus');
-            if (!indicator) return;
-
-            indicator.className = `connection-status ${status}`;
-            indicator.textContent = status.toUpperCase();
-
-            connectionState.isConnected = (status === 'connected');
-
-            if (status === 'connected') {
-                connectionState.lastSuccessfulFetch = Date.now();
-                connectionState.consecutiveFailures = 0;
-            }
-        }
-
-        /**
-         * Show/hide loading overlay
-         * @param {boolean} show - Whether to show the loading indicator
-         */
-        function setLoading(show) {
-            const overlay = document.getElementById('loadingOverlay');
-            if (!overlay) return;
-
-            if (show) {
-                overlay.classList.add('active');
-            } else {
-                overlay.classList.remove('active');
-            }
-        }
-
-        /**
-         * Fetch wrapper with timeout and error handling
-         * @param {string} url - The URL to fetch
-         * @param {object} options - Fetch options
-         * @param {number} timeout - Timeout in milliseconds
-         * @returns {Promise<Response>}
-         */
-        async function fetchWithTimeout(url, options = {}, timeout = CONFIG.FETCH_TIMEOUT_MS) {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-            try {
-                const response = await fetch(url, {
-                    ...options,
-                    signal: controller.signal
-                });
-                clearTimeout(timeoutId);
-
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                }
-
-                connectionState.lastSuccessfulFetch = Date.now();
-                connectionState.consecutiveFailures = 0;
-
-                if (!connectionState.isConnected) {
-                    updateConnectionStatus('connected');
-                }
-
-                return response;
-            } catch (error) {
-                clearTimeout(timeoutId);
-
-                connectionState.consecutiveFailures++;
-
-                if (connectionState.consecutiveFailures >= 3) {
-                    updateConnectionStatus('disconnected');
-                }
-
-                if (error.name === 'AbortError') {
-                    throw new Error(`Request timeout after ${timeout}ms`);
-                }
-
-                throw error;
-            }
-        }
-
-        /**
-         * Safe DOM element getter with null check
-         * @param {string} id - Element ID
-         * @returns {HTMLElement|null}
-         */
-        function getElement(id) {
-            const element = document.getElementById(id);
-            if (!element) {
-                console.warn(`Element not found: ${id}`);
-            }
-            return element;
-        }
-
-        /**
-         * Safely update element text content
-         * @param {string} id - Element ID
-         * @param {string} text - Text to set
-         */
-        function setElementText(id, text) {
-            const element = getElement(id);
-            if (element) {
-                element.textContent = text;
-            }
-        }
-
-        /**
-         * Validate and sanitize preset name
-         * @param {string} name - Preset name to validate
-         * @returns {object} {valid: boolean, error: string}
-         */
-        function validatePresetName(name) {
-            if (!name || name.trim().length === 0) {
-                return {valid: false, error: 'Preset name is required'};
-            }
-
-            if (name.length > 100) {
-                return {valid: false, error: 'Preset name too long (max 100 characters)'};
-            }
-
-            if (!/^[a-zA-Z0-9\-_ ]+$/.test(name)) {
-                return {valid: false, error: 'Invalid characters (use only letters, numbers, spaces, dashes, underscores)'};
-            }
-
-            if (['__proto__', 'constructor', 'prototype'].includes(name)) {
-                return {valid: false, error: 'Invalid preset name'};
-            }
-
-            return {valid: true};
-        }
-
-        /**
-         * Safe localStorage setItem with quota handling
-         * @param {string} key - Storage key
-         * @param {string} value - Value to store
-         * @returns {boolean} Success status
-         */
-        function safeLocalStorageSet(key, value) {
-            try {
-                if (value.length > CONFIG.MAX_STORAGE_SIZE_BYTES) {
-                    showNotification('Data too large to save (max 5MB)', 'error');
-                    return false;
-                }
-                localStorage.setItem(key, value);
-                return true;
-            } catch (e) {
-                if (e.name === 'QuotaExceededError') {
-                    showNotification('Storage quota exceeded. Delete old data to continue', 'error');
-                } else {
-                    showNotification(`Failed to save: ${e.message}`, 'error');
-                }
-                return false;
-            }
-        }
 
         // Helper functions for dB conversion
         function rawToDb(raw) {
@@ -2824,11 +2635,11 @@ const char* html_page = R"HTMLDELIM(
         // Fetch and display IQ constellation data
         async function updateIQData() {
             if (!showIQ) return;
-            if (isUpdatingIQ) return; // Skip if previous request still running
 
-            isUpdatingIQ = true;
             try {
-                const response = await fetchWithTimeout('/iq_data?t=' + Date.now());
+                const response = await fetch('/iq_data?t=' + Date.now());
+                if (!response.ok) return;
+
                 const buffer = await response.arrayBuffer();
                 const data = new Int16Array(buffer);
 
@@ -2847,19 +2658,17 @@ const char* html_page = R"HTMLDELIM(
                 drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q);
             } catch (err) {
                 console.error('IQ data fetch error:', err);
-            } finally {
-                isUpdatingIQ = false;
             }
         }
 
         // Fetch and display cross-correlation data
         async function updateXCorrData() {
             if (!showXCorr) return;
-            if (isUpdatingXCorr) return; // Skip if previous request still running
 
-            isUpdatingXCorr = true;
             try {
-                const response = await fetchWithTimeout('/xcorr_data?t=' + Date.now());
+                const response = await fetch('/xcorr_data?t=' + Date.now());
+                if (!response.ok) return;
+
                 const buffer = await response.arrayBuffer();
                 const data = new Float32Array(buffer);
 
@@ -2880,22 +2689,19 @@ const char* html_page = R"HTMLDELIM(
                 drawXCorr(magnitude, phase);
             } catch (err) {
                 console.error('XCorr data fetch error:', err);
-            } finally {
-                isUpdatingXCorr = false;
             }
         }
 
         // Update link quality indicator
         async function updateLinkQuality() {
-            if (isUpdatingLinkQuality) return; // Skip if previous request still running
-
-            isUpdatingLinkQuality = true;
             try {
-                const response = await fetchWithTimeout('/link_quality');
+                const response = await fetch('/link_quality');
+                if (!response.ok) return;
+
                 const data = await response.json();
 
                 // Update RTT
-                setElementText('rtt', data.rtt_ms.toFixed(0) + 'ms');
+                document.getElementById('rtt').textContent = data.rtt_ms.toFixed(0) + 'ms';
 
                 // Update bandwidth
                 const bw = data.bandwidth_kbps;
@@ -2905,7 +2711,7 @@ const char* html_page = R"HTMLDELIM(
                 } else {
                     bwStr = bw.toFixed(0) + 'kbps';
                 }
-                setElementText('bandwidth', bwStr);
+                document.getElementById('bandwidth').textContent = bwStr;
 
                 // Update link quality bar (5 bars based on quality)
                 const fps = data.fps;
@@ -2932,59 +2738,11 @@ const char* html_page = R"HTMLDELIM(
                 }
             } catch (err) {
                 console.error('Link quality fetch error:', err);
-            } finally {
-                isUpdatingLinkQuality = false;
             }
         }
 
         resizeCanvas();
         window.addEventListener('resize', resizeCanvas);
-
-        // Keyboard navigation for zoom and controls
-        window.addEventListener('keydown', (e) => {
-            // Don't trigger if user is typing in an input field
-            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
-                return;
-            }
-
-            switch(e.key) {
-                case '-':
-                case '_':
-                    // Zoom out
-                    e.preventDefault();
-                    zoomOut();
-                    showNotification('Zoomed out to full spectrum', 'info', 1500);
-                    break;
-
-                case '0':
-                case ')':
-                    // Reset zoom (same as zoom out)
-                    e.preventDefault();
-                    zoomOut();
-                    showNotification('Reset to full spectrum view', 'info', 1500);
-                    break;
-
-                case 'Escape':
-                    // Cancel selection if in progress
-                    if (zoomState.isSelecting) {
-                        e.preventDefault();
-                        zoomState.isSelecting = false;
-                        showNotification('Selection cancelled', 'info', 1500);
-                    } else if (zoomState.isZoomed) {
-                        // If not selecting but zoomed, escape zooms out
-                        e.preventDefault();
-                        zoomOut();
-                        showNotification('Reset to full spectrum view', 'info', 1500);
-                    }
-                    break;
-
-                case '?':
-                    // Show keyboard shortcuts help
-                    e.preventDefault();
-                    showNotification('Keyboard: [-] Zoom Out | [0] Reset | [Esc] Cancel/Reset', 'info', 5000);
-                    break;
-            }
-        });
 
         // Initialize draggable panels
         makeDraggable(document.getElementById('iq_constellation'));
@@ -3004,12 +2762,27 @@ const char* html_page = R"HTMLDELIM(
 
             const ch = chSelect;
 
-            fetchWithTimeout('/fft?ch=' + ch + '&t=' + Date.now(), {
+            // Failsafe: force unlock after 5 seconds if fetch hangs
+            if (fetchTimeout) clearTimeout(fetchTimeout);
+            fetchTimeout = setTimeout(() => {
+                console.warn('Fetch timeout - forcing unlock');
+                isUpdating = false;
+            }, 5000);
+
+            fetch('/fft?ch=' + ch + '&t=' + Date.now(), {
                 method: 'GET',
-                cache: 'no-cache'
+                cache: 'no-cache',
+                signal: fetchSignal
             })
-                .then(response => response.arrayBuffer())
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('HTTP ' + response.status);
+                    }
+                    return response.arrayBuffer();
+                })
                 .then(buffer => {
+                    clearTimeout(fetchTimeout);  // Cancel timeout on success
+
                     let data = new Uint8Array(buffer);
 
                     if (data.length !== FFT_SIZE) {
@@ -3080,6 +2853,7 @@ const char* html_page = R"HTMLDELIM(
                     isUpdating = false;
                 })
                 .catch(err => {
+                    clearTimeout(fetchTimeout);  // Cancel timeout on error
                     // Don't log aborted fetches (intentional cleanup)
                     if (err.name !== 'AbortError') {
                         console.error('FFT fetch error:', err);
@@ -3093,9 +2867,13 @@ const char* html_page = R"HTMLDELIM(
             try {
                 // Fetch both channels in parallel
                 const [ch1Response, ch2Response] = await Promise.all([
-                    fetchWithTimeout('/fft?ch=1&t=' + Date.now()),
-                    fetchWithTimeout('/fft?ch=2&t=' + Date.now())
+                    fetch('/fft?ch=1&t=' + Date.now(), { signal: fetchSignal }),
+                    fetch('/fft?ch=2&t=' + Date.now(), { signal: fetchSignal })
                 ]);
+
+                if (!ch1Response.ok || !ch2Response.ok) {
+                    throw new Error('HTTP error');
+                }
 
                 const [ch1Buffer, ch2Buffer] = await Promise.all([
                     ch1Response.arrayBuffer(),
@@ -3602,11 +3380,8 @@ const char* html_page = R"HTMLDELIM(
 
         // Update status
         async function updateStatus() {
-            if (isUpdatingStatus) return; // Skip if previous request still running
-
-            isUpdatingStatus = true;
             try {
-                const response = await fetchWithTimeout('/status');
+                const response = await fetch('/status');
                 const data = await response.json();
                 const ch = document.getElementById('channel_select').value;
 
@@ -3657,8 +3432,6 @@ const char* html_page = R"HTMLDELIM(
                 updateZoomState(data.freq, data.sr);
             } catch (err) {
                 console.error('Status update failed:', err);
-            } finally {
-                isUpdatingStatus = false;
             }
         }
 
@@ -3681,35 +3454,21 @@ const char* html_page = R"HTMLDELIM(
 
         // Apply frequency change
         async function applyFrequency() {
-            const freqInput = getElement('freqInput');
-            if (!freqInput) return;
-
-            const freq = parseFloat(freqInput.value);
-            if (isNaN(freq)) {
-                showNotification('Invalid frequency format', 'error');
-                return;
-            }
-            if (freq < CONFIG.FREQ_MIN_MHZ || freq > CONFIG.FREQ_MAX_MHZ) {
-                showNotification(`Frequency must be between ${CONFIG.FREQ_MIN_MHZ} and ${CONFIG.FREQ_MAX_MHZ} MHz`, 'warning');
+            const freq = parseFloat(document.getElementById('freqInput').value);
+            if (isNaN(freq) || freq < 47 || freq > 6000) {
+                alert('Frequency must be between 47 and 6000 MHz');
                 return;
             }
 
-            const currentSR = zoomState.fullBandwidth || CONFIG.DEFAULT_SAMPLE_RATE;
+            const currentSR = zoomState.fullBandwidth || 40000000;
             await sendControlUpdate(Math.floor(freq * 1e6), currentSR, null, null, null);
         }
 
         // Apply sample rate change
         async function applySampleRate() {
-            const srInput = getElement('srInput');
-            if (!srInput) return;
-
-            const sr = parseFloat(srInput.value);
-            if (isNaN(sr)) {
-                showNotification('Invalid sample rate format', 'error');
-                return;
-            }
-            if (sr < CONFIG.SR_MIN_MHZ || sr > CONFIG.SR_MAX_MHZ) {
-                showNotification(`Sample rate must be between ${CONFIG.SR_MIN_MHZ} and ${CONFIG.SR_MAX_MHZ} MHz`, 'warning');
+            const sr = parseFloat(document.getElementById('srInput').value);
+            if (isNaN(sr) || sr < 0.52 || sr > 61.44) {
+                alert('Sample rate must be between 0.52 and 61.44 MHz');
                 return;
             }
 
@@ -3719,36 +3478,22 @@ const char* html_page = R"HTMLDELIM(
 
         // Apply bandwidth change
         async function applyBandwidth() {
-            const bwInput = getElement('bwInput');
-            if (!bwInput) return;
-
-            const bw = parseFloat(bwInput.value);
-            if (isNaN(bw)) {
-                showNotification('Invalid bandwidth format', 'error');
-                return;
-            }
-            if (bw < CONFIG.SR_MIN_MHZ || bw > CONFIG.SR_MAX_MHZ) {
-                showNotification(`Bandwidth must be between ${CONFIG.SR_MIN_MHZ} and ${CONFIG.SR_MAX_MHZ} MHz`, 'warning');
+            const bw = parseFloat(document.getElementById('bwInput').value);
+            if (isNaN(bw) || bw < 0.52 || bw > 61.44) {
+                alert('Bandwidth must be between 0.52 and 61.44 MHz');
                 return;
             }
 
             const currentFreq = zoomState.centerFreq || 915000000;
-            const currentSR = zoomState.fullBandwidth || CONFIG.DEFAULT_SAMPLE_RATE;
+            const currentSR = zoomState.fullBandwidth || 40000000;
             await sendControlUpdate(currentFreq, currentSR, Math.floor(bw * 1e6), null, null);
         }
 
         // Apply gain RX1 change
         async function applyGain1() {
-            const gainInput = getElement('gain1Input');
-            if (!gainInput) return;
-
-            const gain = parseInt(gainInput.value);
-            if (isNaN(gain)) {
-                showNotification('Invalid gain format', 'error');
-                return;
-            }
-            if (gain < CONFIG.GAIN_MIN_DB || gain > CONFIG.GAIN_MAX_DB) {
-                showNotification(`Gain must be between ${CONFIG.GAIN_MIN_DB} and ${CONFIG.GAIN_MAX_DB} dB`, 'warning');
+            const gain = parseInt(document.getElementById('gain1Input').value);
+            if (isNaN(gain) || gain < 0 || gain > 60) {
+                alert('Gain must be between 0 and 60 dB');
                 return;
             }
 
@@ -3757,16 +3502,9 @@ const char* html_page = R"HTMLDELIM(
 
         // Apply gain RX2 change
         async function applyGain2() {
-            const gainInput = getElement('gain2Input');
-            if (!gainInput) return;
-
-            const gain = parseInt(gainInput.value);
-            if (isNaN(gain)) {
-                showNotification('Invalid gain format', 'error');
-                return;
-            }
-            if (gain < CONFIG.GAIN_MIN_DB || gain > CONFIG.GAIN_MAX_DB) {
-                showNotification(`Gain must be between ${CONFIG.GAIN_MIN_DB} and ${CONFIG.GAIN_MAX_DB} dB`, 'warning');
+            const gain = parseInt(document.getElementById('gain2Input').value);
+            if (isNaN(gain) || gain < 0 || gain > 60) {
+                alert('Gain must be between 0 and 60 dB');
                 return;
             }
 
@@ -3890,15 +3628,10 @@ const char* html_page = R"HTMLDELIM(
 
         // Save current configuration as a preset
         function savePreset() {
-            const presetNameInput = getElement('presetName');
-            if (!presetNameInput) return;
+            const presetName = document.getElementById('presetName').value.trim();
 
-            const presetName = presetNameInput.value.trim();
-
-            // Validate preset name
-            const validation = validatePresetName(presetName);
-            if (!validation.valid) {
-                showNotification(validation.error, 'error');
+            if (!presetName) {
+                alert('Please enter a preset name');
                 return;
             }
 
@@ -3910,20 +3643,15 @@ const char* html_page = R"HTMLDELIM(
                 timestamp: new Date().toISOString()
             };
 
-            const json = JSON.stringify(presets);
-            if (safeLocalStorageSet('bladerfsensor_webserver_presets', json)) {
-                refreshPresetList();
-                showNotification(`Preset "${presetName}" saved successfully`, 'success');
-                presetNameInput.value = '';
-            }
+            localStorage.setItem('bladerfsensor_webserver_presets', JSON.stringify(presets));
+            refreshPresetList();
+            alert('Preset "' + presetName + '" saved successfully');
+            document.getElementById('presetName').value = '';
         }
 
         // Load a preset configuration
         async function loadPreset() {
-            const presetSelectElem = getElement('presetSelect');
-            if (!presetSelectElem) return;
-
-            const presetName = presetSelectElem.value;
+            const presetName = document.getElementById('presetSelect').value;
 
             if (!presetName) {
                 return;
@@ -3933,38 +3661,33 @@ const char* html_page = R"HTMLDELIM(
             const preset = presets[presetName];
 
             if (!preset) {
-                showNotification(`Preset "${presetName}" not found`, 'error');
+                alert('Preset "' + presetName + '" not found');
                 return;
             }
 
             await applyConfig(preset.config);
-            showNotification(`Preset "${presetName}" loaded successfully`, 'success');
+            alert('Preset "' + presetName + '" loaded successfully');
         }
 
         // Delete the currently selected preset
         function deletePreset() {
-            const presetSelectElem = getElement('presetSelect');
-            if (!presetSelectElem) return;
-
-            const presetName = presetSelectElem.value;
+            const presetName = document.getElementById('presetSelect').value;
 
             if (!presetName) {
-                showNotification('Please select a preset to delete', 'warning');
+                alert('Please select a preset to delete');
                 return;
             }
 
-            if (!confirm(`Are you sure you want to delete the preset "${presetName}"?`)) {
+            if (!confirm('Are you sure you want to delete the preset "' + presetName + '"?')) {
                 return;
             }
 
             const presets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
             delete presets[presetName];
+            localStorage.setItem('bladerfsensor_webserver_presets', JSON.stringify(presets));
 
-            const json = JSON.stringify(presets);
-            if (safeLocalStorageSet('bladerfsensor_webserver_presets', json)) {
-                refreshPresetList();
-                showNotification(`Preset "${presetName}" deleted successfully`, 'success');
-            }
+            refreshPresetList();
+            alert('Preset "' + presetName + '" deleted successfully');
         }
 
         // Export all presets to a JSON file
@@ -3972,7 +3695,7 @@ const char* html_page = R"HTMLDELIM(
             const presets = JSON.parse(localStorage.getItem('bladerfsensor_webserver_presets') || '{}');
 
             if (Object.keys(presets).length === 0) {
-                showNotification('No presets to export', 'warning');
+                alert('No presets to export');
                 return;
             }
 
@@ -3988,7 +3711,7 @@ const char* html_page = R"HTMLDELIM(
             document.body.removeChild(link);
             URL.revokeObjectURL(url);
 
-            showNotification(`Exported ${Object.keys(presets).length} preset(s)`, 'success');
+            alert('Exported ' + Object.keys(presets).length + ' preset(s)');
         }
 
         // Trigger file input for importing presets
@@ -4015,12 +3738,11 @@ const char* html_page = R"HTMLDELIM(
                         }
                     }
 
-                    if (safeLocalStorageSet('bladerfsensor_webserver_presets', JSON.stringify(currentPresets))) {
-                        refreshPresetList();
-                        showNotification(`Imported ${importedCount} preset(s) successfully`, 'success');
-                    }
+                    localStorage.setItem('bladerfsensor_webserver_presets', JSON.stringify(currentPresets));
+                    refreshPresetList();
+                    alert('Imported ' + importedCount + ' preset(s) successfully');
                 } catch (error) {
-                    showNotification('Error importing presets: Invalid file format', 'error');
+                    alert('Error importing presets: Invalid file format');
                 }
             };
             reader.readAsText(file);
@@ -4048,119 +3770,10 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
-        /**
-         * Save UI state to localStorage
-         */
-        function saveUIState() {
-            const state = {
-                // Display settings
-                waterfallIntensity: waterfallIntensity,
-                waterfallContrast: waterfallContrast,
-                spectrumMinDb: spectrumMinDb,
-                spectrumMaxDb: spectrumMaxDb,
-                showSpectrum: showSpectrum,
-                showIQ: showIQ,
-                showXCorr: showXCorr,
-
-                // Zoom state (don't save actual zoom, just the fact that user had zoom capability)
-                // Actual zoom depends on current frequency/bandwidth
-
-                // Channel selection
-                currentChannel: currentChannel,
-
-                // Signal analysis settings
-                persistenceMode: signalAnalysis.persistenceMode,
-                persistenceDecayRate: signalAnalysis.persistenceDecayRate,
-                colorPalette: signalAnalysis.colorPalette,
-
-                // Timestamp
-                savedAt: new Date().toISOString()
-            };
-
-            safeLocalStorageSet('bladerfsensor_ui_state', JSON.stringify(state));
-        }
-
-        /**
-         * Restore UI state from localStorage
-         */
-        function restoreUIState() {
-            try {
-                const saved = localStorage.getItem('bladerfsensor_ui_state');
-                if (!saved) return;
-
-                const state = JSON.parse(saved);
-
-                // Restore display settings
-                if (state.waterfallIntensity !== undefined) {
-                    waterfallIntensity = state.waterfallIntensity;
-                    const intensitySlider = getElement('waterfallIntensity');
-                    if (intensitySlider) {
-                        intensitySlider.value = state.waterfallIntensity;
-                        updateWaterfallIntensity(state.waterfallIntensity);
-                    }
-                }
-
-                if (state.waterfallContrast !== undefined) {
-                    waterfallContrast = state.waterfallContrast;
-                    const contrastSlider = getElement('waterfallContrast');
-                    if (contrastSlider) {
-                        contrastSlider.value = state.waterfallContrast;
-                        updateWaterfallContrast(state.waterfallContrast);
-                    }
-                }
-
-                if (state.spectrumMinDb !== undefined) {
-                    spectrumMinDb = state.spectrumMinDb;
-                    const minInput = getElement('spectrumMin');
-                    if (minInput) minInput.value = state.spectrumMinDb;
-                }
-
-                if (state.spectrumMaxDb !== undefined) {
-                    spectrumMaxDb = state.spectrumMaxDb;
-                    const maxInput = getElement('spectrumMax');
-                    if (maxInput) maxInput.value = state.spectrumMaxDb;
-                }
-
-                // Restore visibility states
-                if (state.showSpectrum !== undefined) showSpectrum = state.showSpectrum;
-                if (state.showIQ !== undefined) showIQ = state.showIQ;
-                if (state.showXCorr !== undefined) showXCorr = state.showXCorr;
-
-                // Restore channel
-                if (state.currentChannel !== undefined) {
-                    currentChannel = state.currentChannel;
-                    const channelSelect = getElement('channel_select');
-                    if (channelSelect) channelSelect.value = state.currentChannel;
-                }
-
-                // Restore signal analysis settings
-                if (state.persistenceMode !== undefined) {
-                    signalAnalysis.persistenceMode = state.persistenceMode;
-                }
-                if (state.persistenceDecayRate !== undefined) {
-                    signalAnalysis.persistenceDecayRate = state.persistenceDecayRate;
-                }
-                if (state.colorPalette !== undefined) {
-                    signalAnalysis.colorPalette = state.colorPalette;
-                }
-
-                console.log('UI state restored from', state.savedAt);
-                showNotification('UI settings restored', 'success', 2000);
-            } catch (err) {
-                console.error('Failed to restore UI state:', err);
-            }
-        }
-
         // Initialize preset list on page load
         window.addEventListener('load', function() {
             refreshPresetList();
             updateRecordMode();  // Initialize recording UI
-            restoreUIState();    // Restore saved UI settings
-        });
-
-        // Save UI state before page unload
-        window.addEventListener('beforeunload', function() {
-            saveUIState();
         });
 
         // ===== Recording Functions =====
@@ -4191,7 +3804,7 @@ const char* html_page = R"HTMLDELIM(
         function startRecording() {
             const duration = parseInt(document.getElementById('recordDuration').value);
             if (!duration || duration < 1 || duration > 300) {
-                showNotification('Please set a valid duration (1-300 seconds)', 'warning');
+                alert('Please set a valid duration (1-300 seconds)');
                 return;
             }
 
@@ -4211,7 +3824,7 @@ const char* html_page = R"HTMLDELIM(
                 const centerMHz = parseFloat(document.getElementById('recordCenterFreq').value);
                 const bwMHz = parseFloat(document.getElementById('recordBandwidth').value);
                 if (!centerMHz || !bwMHz) {
-                    showNotification('Please enter valid center frequency and bandwidth', 'warning');
+                    alert('Please enter valid center frequency and bandwidth');
                     return;
                 }
                 recordingConfig.recordCenterFreq = centerMHz * 1e6;
@@ -4245,7 +3858,7 @@ const char* html_page = R"HTMLDELIM(
             document.getElementById('recordButton').style.background = '';
 
             if (recordedFrames.length === 0) {
-                showNotification('No data recorded', 'warning');
+                alert('No data recorded');
                 document.getElementById('recordingStatus').textContent = 'Ready';
                 return;
             }
@@ -4394,7 +4007,7 @@ const char* html_page = R"HTMLDELIM(
         // Export spectrum data to CSV with metadata
         function exportSpectrumCSV() {
             if (!latestFFTData || latestFFTData.length === 0) {
-                showNotification('No spectrum data available to export', 'warning');
+                alert('No spectrum data available to export');
                 return;
             }
 
@@ -4451,7 +4064,7 @@ const char* html_page = R"HTMLDELIM(
             document.body.removeChild(link);
             URL.revokeObjectURL(url);
 
-            showNotification(`Spectrum data exported (${latestFFTData.length} bins)`, 'success');
+            alert('Spectrum data exported (' + latestFFTData.length + ' bins)');
         }
 
         // Send control update to server
@@ -4481,23 +4094,17 @@ const char* html_page = R"HTMLDELIM(
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
                 } else {
                     console.error('Control update failed:', result);
-                    showNotification(`Error: ${result.error || 'Unknown error'}`, 'error');
+                    alert('Error: ' + (result.error || 'Unknown error'));
                 }
             } catch (err) {
                 console.error('Control request error:', err);
-                showNotification('Failed to send control update', 'error');
+                alert('Failed to send control update');
             }
         }
 
         // Continuous update loop using requestAnimationFrame
         let lastUpdateTime = 0;
         let isUpdating = false;
-
-        // Throttling flags to prevent overlapping requests
-        let isUpdatingStatus = false;
-        let isUpdatingIQ = false;
-        let isUpdatingXCorr = false;
-        let isUpdatingLinkQuality = false;
 
         function updateLoop(timestamp) {
             // Only start new fetch if previous one finished
@@ -5043,7 +4650,7 @@ const char* html_page = R"HTMLDELIM(
 
         function detectPeaks() {
             if (!latestFFTData || latestFFTData.length === 0) {
-                showNotification('No FFT data available', 'warning');
+                alert('No FFT data available');
                 return;
             }
 
@@ -5102,7 +4709,7 @@ const char* html_page = R"HTMLDELIM(
         function addBookmark() {
             const name = document.getElementById('bookmark_name').value.trim();
             if (!name) {
-                showNotification('Please enter a signal name', 'warning');
+                alert('Please enter a signal name');
                 return;
             }
 
@@ -5862,7 +5469,7 @@ const char* html_page = R"HTMLDELIM(
 
             const mode = document.getElementById('demod_mode').value;
             if (mode === 'off') {
-                showNotification('Please select a demodulation mode', 'warning');
+                alert('Please select a demodulation mode');
                 return;
             }
 
@@ -5939,6 +5546,152 @@ const char* html_page = R"HTMLDELIM(
         };
 
         // Demod spectrum canvas
+        let demodSpectrumCanvas = null;
+        let demodSpectrumCtx = null;
+
+        // S-meter canvas
+        let sMeterCanvas = null;
+        let sMeterCtx = null;
+
+        // Initialize demod spectrum display
+        function initDemodSpectrum() {
+            demodSpectrumCanvas = document.getElementById('demod_spectrum');
+            if (!demodSpectrumCanvas) return;
+
+            demodSpectrumCtx = demodSpectrumCanvas.getContext('2d');
+            const parent = demodSpectrumCanvas.parentElement;
+            demodSpectrumCanvas.width = parent.clientWidth;
+            demodSpectrumCanvas.height = parent.clientHeight;
+
+            // Click to tune
+            demodSpectrumCanvas.addEventListener('click', (e) => {
+                const rect = demodSpectrumCanvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const width = demodSpectrumCanvas.width;
+
+                // Get current RF parameters
+                const centerFreq = parseFloat(document.getElementById('freq')?.textContent) || 915;  // MHz
+                const sampleRate = parseFloat(document.getElementById('sample_rate')?.textContent) || 40;  // MHz
+
+                // Calculate clicked frequency
+                const startFreq = (centerFreq - sampleRate / 2) * 1e6;  // Hz
+                const clickedFreq = startFreq + (x / width) * sampleRate * 1e6;
+
+                // Tune to this frequency
+                tuneToFrequency(clickedFreq);
+            });
+
+            console.log('Demod spectrum initialized');
+        }
+
+        // Update demod spectrum display
+        function updateDemodSpectrum() {
+            if (!demodSpectrumCtx || !latestFFTData) return;
+
+            const canvas = demodSpectrumCanvas;
+            const ctx = demodSpectrumCtx;
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw grid
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw spectrum with gradient fill
+            const gradient = ctx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');
+            gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');
+            gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');
+            gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');
+
+            ctx.beginPath();
+            ctx.moveTo(0, height);
+
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const x = (i / latestFFTData.length) * width;
+                const magnitude = latestFFTData[i] / 255.0;
+                const y = height - (magnitude * height);
+
+                if (i === 0) {
+                    ctx.lineTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+
+            ctx.lineTo(width, height);
+            ctx.closePath();
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Draw spectrum line
+            ctx.beginPath();
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const x = (i / latestFFTData.length) * width;
+                const magnitude = latestFFTData[i] / 255.0;
+                const y = height - (magnitude * height);
+
+                // Color based on magnitude
+                if (magnitude > 0.8) ctx.strokeStyle = '#ffff00';
+                else if (magnitude > 0.5) ctx.strokeStyle = '#88ff00';
+                else if (magnitude > 0.3) ctx.strokeStyle = '#00ff88';
+                else ctx.strokeStyle = '#00ffff';
+
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // Draw tuned frequency marker
+            if (demodEnhanced.tunedFreq !== null) {
+                const centerFreq = parseFloat(document.getElementById('freq')?.textContent) || 915;  // MHz
+                const sampleRate = parseFloat(document.getElementById('sample_rate')?.textContent) || 40;  // MHz
+                const startFreq = (centerFreq - sampleRate / 2) * 1e6;  // Hz
+                const endFreq = (centerFreq + sampleRate / 2) * 1e6;
+
+                if (demodEnhanced.tunedFreq >= startFreq && demodEnhanced.tunedFreq <= endFreq) {
+                    const markerX = ((demodEnhanced.tunedFreq - startFreq) / (sampleRate * 1e6)) * width;
+
+                    // Draw bandwidth box
+                    const bwPixels = (demodEnhanced.bandwidth / (sampleRate * 1e6)) * width;
+                    ctx.fillStyle = 'rgba(0, 255, 0, 0.1)';
+                    ctx.fillRect(markerX - bwPixels/2, 0, bwPixels, height);
+
+                    // Draw center line
+                    ctx.strokeStyle = '#0f0';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([5, 5]);
+                    ctx.beginPath();
+                    ctx.moveTo(markerX, 0);
+                    ctx.lineTo(markerX, height);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // Update signal power at tuned frequency
+                    const bin = Math.floor(((demodEnhanced.tunedFreq - startFreq) / (sampleRate * 1e6)) * latestFFTData.length);
+                    if (bin >= 0 && bin < latestFFTData.length) {
+                        demodEnhanced.signalPower = (latestFFTData[bin] / 255.0) * 120 - 100;
+                        document.getElementById('demod_signal_power').textContent = demodEnhanced.signalPower.toFixed(1) + ' dBm';
+                    }
+                }
+            }
+        }
+
         // Initialize S-meter
         function initSMeter() {
             sMeterCanvas = document.getElementById('s_meter_canvas');
@@ -6115,7 +5868,7 @@ const char* html_page = R"HTMLDELIM(
 
         function startAudioRecording() {
             if (!demodState.audioCtx) {
-                showNotification('Start demodulation first', 'warning');
+                alert('Start demodulation first');
                 return;
             }
 
@@ -6168,7 +5921,7 @@ const char* html_page = R"HTMLDELIM(
         function exportDecodedData() {
             const messages = document.getElementById('decoded_messages');
             if (!messages || messages.children.length === 0) {
-                showNotification('No decoded data to export', 'warning');
+                alert('No decoded data to export');
                 return;
             }
 
@@ -6234,7 +5987,7 @@ const char* html_page = R"HTMLDELIM(
                 document.getElementById('demod_status_text').textContent = 'Stopped - Select mode and click START';
             } else {
                 if (!selectedMode) {
-                    showNotification('Please select a demodulation mode first', 'warning');
+                    alert('Please select a demodulation mode first');
                     return;
                 }
                 startDemodWithMode(selectedMode);
@@ -6853,12 +6606,12 @@ const char* html_page = R"HTMLDELIM(
                         stopRecording();
                     }, duration * 1000);
                 } else {
-                    showNotification(`Failed to start recording: ${data.error || 'Unknown error'}`, 'error');
+                    alert('Failed to start recording: ' + (data.error || 'Unknown error'));
                 }
             })
             .catch(err => {
                 console.error('Recording start error:', err);
-                showNotification('Failed to start recording', 'error');
+                alert('Failed to start recording');
             });
         }
 
@@ -7077,7 +6830,7 @@ const char* html_page = R"HTMLDELIM(
 
         function calibrateDoA() {
             console.log('DoA calibration started');
-            showNotification('Place a known signal source at 0° and click OK', 'info', 5000);
+            alert('Place a known signal source at 0° and click OK');
             updateDoA();
         }
 
@@ -7784,7 +7537,7 @@ const char* html_page = R"HTMLDELIM(
         function startDoA() {
             if (directionFinding.running) return;
             if (!directionFinding.selection.active) {
-                showNotification('Please select a frequency range by clicking and dragging on the spectrum', 'info');
+                alert('Please select a frequency range by clicking and dragging on the spectrum');
                 return;
             }
 
@@ -7931,7 +7684,7 @@ const char* html_page = R"HTMLDELIM(
 
                     directionFinding.calibration.phaseOffset = phaseDiffSum / samplesPerChannel;
 
-                    showNotification(`Calibration complete! Phase offset: ${(directionFinding.calibration.phaseOffset * 180 / Math.PI).toFixed(2)}°`, 'success', 5000);
+                    alert('Calibration complete!\nPhase offset: ' + (directionFinding.calibration.phaseOffset * 180 / Math.PI).toFixed(2) + '°');
                     console.log('DoA calibrated. Phase offset:', directionFinding.calibration.phaseOffset);
                 })
                 .catch(err => console.error('Calibration failed:', err));
@@ -7944,7 +7697,7 @@ const char* html_page = R"HTMLDELIM(
 
         function exportDoAData() {
             if (directionFinding.history.length === 0) {
-                showNotification('No data to export', 'warning');
+                alert('No data to export');
                 return;
             }
 
@@ -8207,7 +7960,7 @@ const char* html_page = R"HTMLDELIM(
                         streamOutConfig.position.lon = converted.lon;
                         console.log('MGRS converted:', streamOutConfig.position.mgrs, '→', converted.lat.toFixed(6), converted.lon.toFixed(6));
                     } catch (e) {
-                        showNotification(`Invalid MGRS coordinate: ${e.message}`, 'error');
+                        alert('Invalid MGRS coordinate: ' + e.message);
                         return;
                     }
                 }
@@ -8215,7 +7968,7 @@ const char* html_page = R"HTMLDELIM(
 
             // Validate
             if (!streamOutConfig.endpoint || streamOutConfig.port < 1 || streamOutConfig.port > 65535) {
-                showNotification('Please enter valid endpoint and port', 'warning');
+                alert('Please enter valid endpoint and port');
                 return;
             }
 
@@ -8542,7 +8295,7 @@ const char* html_page = R"HTMLDELIM(
 
         function classifySignal() {
             if (!latestFFTData || latestFFTData.length === 0) {
-                showNotification('No signal data available', 'warning');
+                alert('No signal data available');
                 return;
             }
 
@@ -8701,7 +8454,7 @@ const char* html_page = R"HTMLDELIM(
 
         function exportSigMF() {
             if (!latestFFTData || latestFFTData.length === 0) {
-                showNotification('No spectrum data available to export', 'warning');
+                alert('No spectrum data available to export');
                 return;
             }
 
@@ -8840,7 +8593,7 @@ const char* html_page = R"HTMLDELIM(
 
         function runAdvancedAnalysis() {
             if (!latestFFTData || latestFFTData.length === 0) {
-                showNotification('No spectrum data available', 'warning');
+                alert('No spectrum data available');
                 return;
             }
 
@@ -9068,13 +8821,451 @@ const char* html_page = R"HTMLDELIM(
                 document.getElementById('live_fps_display').textContent = fpsElement.textContent;
             }
         }
+
+        // ========================================================================
+        // MEASUREMENTS WORKSPACE - Live Spectrum Display
+        // ========================================================================
+
+        let measurementsSpectrumCanvas = null;
+        let measurementsSpectrumCtx = null;
+
+        function initMeasurementsSpectrum() {
+            measurementsSpectrumCanvas = document.getElementById('measurements_spectrum');
+            if (!measurementsSpectrumCanvas) {
+                console.log('Measurements spectrum canvas not found');
+                return;
+            }
+
+            measurementsSpectrumCtx = measurementsSpectrumCanvas.getContext('2d');
+
+            // Force proper sizing from parent
+            const parent = measurementsSpectrumCanvas.parentElement;
+            measurementsSpectrumCanvas.width = parent ? parent.clientWidth : 1200;
+            measurementsSpectrumCanvas.height = parent ? parent.clientHeight : 400;
+
+            // Add wheel event listener for Y-axis zoom/scroll (same as LIVE and DIRECTION tabs)
+            measurementsSpectrumCanvas.addEventListener('wheel', (e) => {
+                e.preventDefault();
+
+                if (e.ctrlKey) {
+                    // Ctrl+wheel = zoom Y-axis
+                    const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+                    const oldRange = spectrumMaxDb - spectrumMinDb;
+                    const newRange = Math.max(20, Math.min(400, oldRange * zoomFactor));
+                    const center = (spectrumMinDb + spectrumMaxDb) / 2;
+
+                    spectrumMinDb = Math.max(-50, center - newRange / 2);
+                    spectrumMaxDb = Math.min(350, center + newRange / 2);
+                } else {
+                    // Regular wheel = scroll Y-axis up/down
+                    const scrollAmount = e.deltaY * 0.5;
+                    const range = spectrumMaxDb - spectrumMinDb;
+
+                    let newMin = spectrumMinDb + scrollAmount;
+                    let newMax = spectrumMaxDb + scrollAmount;
+
+                    // Clamp to extended range
+                    const minLimit = -50;
+                    const maxLimit = 350;
+
+                    if (newMin < minLimit) {
+                        newMin = minLimit;
+                        newMax = minLimit + range;
+                    }
+                    if (newMax > maxLimit) {
+                        newMax = maxLimit;
+                        newMin = maxLimit - range;
+                    }
+
+                    spectrumMinDb = newMin;
+                    spectrumMaxDb = newMax;
+                }
+
+                // Redraw measurements spectrum with new range
+                updateMeasurementsSpectrum();
+            });
+
+            // Double-click to reset Y-axis to default range
+            measurementsSpectrumCanvas.addEventListener('dblclick', () => {
+                spectrumMinDb = 75;
+                spectrumMaxDb = 225;
+                updateMeasurementsSpectrum();
+            });
+
+            console.log('Measurements spectrum canvas initialized:', measurementsSpectrumCanvas.width, 'x', measurementsSpectrumCanvas.height);
+        }
+
+        function updateMeasurementsSpectrum() {
+            if (!measurementsSpectrumCtx || !latestFFTData || latestFFTData.length === 0) return;
+
+            const canvas = measurementsSpectrumCanvas;
+            const ctx = measurementsSpectrumCtx;
+            const data = latestFFTData;
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear with dark background
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw horizontal grid lines (more visible)
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw vertical grid lines
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
+            for (let i = 0; i <= 10; i++) {
+                const x = (width / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, height);
+                ctx.stroke();
+            }
+
+            // Enable smoothing
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+
+            // Calculate Y-axis mapping
+            const dbRange = spectrumMaxDb - spectrumMinDb;
+
+            // Store path for gradient fill
+            ctx.beginPath();
+            ctx.moveTo(0, height);
+
+            // Draw spectrum line with gradient color
+            const points = [];
+            for (let x = 0; x < width; x++) {
+                // Map canvas X to FFT bin, respecting zoom
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const fftIdx = zoomState.zoomStartBin + Math.floor((x / width) * zoomedBins);
+                const raw = data[fftIdx];
+                const magDb = rawToDb(raw);
+
+                // Map magnitude to visible range
+                const normalizedMag = Math.max(0, Math.min(1, (magDb - spectrumMinDb) / dbRange));
+                const y = height - (normalizedMag * height);
+                points.push({ x: x, y: y, mag: normalizedMag });
+
+                ctx.lineTo(x, y);
+            }
+
+            // Complete the path for fill
+            ctx.lineTo(width, height);
+            ctx.closePath();
+
+            // Create gradient fill (green-yellow gradient like SDR++)
+            const gradient = ctx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');
+            gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');
+            gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');
+            gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');
+
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Draw spectrum line with variable color
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            ctx.lineWidth = 1.5;
+
+            for (let i = 0; i < points.length - 1; i++) {
+                const p1 = points[i];
+                const p2 = points[i + 1];
+
+                // Color based on magnitude
+                const mag = (p1.mag + p2.mag) / 2;
+                if (mag > 0.8) {
+                    ctx.strokeStyle = '#ffff00';  // Yellow for strong signals
+                } else if (mag > 0.5) {
+                    ctx.strokeStyle = '#88ff00';  // Yellow-green
+                } else if (mag > 0.3) {
+                    ctx.strokeStyle = '#00ff88';  // Green-cyan
+                } else {
+                    ctx.strokeStyle = '#00ffff';  // Cyan for weak signals
+                }
+
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.stroke();
+            }
+
+            // Draw dB scale labels
+            ctx.fillStyle = '#888';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'right';
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
+                ctx.fillText(dbValue + ' dB', width - 5, y + 3);
+            }
+
+            // Find and mark peak (within zoomed region only)
+            let peakIdx = zoomState.zoomStartBin;
+            let peakVal = 0;
+            let sum = 0;
+            for (let i = zoomState.zoomStartBin; i <= zoomState.zoomEndBin; i++) {
+                if (data[i] > peakVal) {
+                    peakVal = data[i];
+                    peakIdx = i;
+                }
+                sum += data[i];
+            }
+
+            // Draw peak marker (mapped to zoomed coordinates)
+            const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+            const peakX = Math.floor(((peakIdx - zoomState.zoomStartBin) / zoomedBins) * width);
+            const peakDb = rawToDb(peakVal);
+            const peakNormalized = Math.max(0, Math.min(1, (peakDb - spectrumMinDb) / dbRange));
+            const peakY = height - (peakNormalized * height);
+
+            ctx.fillStyle = '#0f0';
+            ctx.beginPath();
+            ctx.arc(peakX, peakY, 5, 0, 2 * Math.PI);
+            ctx.fill();
+
+            ctx.strokeStyle = '#0f0';
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(peakX, peakY);
+            ctx.lineTo(peakX, height);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Update info overlay
+            const centerFreq = parseFloat(document.getElementById('freqInput').value) * 1e6;
+            const sampleRate = parseFloat(document.getElementById('srInput').value) * 1e6;
+            const peakFreq = centerFreq - (sampleRate / 2) + (peakIdx * sampleRate / data.length);
+
+            const peakDbm = rawToDb(peakVal);
+            const avgDbm = rawToDb(sum / zoomedBins);  // Average within zoomed region
+
+            document.getElementById('meas_peak_display').textContent = (peakFreq / 1e6).toFixed(3) + ' MHz @ ' + peakDbm.toFixed(1) + ' dBm';
+            document.getElementById('meas_avg_display').textContent = avgDbm.toFixed(1) + ' dBm';
+        }
+
+        // ========================================================================
+        // DEMOD WORKSPACE - Live IQ and Waveform Displays
+        // ========================================================================
+
+        let demodIqCanvas = null;
+        let demodIqCtx = null;
+        let demodWaveformCanvas = null;
+        let demodWaveformCtx = null;
+
+        function initDemodDisplays() {
+            demodIqCanvas = document.getElementById('demod_iq_live');
+            demodWaveformCanvas = document.getElementById('demod_waveform');
+
+            if (demodIqCanvas) {
+                demodIqCtx = demodIqCanvas.getContext('2d');
+                const parent = demodIqCanvas.parentElement;
+                demodIqCanvas.width = parent ? parent.clientWidth : 500;
+                demodIqCanvas.height = parent ? parent.clientHeight : 400;
+                console.log('IQ canvas sized:', demodIqCanvas.width, 'x', demodIqCanvas.height);
+            }
+
+            if (demodWaveformCanvas) {
+                demodWaveformCtx = demodWaveformCanvas.getContext('2d');
+                const parent = demodWaveformCanvas.parentElement;
+                demodWaveformCanvas.width = parent ? parent.clientWidth : 500;
+                demodWaveformCanvas.height = parent ? parent.clientHeight : 400;
+                console.log('Waveform canvas sized:', demodWaveformCanvas.width, 'x', demodWaveformCanvas.height);
+            }
+
+            console.log('Demod displays initialized');
+        }
+
+        function updateDemodIqDisplay() {
+            if (!demodIqCtx) return;
+
+            // Fetch binary IQ data and render
+            fetch('/iq_data?t=' + Date.now())
+                .then(response => response.arrayBuffer())
+                .then(buffer => {
+                    // Parse binary data: CH1_I, CH1_Q, CH2_I, CH2_Q (256 int16 samples each)
+                    const view = new DataView(buffer);
+                    const samplesPerChannel = 256;
+
+                    const data = {
+                        i: new Array(samplesPerChannel),
+                        q: new Array(samplesPerChannel)
+                    };
+
+                    // Extract CH1 I and Q (first 512 bytes each)
+                    let offset = 0;
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.i[i] = view.getInt16(offset, true) / 2048.0; // Normalize to ±1.0
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.q[i] = view.getInt16(offset, true) / 2048.0;
+                        offset += 2;
+                    }
+
+                    const canvas = demodIqCanvas;
+                    const ctx = demodIqCtx;
+
+                    // Clear
+                    ctx.fillStyle = '#000';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    // Draw grid and axes
+                    ctx.strokeStyle = '#222';
+                    ctx.lineWidth = 1;
+
+                    // Vertical axis
+                    ctx.beginPath();
+                    ctx.moveTo(canvas.width / 2, 0);
+                    ctx.lineTo(canvas.width / 2, canvas.height);
+                    ctx.stroke();
+
+                    // Horizontal axis
+                    ctx.beginPath();
+                    ctx.moveTo(0, canvas.height / 2);
+                    ctx.lineTo(canvas.width, canvas.height / 2);
+                    ctx.stroke();
+
+                    // Draw IQ points
+                    const centerX = canvas.width / 2;
+                    const centerY = canvas.height / 2;
+                    const scale = Math.min(canvas.width, canvas.height) / 2 * 0.8;
+
+                    ctx.fillStyle = 'rgba(0, 255, 255, 0.3)';
+                    for (let i = 0; i < Math.min(data.i.length, 1000); i++) {
+                        const x = centerX + data.i[i] * scale;
+                        const y = centerY - data.q[i] * scale;
+
+                        ctx.fillRect(x - 1, y - 1, 2, 2);
+                    }
+                })
+                .catch(err => console.error('Failed to fetch IQ data:', err));
+        }
+
+        function updateDemodWaveform() {
+            if (!demodWaveformCtx) return;
+
+            fetch('/iq_data?t=' + Date.now())
+                .then(response => response.arrayBuffer())
+                .then(buffer => {
+                    // Parse binary data
+                    const view = new DataView(buffer);
+                    const samplesPerChannel = 256;
+
+                    const data = {
+                        i: new Array(samplesPerChannel),
+                        q: new Array(samplesPerChannel)
+                    };
+
+                    // Extract CH1 I and Q
+                    let offset = 0;
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.i[i] = view.getInt16(offset, true) / 2048.0;
+                        offset += 2;
+                    }
+                    for (let i = 0; i < samplesPerChannel; i++) {
+                        data.q[i] = view.getInt16(offset, true) / 2048.0;
+                        offset += 2;
+                    }
+
+                    const canvas = demodWaveformCanvas;
+                    const ctx = demodWaveformCtx;
+
+                    // Clear
+                    ctx.fillStyle = '#000';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    // Draw I channel (cyan)
+                    ctx.strokeStyle = '#0ff';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+
+                    const centerY = canvas.height / 2;
+                    const yScale = canvas.height / 2 * 0.8;
+                    const xScale = canvas.width / Math.min(data.i.length, 500);
+
+                    for (let i = 0; i < Math.min(data.i.length, 500); i++) {
+                        const x = i * xScale;
+                        const y = centerY - data.i[i] * yScale;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.stroke();
+
+                    // Draw Q channel (orange)
+                    ctx.strokeStyle = '#ff8800';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+
+                    for (let i = 0; i < Math.min(data.q.length, 500); i++) {
+                        const x = i * xScale;
+                        const y = centerY - data.q[i] * yScale;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.stroke();
+
+                    // Draw center line
+                    ctx.strokeStyle = '#222';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(0, centerY);
+                    ctx.lineTo(canvas.width, centerY);
+                    ctx.stroke();
+                })
+                .catch(err => console.error('Failed to fetch IQ data:', err));
+        }
+
         // Start update intervals when page loads
         setTimeout(() => {
             // Try initial canvas setup
+            initMeasurementsSpectrum();
+            initDemodDisplays();
+            initDemodSpectrum();
             initSMeter();
 
             // Update live stats in LIVE workspace
             setInterval(updateLiveStats, 500);
+
+            // Update measurements spectrum
+            setInterval(() => {
+                const workspace = document.getElementById('workspace-measurements');
+                if (workspace && workspace.classList.contains('active')) {
+                    if (!measurementsSpectrumCtx) initMeasurementsSpectrum();
+                    updateMeasurementsSpectrum();
+                }
+            }, 100);
+
+            // Update demod displays
+            setInterval(() => {
+                const workspace = document.getElementById('workspace-demod');
+                if (workspace && workspace.classList.contains('active')) {
+                    if (!demodIqCtx || !demodWaveformCtx) initDemodDisplays();
+                    if (!demodSpectrumCtx) initDemodSpectrum();
+                    if (!sMeterCtx) initSMeter();
+
+                    updateDemodIqDisplay();
+                    updateDemodWaveform();
+                    updateDemodSpectrum();
+                    updateSMeter();
+                }
+            }, 100);
 
             // Update direction finding spectrum
             let directionUpdateCount = 0;
@@ -9112,6 +9303,14 @@ const char* html_page = R"HTMLDELIM(
 
         // Reinitialize canvases on window resize
         window.addEventListener('resize', () => {
+            if (document.getElementById('workspace-measurements').classList.contains('active')) {
+                initMeasurementsSpectrum();
+            }
+            if (document.getElementById('workspace-demod').classList.contains('active')) {
+                initDemodDisplays();
+                initDemodSpectrum();
+                initSMeter();
+            }
             if (document.getElementById('workspace-direction').classList.contains('active')) {
                 initDirectionSpectrum();
                 initDoAPolarMain();

@@ -7810,131 +7810,280 @@ const char* html_page = R"HTMLDELIM(
             console.log('Direction finding stopped');
         }
 
-        function performDoAUpdate() {
-            // Fetch DoA result calculated by backend (C++ phase-based interferometry)
-            fetch('/doa_result?t=' + Date.now())
-                .then(response => response.json())
-                .then(result => {
-                    // Update displays with backend-calculated result
-                    updateDoADisplays(result);
+        /**
+         * Validate DoA result data
+         * @param {object} result - DoA result from backend
+         * @returns {object} {valid: boolean, error: string}
+         */
+        function validateDoAResult(result) {
+            if (!result) {
+                return {valid: false, error: 'No DoA data received'};
+            }
 
-                    // Add to history with full signal data
-                    directionFinding.history.push({
-                        timestamp: Date.now(),
-                        azimuth: result.azimuth,
-                        backAzimuth: result.backAzimuth,
-                        hasAmbiguity: result.hasAmbiguity,
-                        confidence: result.confidence,
-                        frequency: directionFinding.selection.centerFreq,
-                        bandwidth: directionFinding.selection.bandwidth,
-                        snr: result.snr,
-                        phaseDiff: result.phaseDiff,
-                        phaseStd: result.phaseStd,
-                        coherence: result.coherence
-                    });
+            // Check for required fields
+            const requiredFields = ['azimuth', 'backAzimuth', 'confidence', 'snr', 'phaseDiff', 'phaseStd', 'coherence'];
+            for (const field of requiredFields) {
+                if (result[field] === undefined || result[field] === null) {
+                    return {valid: false, error: `Missing field: ${field}`};
+                }
+            }
 
-                    if (directionFinding.history.length > directionFinding.maxHistory) {
-                        directionFinding.history.shift();
-                    }
+            // Check for NaN or Infinity
+            if (!isFinite(result.azimuth) || !isFinite(result.backAzimuth)) {
+                return {valid: false, error: 'Invalid azimuth values (NaN or Infinity)'};
+            }
 
-                    drawDoATimeline();
-                })
-                .catch(err => {
-                    if (err.name !== 'AbortError') {
-                        console.error('DoA update failed:', err);
-                    }
+            if (!isFinite(result.confidence) || !isFinite(result.snr)) {
+                return {valid: false, error: 'Invalid quality metrics (NaN or Infinity)'};
+            }
+
+            // Check value ranges
+            if (result.azimuth < 0 || result.azimuth > 360) {
+                return {valid: false, error: `Azimuth out of range: ${result.azimuth}°`};
+            }
+
+            if (result.confidence < 0 || result.confidence > 100) {
+                return {valid: false, error: `Confidence out of range: ${result.confidence}%`};
+            }
+
+            if (result.phaseStd < 0) {
+                return {valid: false, error: `Negative phase std dev: ${result.phaseStd}°`};
+            }
+
+            // Check for suspiciously low confidence
+            if (result.confidence < 10) {
+                console.warn('Very low DF confidence:', result.confidence);
+            }
+
+            return {valid: true};
+        }
+
+        async function performDoAUpdate() {
+            try {
+                // Fetch DoA result calculated by backend (C++ phase-based interferometry)
+                const response = await fetchWithTimeout('/doa_result?t=' + Date.now());
+                const result = await response.json();
+
+                // Validate result data
+                const validation = validateDoAResult(result);
+                if (!validation.valid) {
+                    console.error('DoA validation failed:', validation.error);
+                    showNotification(`DF Error: ${validation.error}`, 'error');
+                    return;
+                }
+
+                // Show warning if confidence is low
+                if (result.confidence < 30) {
+                    console.warn('Low DF confidence:', result.confidence + '%');
+                    // Don't spam notifications, just log
+                }
+
+                // Update displays with backend-calculated result
+                updateDoADisplays(result);
+
+                // Add to history with full signal data
+                directionFinding.history.push({
+                    timestamp: Date.now(),
+                    azimuth: result.azimuth,
+                    backAzimuth: result.backAzimuth,
+                    hasAmbiguity: result.hasAmbiguity,
+                    confidence: result.confidence,
+                    frequency: directionFinding.selection.centerFreq,
+                    bandwidth: directionFinding.selection.bandwidth,
+                    snr: result.snr,
+                    phaseDiff: result.phaseDiff,
+                    phaseStd: result.phaseStd,
+                    coherence: result.coherence
                 });
+
+                if (directionFinding.history.length > directionFinding.maxHistory) {
+                    directionFinding.history.shift();
+                }
+
+                drawDoATimeline();
+            } catch (err) {
+                if (err.name !== 'AbortError') {
+                    console.error('DoA update failed:', err);
+                    if (directionFinding.running) {
+                        showNotification('DF update failed: Connection timeout', 'error');
+                    }
+                }
+            }
         }
 
         function updateDoADisplays(result) {
-            const elem = (id) => document.getElementById(id);
-
             // Display primary azimuth with ambiguity warning
-            if (elem('doa_azimuth_main')) {
+            const azimuthElem = getElement('doa_azimuth_main');
+            if (azimuthElem) {
                 let displayText = result.azimuth.toFixed(1) + '°';
                 if (result.hasAmbiguity) {
                     displayText += ' / ' + result.backAzimuth.toFixed(1) + '°';
                 }
-                elem('doa_azimuth_main').textContent = displayText;
-                elem('doa_azimuth_main').title = result.hasAmbiguity ?
-                    'Primary: ' + result.azimuth.toFixed(1) + '° | Back: ' + result.backAzimuth.toFixed(1) + '° (180° ambiguity)' :
+                azimuthElem.textContent = displayText;
+                azimuthElem.title = result.hasAmbiguity ?
+                    `Primary: ${result.azimuth.toFixed(1)}° | Back: ${result.backAzimuth.toFixed(1)}° (180° ambiguity)` :
                     '';
+
+                // Color code by confidence
+                if (result.confidence > 70) {
+                    azimuthElem.style.color = '#0f0';  // Green - good
+                } else if (result.confidence > 40) {
+                    azimuthElem.style.color = '#ff0';  // Yellow - fair
+                } else {
+                    azimuthElem.style.color = '#f80';  // Orange - poor
+                }
             }
 
-            if (elem('doa_confidence_main')) elem('doa_confidence_main').textContent = result.confidence.toFixed(0) + '%';
-            if (elem('doa_snr')) elem('doa_snr').textContent = result.snr.toFixed(1) + ' dB';
+            const confidenceElem = getElement('doa_confidence_main');
+            if (confidenceElem) {
+                confidenceElem.textContent = result.confidence.toFixed(0) + '%';
+                // Color code confidence
+                if (result.confidence > 70) {
+                    confidenceElem.style.color = '#0f0';
+                } else if (result.confidence > 40) {
+                    confidenceElem.style.color = '#ff0';
+                } else {
+                    confidenceElem.style.color = '#f80';
+                }
+            }
 
-            if (elem('doa_phase_diff')) elem('doa_phase_diff').textContent = result.phaseDiff.toFixed(1) + '°';
-            if (elem('doa_phase_unwrap')) elem('doa_phase_unwrap').textContent = result.phaseDiff.toFixed(1) + '°';
-            if (elem('doa_phase_std')) elem('doa_phase_std').textContent = result.phaseStd.toFixed(2) + '°';
+            setElementText('doa_snr', result.snr.toFixed(1) + ' dB');
+            setElementText('doa_phase_diff', result.phaseDiff.toFixed(1) + '°');
+            setElementText('doa_phase_unwrap', result.phaseDiff.toFixed(1) + '°');
 
-            if (elem('doa_coherence_mag')) elem('doa_coherence_mag').textContent = result.coherence.toFixed(3);
+            const phaseStdElem = getElement('doa_phase_std');
+            if (phaseStdElem) {
+                phaseStdElem.textContent = result.phaseStd.toFixed(2) + '°';
+                // Color code by phase stability (lower is better)
+                if (result.phaseStd < 5) {
+                    phaseStdElem.style.color = '#0f0';  // Stable
+                } else if (result.phaseStd < 15) {
+                    phaseStdElem.style.color = '#ff0';  // Moderate
+                } else {
+                    phaseStdElem.style.color = '#f80';  // Unstable
+                }
+            }
 
-            // Update quality with ambiguity warning
+            setElementText('doa_coherence_mag', result.coherence.toFixed(3));
+
+            // Update quality with ambiguity warning and detailed tooltip
             let quality = result.confidence > 70 ? 'Good' : result.confidence > 40 ? 'Fair' : 'Poor';
             if (result.hasAmbiguity) quality += ' ⚠';
-            if (elem('doa_quality')) {
-                elem('doa_quality').textContent = quality;
-                elem('doa_quality').title = result.hasAmbiguity ? '2-channel DF has 180° ambiguity' : '';
+
+            const qualityElem = getElement('doa_quality');
+            if (qualityElem) {
+                qualityElem.textContent = quality;
+                qualityElem.title = result.hasAmbiguity ?
+                    `2-channel DF has 180° ambiguity\nConfidence: ${result.confidence.toFixed(0)}%\nPhase Std: ${result.phaseStd.toFixed(2)}°\nSNR: ${result.snr.toFixed(1)} dB` :
+                    `Confidence: ${result.confidence.toFixed(0)}%\nPhase Std: ${result.phaseStd.toFixed(2)}°\nSNR: ${result.snr.toFixed(1)} dB`;
             }
 
-            if (elem('doa_samples')) elem('doa_samples').textContent = directionFinding.history.length;
+            setElementText('doa_samples', String(directionFinding.history.length));
 
             // Update polar display with both bearings
             drawDoAPolarMain(result.azimuth, result.backAzimuth, result.sources);
         }
 
-        function calibrateDoAMain() {
+        async function calibrateDoAMain() {
+            // Use confirm for now since we need user acknowledgment before starting
+            // TODO: Could create a custom modal in future
             if (!confirm('Place a known signal source directly at 0° (north) and click OK to calibrate')) {
                 return;
             }
 
-            // Perform calibration measurement
-            fetch('/iq_data?t=' + Date.now())
-                .then(response => response.arrayBuffer())
-                .then(buffer => {
-                    const view = new DataView(buffer);
-                    const samplesPerChannel = 256;
+            showNotification('Performing DF calibration...', 'info', 3000);
 
-                    let ch1_i = [], ch1_q = [], ch2_i = [], ch2_q = [];
-                    let offset = 0;
+            try {
+                // Perform calibration measurement
+                const response = await fetchWithTimeout('/iq_data?t=' + Date.now());
+                const buffer = await response.arrayBuffer();
 
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch1_i.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch1_q.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch2_i.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch2_q.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
+                // Validate buffer size
+                const expectedSize = IQ_SAMPLES * 4 * 2; // 4 channels (I,Q × 2) × 2 bytes per sample
+                if (buffer.byteLength < expectedSize) {
+                    throw new Error(`Insufficient IQ data: got ${buffer.byteLength} bytes, expected ${expectedSize}`);
+                }
 
-                    // Calculate phase offset
-                    let phaseDiffSum = 0;
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        const phase1 = Math.atan2(ch1_q[i], ch1_i[i]);
-                        const phase2 = Math.atan2(ch2_q[i], ch2_i[i]);
-                        let diff = phase2 - phase1;
+                const view = new DataView(buffer);
+                const samplesPerChannel = IQ_SAMPLES;
 
-                        while (diff > Math.PI) diff -= 2 * Math.PI;
-                        while (diff < -Math.PI) diff += 2 * Math.PI;
+                let ch1_i = [], ch1_q = [], ch2_i = [], ch2_q = [];
+                let offset = 0;
 
-                        phaseDiffSum += diff;
-                    }
+                // Parse IQ samples
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch1_i.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch1_q.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch2_i.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch2_q.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
 
-                    directionFinding.calibration.phaseOffset = phaseDiffSum / samplesPerChannel;
+                // Validate signal strength
+                const ch1Power = Math.sqrt(ch1_i.reduce((sum, val, idx) => sum + val*val + ch1_q[idx]*ch1_q[idx], 0) / samplesPerChannel);
+                const ch2Power = Math.sqrt(ch2_i.reduce((sum, val, idx) => sum + val*val + ch2_q[idx]*ch2_q[idx], 0) / samplesPerChannel);
 
-                    showNotification(`Calibration complete! Phase offset: ${(directionFinding.calibration.phaseOffset * 180 / Math.PI).toFixed(2)}°`, 'success', 5000);
-                    console.log('DoA calibrated. Phase offset:', directionFinding.calibration.phaseOffset);
-                })
-                .catch(err => console.error('Calibration failed:', err));
+                if (ch1Power < 100 || ch2Power < 100) {
+                    showNotification('Warning: Weak signal detected. Calibration may be inaccurate', 'warning', 5000);
+                    console.warn('Low signal power during calibration:', {ch1: ch1Power, ch2: ch2Power});
+                }
+
+                // Calculate phase offset
+                let phaseDiffSum = 0;
+                const phaseValues = [];
+
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    const phase1 = Math.atan2(ch1_q[i], ch1_i[i]);
+                    const phase2 = Math.atan2(ch2_q[i], ch2_i[i]);
+                    let diff = phase2 - phase1;
+
+                    // Wrap to [-π, π]
+                    while (diff > Math.PI) diff -= 2 * Math.PI;
+                    while (diff < -Math.PI) diff += 2 * Math.PI;
+
+                    phaseDiffSum += diff;
+                    phaseValues.push(diff);
+                }
+
+                const avgPhaseOffset = phaseDiffSum / samplesPerChannel;
+
+                // Calculate standard deviation to assess calibration quality
+                const variance = phaseValues.reduce((sum, val) => sum + Math.pow(val - avgPhaseOffset, 2), 0) / samplesPerChannel;
+                const stdDev = Math.sqrt(variance);
+                const stdDevDeg = stdDev * 180 / Math.PI;
+
+                // Store calibration
+                directionFinding.calibration.phaseOffset = avgPhaseOffset;
+
+                // Report results
+                const offsetDeg = (avgPhaseOffset * 180 / Math.PI).toFixed(2);
+                console.log('DoA calibration complete:', {
+                    phaseOffset: avgPhaseOffset,
+                    phaseOffsetDeg: offsetDeg,
+                    stdDevDeg: stdDevDeg.toFixed(2),
+                    ch1Power: ch1Power.toFixed(1),
+                    ch2Power: ch2Power.toFixed(1)
+                });
+
+                if (stdDevDeg > 10) {
+                    showNotification(`Calibration complete but unstable (σ=${stdDevDeg.toFixed(1)}°). Phase offset: ${offsetDeg}°`, 'warning', 5000);
+                } else {
+                    showNotification(`Calibration successful! Phase offset: ${offsetDeg}° (σ=${stdDevDeg.toFixed(1)}°)`, 'success', 5000);
+                }
+
+            } catch (err) {
+                console.error('Calibration failed:', err);
+                showNotification(`Calibration failed: ${err.message}`, 'error');
+            }
         }
 
         function clearDoAHistory() {

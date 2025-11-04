@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <complex>
+#include <fftw3.h>
 
 // PNG image writer (single-header library)
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -55,6 +57,7 @@ XCorrBuffer g_xcorr_data;                            // Cross-correlation data b
 LinkQuality g_link_quality;                          // Link quality metrics buffer
 DoAResult g_doa_result;                              // Direction of Arrival result buffer
 ScannerState g_scanner;                              // Frequency scanner state
+ClassificationBuffer g_classifications;              // Signal classification buffer
 static std::atomic<bool> g_web_running{false};       // Web server thread running flag
 static std::thread g_web_thread;                     // Web server worker thread
 static std::atomic<uint64_t> g_http_bytes_sent{0};   // Actual HTTP bytes sent counter
@@ -143,12 +146,16 @@ void update_waterfall(const uint8_t* ch1_mag, const uint8_t* ch2_mag, size_t fft
 }
 
 // Update IQ constellation data for both channels
-// Thread-safe function that stores decimated IQ samples for scatter plot display
+// Thread-safe function that stores decimated IQ samples and full FFT data
 // Args
 //   ch1_iq Channel 1 IQ samples as interleaved I Q pairs
 //   ch2_iq Channel 2 IQ samples as interleaved I Q pairs
 //   count Number of IQ pairs to copy (should be IQ_SAMPLES)
-void update_iq_data(const int16_t* ch1_iq, const int16_t* ch2_iq, size_t count) {
+//   ch1_fft Channel 1 FFT output (optional, for frequency-domain filtering)
+//   ch2_fft Channel 2 FFT output (optional, for frequency-domain filtering)
+//   fft_size Size of FFT arrays (should be 4096)
+void update_iq_data(const int16_t* ch1_iq, const int16_t* ch2_iq, size_t count,
+                    const fftwf_complex* ch1_fft, const fftwf_complex* ch2_fft, size_t fft_size) {
     std::lock_guard<std::mutex> lock(g_iq_data.mutex);
 
     // Copy IQ samples up to buffer size
@@ -159,6 +166,21 @@ void update_iq_data(const int16_t* ch1_iq, const int16_t* ch2_iq, size_t count) 
         g_iq_data.ch1_q[i] = ch1_iq[i * 2 + 1];  // Extract Q samples
         g_iq_data.ch2_i[i] = ch2_iq[i * 2];
         g_iq_data.ch2_q[i] = ch2_iq[i * 2 + 1];
+    }
+
+    // Store FFT data if provided (for frequency-domain filtering)
+    if (ch1_fft && ch2_fft && fft_size > 0) {
+        // Ensure vectors are sized correctly
+        if (g_iq_data.ch1_fft.size() != fft_size) {
+            g_iq_data.ch1_fft.resize(fft_size);
+            g_iq_data.ch2_fft.resize(fft_size);
+        }
+
+        // Copy FFT data as complex numbers
+        for (size_t i = 0; i < fft_size; i++) {
+            g_iq_data.ch1_fft[i] = std::complex<float>(ch1_fft[i][0], ch1_fft[i][1]);
+            g_iq_data.ch2_fft[i] = std::complex<float>(ch2_fft[i][0], ch2_fft[i][1]);
+        }
     }
 }
 
@@ -222,6 +244,30 @@ void update_doa_result(float azimuth, float back_azimuth, float phase_diff,
     g_doa_result.snr_db = snr;
     g_doa_result.coherence = coherence;
     g_doa_result.has_ambiguity = true;  // Always true for 2-channel systems
+}
+
+// Add a signal classification result to the circular buffer
+void add_classification(uint64_t frequency_hz, float bandwidth_hz, const char* modulation,
+                       uint8_t confidence, float power_db, uint64_t timestamp_ms) {
+    std::lock_guard<std::mutex> lock(g_classifications.mutex);
+
+    // Add to circular buffer
+    ClassifiedSignal& entry = g_classifications.classifications[g_classifications.write_index];
+    entry.frequency_hz = frequency_hz;
+    entry.bandwidth_hz = bandwidth_hz;
+    strncpy(entry.modulation, modulation, sizeof(entry.modulation) - 1);
+    entry.modulation[sizeof(entry.modulation) - 1] = '\0';
+    entry.confidence = confidence;
+    entry.power_db = power_db;
+    entry.timestamp_ms = timestamp_ms;
+
+    // Advance write index
+    g_classifications.write_index = (g_classifications.write_index + 1) % MAX_CLASSIFICATIONS;
+
+    // Update count
+    if (g_classifications.count < MAX_CLASSIFICATIONS) {
+        g_classifications.count++;
+    }
 }
 
 // Get and reset HTTP bytes sent counter
@@ -887,6 +933,61 @@ const char* html_page = R"HTMLDELIM(
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        /* Tooltip Styles */
+        [title]:not([title=""]) {
+            position: relative;
+            cursor: help;
+        }
+        [title]:not([title=""]):hover::after {
+            content: attr(title);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            margin-bottom: 8px;
+            padding: 8px 12px;
+            background: rgba(0, 0, 0, 0.95);
+            color: #0ff;
+            font-size: 11px;
+            white-space: nowrap;
+            border: 1px solid #0ff;
+            border-radius: 4px;
+            z-index: 10000;
+            pointer-events: none;
+            box-shadow: 0 2px 10px rgba(0, 255, 255, 0.3);
+        }
+        [title]:not([title=""]):hover::before {
+            content: '';
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            margin-bottom: 2px;
+            border: 6px solid transparent;
+            border-top-color: #0ff;
+            z-index: 10000;
+            pointer-events: none;
+        }
+        /* Button tooltips appear above */
+        button[title]:not([title=""]):hover::after {
+            bottom: calc(100% + 5px);
+        }
+        /* Input tooltips appear to the right */
+        input[title]:not([title=""]):hover::after {
+            bottom: auto;
+            left: calc(100% + 10px);
+            top: 50%;
+            transform: translateY(-50%);
+            margin-bottom: 0;
+        }
+        input[title]:not([title=""]):hover::before {
+            bottom: auto;
+            left: calc(100% + 4px);
+            top: 50%;
+            transform: translateY(-50%) rotate(-90deg);
+            margin-bottom: 0;
+        }
     </style>
 </head>
 <body>
@@ -943,9 +1044,21 @@ const char* html_page = R"HTMLDELIM(
             <!-- Channel divider for dual-channel mode -->
             <div id="channel-divider"></div>
 
-            <!-- Live Stats Overlay -->
-            <div style="position: fixed; bottom: 20px; right: 20px; background: rgba(0,0,0,0.85); padding: 12px; border: 1px solid #0ff; border-radius: 4px; font-size: 11px; z-index: 50; min-width: 200px;">
+            <!-- Live Stats Overlay with Signal Strength Meter -->
+            <div style="position: fixed; bottom: 20px; right: 20px; background: rgba(0,0,0,0.85); padding: 12px; border: 1px solid #0ff; border-radius: 4px; font-size: 11px; z-index: 50; min-width: 220px;">
                 <div style="color: #0ff; font-weight: bold; margin-bottom: 8px; border-bottom: 1px solid #333; padding-bottom: 5px;">LIVE STATS</div>
+
+                <!-- Signal Strength Meter -->
+                <div style="margin-bottom: 10px;">
+                    <div style="font-size: 10px; color: #888; margin-bottom: 3px;">Signal Strength</div>
+                    <div style="width: 100%; height: 20px; background: #0a0a0a; border: 1px solid #333; border-radius: 3px; overflow: hidden; position: relative;">
+                        <div id="signal_strength_bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #0f0, #ff0, #f00); transition: width 0.2s;"></div>
+                        <div style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: bold; color: #fff; text-shadow: 1px 1px 2px #000;">
+                            <span id="signal_strength_text">--</span>
+                        </div>
+                    </div>
+                </div>
+
                 <div style="color: #888; font-family: monospace;">
                     <div style="display: flex; justify-content: space-between; margin: 3px 0;">
                         <span>Peak:</span>
@@ -1076,16 +1189,22 @@ const char* html_page = R"HTMLDELIM(
                             <strong style="color: #0ff; font-size: 12px;">CONTROL</strong>
 
                             <div style="display: flex; flex-direction: column; gap: 6px; flex: 1; justify-content: center;">
-                                <button onclick="startDoA()" style="padding: 12px; background: #0a3a3a; border: 2px solid #0ff; color: #0ff; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 12px;">
+                                <button onclick="startDoA()" style="padding: 12px; background: #0a3a3a; border: 2px solid #0ff; color: #0ff; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 12px;" title="Start direction finding on selected frequency range">
                                     ▶ START
                                 </button>
-                                <button onclick="stopDoA()" style="padding: 10px; background: #3a0a0a; border: 2px solid #f00; color: #f00; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 11px;">
+                                <button onclick="stopDoA()" style="padding: 10px; background: #3a0a0a; border: 2px solid #f00; color: #f00; cursor: pointer; border-radius: 4px; font-weight: bold; font-size: 11px;" title="Stop direction finding">
                                     ■ STOP
                                 </button>
-                                <button onclick="calibrateDoAMain()" style="padding: 8px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                                <button onclick="calibrateDoAMain()" style="padding: 8px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;" title="Calibrate phase offset with known signal at 0°">
                                     Calibrate Array
                                 </button>
-                                <button onclick="openStreamOutConfig()" style="padding: 8px; background: #1a1a3a; border: 1px solid #88f; color: #aaf; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                                <button id="doa_freeze_btn" onclick="toggleDoAFreeze()" style="padding: 8px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;" title="Freeze display to analyze current bearing">
+                                    ❄ Freeze
+                                </button>
+                                <button onclick="showBearingExportDialog()" style="padding: 8px; background: #1a1a1a; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 3px; font-size: 10px;" title="Export bearing history to CSV/JSON/KML">
+                                    📁 Export
+                                </button>
+                                <button onclick="openStreamOutConfig()" style="padding: 8px; background: #1a1a3a; border: 1px solid #88f; color: #aaf; cursor: pointer; border-radius: 3px; font-size: 10px;" title="Configure TAK/CoT streaming output">
                                     Stream Out
                                 </button>
                             </div>
@@ -1164,11 +1283,11 @@ const char* html_page = R"HTMLDELIM(
                             </div>
                             <div>
                                 <label style="font-size: 11px; color: #888;">Step (MHz):</label>
-                                <input type="number" id="scan_step" value="40" min="1" max="100" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
+                                <input type="number" id="scan_step" value="40" min="1" max="100" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;" title="Frequency step size between scan points">
                             </div>
                             <div>
                                 <label style="font-size: 11px; color: #888;">Threshold (dBm):</label>
-                                <input type="number" id="scan_threshold" value="-80" min="-120" max="0" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
+                                <input type="number" id="scan_threshold" value="-80" min="-120" max="0" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;" title="Minimum power level to detect signals">
                             </div>
                             <div>
                                 <label style="font-size: 11px; color: #888;">Dwell (ms):</label>
@@ -1183,6 +1302,10 @@ const char* html_page = R"HTMLDELIM(
                             <button id="scan_start_btn" onclick="startScanner()" style="padding: 10px; background: #0a0; border: none; color: #fff; font-weight: bold; border-radius: 3px; cursor: pointer;">▶ START SCAN</button>
                             <button id="scan_stop_btn" onclick="stopScanner()" style="padding: 10px; background: #a00; border: none; color: #fff; font-weight: bold; border-radius: 3px; cursor: pointer; display: none;">⏹ STOP SCAN</button>
                             <button onclick="clearScanner()" style="padding: 8px; background: #444; border: none; color: #fff; border-radius: 3px; cursor: pointer;">🗑 Clear Results</button>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px;">
+                                <button id="scan_export_btn" onclick="Scanner.exportResults()" style="padding: 6px; background: #046; border: none; color: #fff; font-size: 11px; border-radius: 3px; cursor: pointer;">📁 Export</button>
+                                <button id="scan_filter_btn" onclick="Scanner.showFilterDialog()" style="padding: 6px; background: #046; border: none; color: #fff; font-size: 11px; border-radius: 3px; cursor: pointer;">🔍 Filter</button>
+                            </div>
                         </div>
                     </div>
 
@@ -1193,6 +1316,15 @@ const char* html_page = R"HTMLDELIM(
                             <div>Current: <span id="scan_current_freq" style="color: #0f0;">--</span> MHz</div>
                             <div>Scans: <span id="scan_count" style="color: #ff0;">0</span></div>
                             <div>Signals: <span id="scan_signal_count" style="color: #0ff;">0</span></div>
+                            <div style="margin-top: 10px;">
+                                <div style="font-size: 10px; color: #888; margin-bottom: 3px;">Progress:</div>
+                                <div style="width: 100%; height: 16px; background: #0a0a0a; border: 1px solid #333; border-radius: 3px; overflow: hidden;">
+                                    <div id="scan_progress_bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #0a0, #0f0); transition: width 0.3s;"></div>
+                                </div>
+                                <div style="font-size: 10px; color: #888; margin-top: 3px;">
+                                    <span id="scan_progress_pct">0%</span> | ETA: <span id="scan_eta">--</span>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -2215,8 +2347,45 @@ const char* html_page = R"HTMLDELIM(
         </div>
         <div class="control-group">
             <label>Frequency (MHz)</label>
-            <input type="number" id="freqInput" step="0.01" min="47" max="6000" value="915.00">
-            <button onclick="applyFrequency()">Set</button>
+            <input type="number" id="freqInput" step="0.01" min="47" max="6000" value="915.00" title="Center frequency in MHz (47-6000)">
+            <button onclick="applyFrequency()" title="Apply frequency">Set</button>
+        </div>
+        <div class="control-group">
+            <label>Frequency Presets</label>
+            <select id="freqPresets" onchange="applyFrequencyPreset()" style="width: 100%;" title="Quick access to common frequency bands">
+                <option value="">-- Select Preset --</option>
+                <optgroup label="ISM Bands">
+                    <option value="315.0">315 MHz ISM</option>
+                    <option value="433.92">433.92 MHz ISM</option>
+                    <option value="868.0">868 MHz ISM (EU)</option>
+                    <option value="915.0">915 MHz ISM (US)</option>
+                    <option value="2450.0">2.4 GHz ISM</option>
+                    <option value="5800.0">5.8 GHz ISM</option>
+                </optgroup>
+                <optgroup label="Radio Services">
+                    <option value="155.0">155 MHz Marine VHF</option>
+                    <option value="162.5">162.5 MHz NOAA Weather</option>
+                    <option value="462.5">462.5 MHz FRS/GMRS</option>
+                    <option value="850.0">850 MHz Cellular</option>
+                    <option value="1900.0">1900 MHz PCS</option>
+                    <option value="1090.0">1090 MHz ADS-B</option>
+                </optgroup>
+                <optgroup label="Ham Bands">
+                    <option value="144.0">144 MHz (2m)</option>
+                    <option value="220.0">220 MHz (1.25m)</option>
+                    <option value="440.0">440 MHz (70cm)</option>
+                    <option value="1296.0">1296 MHz (23cm)</option>
+                    <option value="2320.0">2320 MHz (13cm)</option>
+                </optgroup>
+                <optgroup label="WiFi">
+                    <option value="2412.0">WiFi Ch 1 (2412 MHz)</option>
+                    <option value="2437.0">WiFi Ch 6 (2437 MHz)</option>
+                    <option value="2462.0">WiFi Ch 11 (2462 MHz)</option>
+                    <option value="5180.0">WiFi Ch 36 (5180 MHz)</option>
+                    <option value="5500.0">WiFi Ch 100 (5500 MHz)</option>
+                    <option value="5745.0">WiFi Ch 149 (5745 MHz)</option>
+                </optgroup>
+            </select>
         </div>
         <div class="control-group">
             <label>Sample Rate (MHz)</label>
@@ -2230,13 +2399,13 @@ const char* html_page = R"HTMLDELIM(
         </div>
         <div class="control-group">
             <label>Gain RX1 (dB)</label>
-            <input type="number" id="gain1Input" step="1" min="0" max="60" value="40">
-            <button onclick="applyGain1()">Set</button>
+            <input type="number" id="gain1Input" step="1" min="0" max="60" value="40" title="RF gain for receiver channel 1 (0-60 dB)">
+            <button onclick="applyGain1()" title="Apply gain to RX1">Set</button>
         </div>
         <div class="control-group">
             <label>Gain RX2 (dB)</label>
-            <input type="number" id="gain2Input" step="1" min="0" max="60" value="40">
-            <button onclick="applyGain2()">Set</button>
+            <input type="number" id="gain2Input" step="1" min="0" max="60" value="40" title="RF gain for receiver channel 2 (0-60 dB)">
+            <button onclick="applyGain2()" title="Apply gain to RX2">Set</button>
         </div>
         <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Display Settings</h3>
         <div class="control-group">
@@ -2282,6 +2451,55 @@ const char* html_page = R"HTMLDELIM(
             <label>Spectrum Max (dB)</label>
             <input type="number" id="spectrumMax" step="10" min="-60" max="20" value="-10">
             <button onclick="updateSpectrumRange()">Set</button>
+        </div>
+        <div class="control-group">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="peakHoldCheckbox" onchange="togglePeakHold(this.checked)" style="margin-right: 8px;" title="Hold maximum spectrum values">
+                Peak Hold
+            </label>
+        </div>
+        <div class="control-group">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="persistenceCheckbox" onchange="togglePersistence(this.checked)" style="margin-right: 8px;" title="Show signal trails on waterfall">
+                Persistence Mode
+            </label>
+        </div>
+        <div class="control-group" id="persistenceControls" style="display: none; padding-left: 20px;">
+            <label style="font-size: 10px;">Decay Rate:</label>
+            <input type="range" id="persistenceDecay" min="0.1" max="0.95" step="0.05" value="0.7" oninput="updatePersistenceDecay(this.value)" style="width: 100%;" title="How fast trails fade">
+            <span id="persistenceDecayValue" style="font-size: 9px; color: #888;">0.7</span>
+        </div>
+        <div class="control-group">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="signalLogCheckbox" onchange="toggleSignalLog(this.checked)" style="margin-right: 8px;" title="Automatically log strong signals">
+                Signal Logging
+            </label>
+        </div>
+        <div class="control-group">
+            <button onclick="downloadSignalLog()" id="downloadLogBtn" style="width: 100%; padding: 6px;" title="Download logged signals as CSV" disabled>
+                Download Signal Log
+            </button>
+        </div>
+
+        <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Advanced Displays</h3>
+        <div class="control-group">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="iq_toggle" onchange="toggleIQ()" style="margin-right: 8px;" title="Show IQ constellation diagram">
+                IQ Constellation
+            </label>
+        </div>
+        <div class="control-group">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="xcorr_toggle" onchange="toggleXCorr()" style="margin-right: 8px;" title="Show cross-correlation plot">
+                Cross-Correlation
+            </label>
+        </div>
+        <div class="control-group">
+            <label style="display: flex; align-items: center; cursor: pointer;">
+                <input type="checkbox" id="filter_mode_toggle" onchange="toggleFilterMode()" style="margin-right: 8px;" title="Enable filter selection mode for IQ/XCorr">
+                Filter Selection Mode
+            </label>
+            <div id="filter_status" style="font-size: 10px; color: #888; margin-left: 24px; min-height: 14px;"></div>
         </div>
 
         <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Configuration Presets</h3>
@@ -2338,6 +2556,22 @@ const char* html_page = R"HTMLDELIM(
         <div class="control-group">
             <button onclick="exportSpectrumCSV()" style="padding: 6px 12px; width: 100%;">Export Spectrum to CSV</button>
         </div>
+
+        <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Application Settings</h3>
+        <div class="control-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
+            <button onclick="exportAllSettings()" style="padding: 6px;" title="Download all app settings as JSON">
+                📥 Export Config
+            </button>
+            <button onclick="importAllSettings()" style="padding: 6px;" title="Load settings from JSON file">
+                📤 Import Config
+            </button>
+        </div>
+        <div class="control-group">
+            <button onclick="resetAllSettings()" style="padding: 6px 12px; width: 100%; background: rgba(255, 0, 0, 0.1);" title="Reset all settings to defaults">
+                🔄 Reset to Defaults
+            </button>
+        </div>
+        <input type="file" id="settingsImportFile" accept=".json" style="display: none;" onchange="handleSettingsImport(event)" />
     </div>
 
     <div class="axis-label freq-axis" id="freq-axis"></div>
@@ -2354,6 +2588,18 @@ const char* html_page = R"HTMLDELIM(
         const iqCtx = iqCanvas.getContext('2d');
         const xcorrCanvas = document.getElementById('xcorr_canvas');
         const xcorrCtx = xcorrCanvas.getContext('2d');
+
+        // Offscreen canvases for double buffering (eliminates flicker)
+        const spectrumOffscreen = document.createElement('canvas');
+        const spectrumOffscreenCtx = spectrumOffscreen.getContext('2d');
+        spectrumOffscreen.width = spectrumCanvas.width;
+        spectrumOffscreen.height = spectrumCanvas.height;
+
+        const iqOffscreen = document.createElement('canvas');
+        const iqOffscreenCtx = iqOffscreen.getContext('2d');
+        iqOffscreen.width = iqCanvas.width;
+        iqOffscreen.height = iqCanvas.height;
+
         const FFT_SIZE = 4096;
         const IQ_SAMPLES = 256;
         let currentChannel = 1;
@@ -2387,6 +2633,17 @@ const char* html_page = R"HTMLDELIM(
             zoomStartBin: 0,          // Start FFT bin of zoom region
             zoomEndBin: 4095,         // End FFT bin of zoom region (FFT_SIZE-1)
             isZoomed: false           // Whether we're zoomed in
+        };
+
+        // Filter selection state for IQ/XCorr filtering
+        let filterState = {
+            enabled: false,           // Filter mode enabled
+            isSelecting: false,       // Currently selecting region
+            startX: 0,                // Start X coordinate of selection
+            currentX: 0,              // Current X coordinate during selection
+            filterStartBin: 0,        // Start FFT bin of filter region
+            filterEndBin: 4095,       // End FFT bin of filter region (FFT_SIZE-1)
+            isFiltered: false         // Whether a filter is active
         };
 
         // Global state for signal analysis
@@ -2802,6 +3059,9 @@ const char* html_page = R"HTMLDELIM(
             if (spectrumCanvas.width !== newSpecWidth || spectrumCanvas.height !== newSpecHeight) {
                 spectrumCanvas.width = newSpecWidth;
                 spectrumCanvas.height = newSpecHeight;
+                // Also resize offscreen canvas for double buffering
+                spectrumOffscreen.width = newSpecWidth;
+                spectrumOffscreen.height = newSpecHeight;
             }
 
             // Ensure spectrum positioning matches waterfall
@@ -2828,7 +3088,12 @@ const char* html_page = R"HTMLDELIM(
 
             isUpdatingIQ = true;
             try {
-                const response = await fetchWithTimeout('/iq_data?t=' + Date.now());
+                // Add filter parameters if filter is active
+                let url = '/iq_data?t=' + Date.now();
+                if (filterState.isFiltered) {
+                    url += `&start_bin=${filterState.filterStartBin}&end_bin=${filterState.filterEndBin}`;
+                }
+                const response = await fetchWithTimeout(url);
                 const buffer = await response.arrayBuffer();
                 const data = new Int16Array(buffer);
 
@@ -2859,7 +3124,12 @@ const char* html_page = R"HTMLDELIM(
 
             isUpdatingXCorr = true;
             try {
-                const response = await fetchWithTimeout('/xcorr_data?t=' + Date.now());
+                // Add filter parameters if filter is active
+                let url = '/xcorr_data?t=' + Date.now();
+                if (filterState.isFiltered) {
+                    url += `&start_bin=${filterState.filterStartBin}&end_bin=${filterState.filterEndBin}`;
+                }
+                const response = await fetchWithTimeout(url);
                 const buffer = await response.arrayBuffer();
                 const data = new Float32Array(buffer);
 
@@ -3200,48 +3470,237 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
-        // Draw FFT spectrum (SDR++/sigdigger style)
+        // Peak hold state
+        let peakHoldEnabled = false;
+        let peakHoldData = null;
+
+        // Persistence mode state
+        let persistenceEnabled = false;
+        let persistenceBuffer = null;
+        let persistenceDecay = 0.7; // How fast trails fade (0-1)
+
+        function togglePersistence(enabled) {
+            persistenceEnabled = enabled;
+            const controls = getElement('persistenceControls');
+
+            if (enabled) {
+                showNotification('Persistence mode enabled - signals will leave trails', 'success', 2000);
+                if (controls) controls.style.display = 'block';
+                // Initialize persistence buffer
+                persistenceBuffer = null;
+            } else {
+                showNotification('Persistence mode disabled', 'info', 2000);
+                if (controls) controls.style.display = 'none';
+                // Clear persistence buffer
+                persistenceBuffer = null;
+            }
+
+            if (typeof Settings !== 'undefined') {
+                Settings.set('persistence_enabled', enabled);
+            }
+        }
+
+        function updatePersistenceDecay(value) {
+            persistenceDecay = parseFloat(value);
+            const display = getElement('persistenceDecayValue');
+            if (display) display.textContent = value;
+
+            if (typeof Settings !== 'undefined') {
+                Settings.set('persistence_decay', persistenceDecay);
+            }
+        }
+
+        function applyPersistence(newData) {
+            if (!persistenceEnabled) {
+                return newData;
+            }
+
+            // Initialize persistence buffer if needed
+            if (!persistenceBuffer || persistenceBuffer.length !== newData.length) {
+                persistenceBuffer = new Uint8Array(newData);
+                return newData;
+            }
+
+            // Create output with persistence applied
+            const output = new Uint8Array(newData.length);
+
+            for (let i = 0; i < newData.length; i++) {
+                // Decay old values
+                persistenceBuffer[i] = Math.floor(persistenceBuffer[i] * persistenceDecay);
+
+                // Take maximum of new data and decayed persistence
+                output[i] = Math.max(newData[i], persistenceBuffer[i]);
+
+                // Update persistence buffer with current max
+                persistenceBuffer[i] = output[i];
+            }
+
+            return output;
+        }
+
+        function togglePeakHold(enabled) {
+            peakHoldEnabled = enabled;
+            if (!enabled) {
+                peakHoldData = null; // Clear peak hold data
+            }
+            if (typeof Settings !== 'undefined') {
+                Settings.set('live_peak_hold', enabled);
+            }
+        }
+
+        // Signal logging state
+        let signalLogEnabled = false;
+        let signalLog = [];
+        const SIGNAL_LOG_THRESHOLD = -60; // dBm
+        const SIGNAL_LOG_INTERVAL = 5000; // Log every 5 seconds
+        let lastSignalLogTime = 0;
+
+        function toggleSignalLog(enabled) {
+            signalLogEnabled = enabled;
+            const downloadBtn = getElement('downloadLogBtn');
+
+            if (enabled) {
+                showNotification('Signal logging started', 'success', 2000);
+                if (downloadBtn) downloadBtn.disabled = false;
+            } else {
+                showNotification('Signal logging stopped', 'info', 2000);
+            }
+
+            if (typeof Settings !== 'undefined') {
+                Settings.set('signal_log_enabled', enabled);
+            }
+        }
+
+        function logSignals(fftData) {
+            if (!signalLogEnabled || !fftData) return;
+
+            const now = Date.now();
+            if (now - lastSignalLogTime < SIGNAL_LOG_INTERVAL) return;
+            lastSignalLogTime = now;
+
+            // Find peaks in spectrum
+            const centerFreq = parseFloat(document.getElementById('freq').textContent) || 915;
+            const sampleRate = parseFloat(document.getElementById('sr').textContent) || 40;
+            const peaks = [];
+
+            // Simple peak detection
+            for (let i = 10; i < fftData.length - 10; i++) {
+                const magDb = rawToDb(fftData[i]);
+                if (magDb > SIGNAL_LOG_THRESHOLD) {
+                    // Check if it's a local maximum
+                    let isPeak = true;
+                    for (let j = i - 5; j <= i + 5; j++) {
+                        if (j !== i && fftData[j] > fftData[i]) {
+                            isPeak = false;
+                            break;
+                        }
+                    }
+
+                    if (isPeak) {
+                        const binFreq = centerFreq - sampleRate / 2 + (i / fftData.length) * sampleRate;
+                        peaks.push({
+                            timestamp: new Date().toISOString(),
+                            frequency: binFreq.toFixed(6),
+                            power: magDb.toFixed(2),
+                            centerFreq: centerFreq,
+                            sampleRate: sampleRate
+                        });
+                    }
+                }
+            }
+
+            // Add peaks to log
+            if (peaks.length > 0) {
+                signalLog.push(...peaks);
+                console.log(`Logged ${peaks.length} signals`);
+
+                // Limit log size to 10000 entries
+                if (signalLog.length > 10000) {
+                    signalLog = signalLog.slice(-5000);
+                }
+            }
+        }
+
+        function downloadSignalLog() {
+            if (signalLog.length === 0) {
+                showNotification('No signals logged yet', 'warning', 3000);
+                return;
+            }
+
+            // Build CSV
+            let csv = 'Timestamp,Frequency (MHz),Power (dBm),Center Freq (MHz),Sample Rate (MHz)\n';
+            signalLog.forEach(signal => {
+                csv += `${signal.timestamp},${signal.frequency},${signal.power},${signal.centerFreq},${signal.sampleRate}\n`;
+            });
+
+            // Download
+            if (typeof Utils !== 'undefined' && Utils.downloadFile) {
+                const filename = `signal_log_${new Date().toISOString().split('T')[0]}.csv`;
+                Utils.downloadFile(csv, filename, 'text/csv');
+                showNotification(`Downloaded ${signalLog.length} logged signals to ${filename}`, 'success', 3000);
+            }
+        }
+
+
+        // Draw FFT spectrum (SDR++/sigdigger style) with double buffering
         function drawSpectrum(data, data2) {
             if (!data) return;
 
-            const width = spectrumCanvas.width;
-            const height = spectrumCanvas.height;
+            // Log signals if enabled
+            logSignals(data);
 
-            // Clear canvas with dark background
-            spectrumCtx.fillStyle = '#0a0a0a';
-            spectrumCtx.fillRect(0, 0, width, height);
+            // Update peak hold data
+            if (peakHoldEnabled) {
+                if (!peakHoldData || peakHoldData.length !== data.length) {
+                    peakHoldData = new Uint8Array(data);
+                } else {
+                    for (let i = 0; i < data.length; i++) {
+                        if (data[i] > peakHoldData[i]) {
+                            peakHoldData[i] = data[i];
+                        }
+                    }
+                }
+            }
+
+            // Render to offscreen canvas (double buffering)
+            const width = spectrumOffscreen.width;
+            const height = spectrumOffscreen.height;
+
+            // Clear offscreen canvas with dark background
+            spectrumOffscreenCtx.fillStyle = '#0a0a0a';
+            spectrumOffscreenCtx.fillRect(0, 0, width, height);
 
             // Draw horizontal grid lines (more visible)
-            spectrumCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
-            spectrumCtx.lineWidth = 1;
+            spectrumOffscreenCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            spectrumOffscreenCtx.lineWidth = 1;
             for (let i = 0; i <= 10; i++) {
                 const y = (height / 10) * i;
-                spectrumCtx.beginPath();
-                spectrumCtx.moveTo(0, y);
-                spectrumCtx.lineTo(width, y);
-                spectrumCtx.stroke();
+                spectrumOffscreenCtx.beginPath();
+                spectrumOffscreenCtx.moveTo(0, y);
+                spectrumOffscreenCtx.lineTo(width, y);
+                spectrumOffscreenCtx.stroke();
             }
 
             // Draw vertical grid lines
-            spectrumCtx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
+            spectrumOffscreenCtx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
             for (let i = 0; i <= 10; i++) {
                 const x = (width / 10) * i;
-                spectrumCtx.beginPath();
-                spectrumCtx.moveTo(x, 0);
-                spectrumCtx.lineTo(x, height);
-                spectrumCtx.stroke();
+                spectrumOffscreenCtx.beginPath();
+                spectrumOffscreenCtx.moveTo(x, 0);
+                spectrumOffscreenCtx.lineTo(x, height);
+                spectrumOffscreenCtx.stroke();
             }
 
             // Enable smoothing for better visual quality
-            spectrumCtx.imageSmoothingEnabled = true;
-            spectrumCtx.imageSmoothingQuality = 'high';
+            spectrumOffscreenCtx.imageSmoothingEnabled = true;
+            spectrumOffscreenCtx.imageSmoothingQuality = 'high';
 
             // Calculate Y-axis mapping based on current zoom/scroll range
             const dbRange = spectrumMaxDb - spectrumMinDb;
 
             // Store path for gradient fill
-            spectrumCtx.beginPath();
-            spectrumCtx.moveTo(0, height);
+            spectrumOffscreenCtx.beginPath();
+            spectrumOffscreenCtx.moveTo(0, height);
 
             // Draw spectrum line with gradient color based on amplitude
             const points = [];
@@ -3257,27 +3716,27 @@ const char* html_page = R"HTMLDELIM(
                 const y = height - (normalizedMag * height);
                 points.push({ x: x, y: y, mag: normalizedMag });
 
-                spectrumCtx.lineTo(x, y);
+                spectrumOffscreenCtx.lineTo(x, y);
             }
 
             // Complete the path for fill
-            spectrumCtx.lineTo(width, height);
-            spectrumCtx.closePath();
+            spectrumOffscreenCtx.lineTo(width, height);
+            spectrumOffscreenCtx.closePath();
 
             // Create gradient fill (green-yellow gradient like SDR++)
-            const gradient = spectrumCtx.createLinearGradient(0, 0, 0, height);
+            const gradient = spectrumOffscreenCtx.createLinearGradient(0, 0, 0, height);
             gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');    // Yellow at top (strong signals)
             gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');  // Green
             gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');  // Cyan
             gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');    // Blue at bottom (noise floor)
 
-            spectrumCtx.fillStyle = gradient;
-            spectrumCtx.fill();
+            spectrumOffscreenCtx.fillStyle = gradient;
+            spectrumOffscreenCtx.fill();
 
             // Draw spectrum line with variable color
-            spectrumCtx.lineJoin = 'round';
-            spectrumCtx.lineCap = 'round';
-            spectrumCtx.lineWidth = 1.5;
+            spectrumOffscreenCtx.lineJoin = 'round';
+            spectrumOffscreenCtx.lineCap = 'round';
+            spectrumOffscreenCtx.lineWidth = 1.5;
 
             // Draw line with gradient based on signal strength
             for (let i = 0; i < points.length - 1; i++) {
@@ -3287,47 +3746,80 @@ const char* html_page = R"HTMLDELIM(
                 // Color based on magnitude (green-yellow gradient)
                 const mag = (p1.mag + p2.mag) / 2;
                 if (mag > 0.8) {
-                    spectrumCtx.strokeStyle = '#ffff00';  // Yellow for strong signals
+                    spectrumOffscreenCtx.strokeStyle = '#ffff00';  // Yellow for strong signals
                 } else if (mag > 0.5) {
-                    spectrumCtx.strokeStyle = '#88ff00';  // Yellow-green
+                    spectrumOffscreenCtx.strokeStyle = '#88ff00';  // Yellow-green
                 } else if (mag > 0.3) {
-                    spectrumCtx.strokeStyle = '#00ff88';  // Green-cyan
+                    spectrumOffscreenCtx.strokeStyle = '#00ff88';  // Green-cyan
                 } else {
-                    spectrumCtx.strokeStyle = '#00ffff';  // Cyan for weak signals
+                    spectrumOffscreenCtx.strokeStyle = '#00ffff';  // Cyan for weak signals
                 }
 
-                spectrumCtx.beginPath();
-                spectrumCtx.moveTo(p1.x, p1.y);
-                spectrumCtx.lineTo(p2.x, p2.y);
-                spectrumCtx.stroke();
+                spectrumOffscreenCtx.beginPath();
+                spectrumOffscreenCtx.moveTo(p1.x, p1.y);
+                spectrumOffscreenCtx.lineTo(p2.x, p2.y);
+                spectrumOffscreenCtx.stroke();
             }
 
             // Draw dB scale labels (now shows scrolled/zoomed range)
-            spectrumCtx.fillStyle = '#888';
-            spectrumCtx.font = '10px monospace';
-            spectrumCtx.textAlign = 'right';
+            spectrumOffscreenCtx.fillStyle = '#888';
+            spectrumOffscreenCtx.font = '10px monospace';
+            spectrumOffscreenCtx.textAlign = 'right';
             for (let i = 0; i <= 10; i++) {
                 const y = (height / 10) * i;
                 const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
-                spectrumCtx.fillText(dbValue + ' dB', width - 5, y + 3);
+                spectrumOffscreenCtx.fillText(dbValue + ' dB', width - 5, y + 3);
             }
 
             // Draw Y-axis range indicator (top-left of spectrum)
             // Always show if not at default range
             if (spectrumMinDb !== -100 || spectrumMaxDb !== -10) {
-                spectrumCtx.fillStyle = 'rgba(255, 255, 0, 0.8)';
-                spectrumCtx.font = 'bold 11px monospace';
-                spectrumCtx.textAlign = 'left';
-                spectrumCtx.fillText(`Range: ${spectrumMinDb.toFixed(0)}-${spectrumMaxDb.toFixed(0)} dBFS`, 5, 15);
-                spectrumCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
-                spectrumCtx.font = '10px monospace';
-                spectrumCtx.fillText('(Scroll: pan, Ctrl+Scroll: zoom, DblClick: reset)', 5, 28);
+                spectrumOffscreenCtx.fillStyle = 'rgba(255, 255, 0, 0.8)';
+                spectrumOffscreenCtx.font = 'bold 11px monospace';
+                spectrumOffscreenCtx.textAlign = 'left';
+                spectrumOffscreenCtx.fillText(`Range: ${spectrumMinDb.toFixed(0)}-${spectrumMaxDb.toFixed(0)} dBFS`, 5, 15);
+                spectrumOffscreenCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+                spectrumOffscreenCtx.font = '10px monospace';
+                spectrumOffscreenCtx.fillText('(Scroll: pan, Ctrl+Scroll: zoom, DblClick: reset)', 5, 28);
+            }
+
+            // Draw peak hold overlay
+            if (peakHoldEnabled && peakHoldData) {
+                spectrumOffscreenCtx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
+                spectrumOffscreenCtx.lineWidth = 1;
+                spectrumOffscreenCtx.beginPath();
+
+                for (let x = 0; x < width; x++) {
+                    const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                    const fftIdx = zoomState.zoomStartBin + Math.floor((x / width) * zoomedBins);
+                    const raw = peakHoldData[fftIdx];
+                    const magDb = rawToDb(raw);
+                    const normalizedMag = Math.max(0, Math.min(1, (magDb - spectrumMinDb) / dbRange));
+                    const y = height - (normalizedMag * height);
+
+                    if (x === 0) {
+                        spectrumOffscreenCtx.moveTo(x, y);
+                    } else {
+                        spectrumOffscreenCtx.lineTo(x, y);
+                    }
+                }
+
+                spectrumOffscreenCtx.stroke();
+
+                // Draw "Peak Hold" label
+                spectrumOffscreenCtx.fillStyle = 'rgba(255, 0, 0, 0.8)';
+                spectrumOffscreenCtx.font = 'bold 10px monospace';
+                spectrumOffscreenCtx.textAlign = 'left';
+                spectrumOffscreenCtx.fillText('PEAK HOLD', 5, height - 5);
             }
 
             // Draw markers on spectrum (from marker_system.js)
             if (typeof drawMarkersOnSpectrum === 'function') {
-                drawMarkersOnSpectrum(spectrumCtx, width, height);
+                drawMarkersOnSpectrum(spectrumOffscreenCtx, width, height);
             }
+
+            // Copy offscreen canvas to visible canvas (double buffering - eliminates flicker)
+            spectrumCtx.drawImage(spectrumOffscreen, 0, 0);
         }
 
         // Toggle spectrum display
@@ -3405,6 +3897,72 @@ const char* html_page = R"HTMLDELIM(
             const divider = document.getElementById('channel-divider');
             divider.style.top = waterfallTop + 'px';
             divider.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+        }
+
+        // Toggle filter selection mode
+        function toggleFilterMode() {
+            filterState.enabled = !filterState.enabled;
+            const button = document.getElementById('filter_mode_toggle');
+            const statusDiv = document.getElementById('filter_status');
+
+            if (filterState.enabled) {
+                button.checked = true;
+                statusDiv.textContent = 'Click and drag on spectrum to select filter region';
+                statusDiv.style.color = '#fa0';
+                if (filterState.isFiltered) {
+                    updateFilterStatus();
+                }
+            } else {
+                button.checked = false;
+                statusDiv.textContent = '';
+                // Clear filter when disabling mode
+                if (filterState.isFiltered) {
+                    filterState.isFiltered = false;
+                    filterState.filterStartBin = 0;
+                    filterState.filterEndBin = FFT_SIZE - 1;
+                    drawSelectionBox(true);
+                }
+            }
+        }
+
+        // Apply filter to selected spectrum region
+        function applyFilter(x1, x2) {
+            // Calculate FFT bin indices for the selected region (respecting current zoom)
+            const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+            const binOffset = Math.floor((x1 / canvas.width) * zoomedBins);
+            const binEnd = Math.floor((x2 / canvas.width) * zoomedBins);
+
+            filterState.filterStartBin = zoomState.zoomStartBin + binOffset;
+            filterState.filterEndBin = zoomState.zoomStartBin + binEnd;
+            filterState.isFiltered = true;
+
+            // Update status display
+            updateFilterStatus();
+
+            // Redraw to show filter overlay
+            drawSelectionBox();
+        }
+
+        // Update filter status text
+        function updateFilterStatus() {
+            const statusDiv = document.getElementById('filter_status');
+            const currentSR = zoomState.fullBandwidth;
+            const currentCF = zoomState.centerFreq;
+            const binWidth = currentSR / FFT_SIZE;
+            const fullStartFreq = currentCF - currentSR / 2;
+
+            const freq1 = fullStartFreq + (filterState.filterStartBin * binWidth);
+            const freq2 = fullStartFreq + ((filterState.filterEndBin + 1) * binWidth);
+            const bw = freq2 - freq1;
+
+            const formatFreq = (f) => {
+                if (f >= 1e9) return (f / 1e9).toFixed(3) + ' GHz';
+                if (f >= 1e6) return (f / 1e6).toFixed(2) + ' MHz';
+                return (f / 1e3).toFixed(1) + ' kHz';
+            };
+
+            statusDiv.textContent = `Filtered: ${formatFreq(bw)} (bins ${filterState.filterStartBin}-${filterState.filterEndBin})`;
+            statusDiv.style.color = '#fa0';
         }
 
         // Draw IQ constellation plot
@@ -3696,6 +4254,31 @@ const char* html_page = R"HTMLDELIM(
 
             const currentSR = zoomState.fullBandwidth || CONFIG.DEFAULT_SAMPLE_RATE;
             await sendControlUpdate(Math.floor(freq * 1e6), currentSR, null, null, null);
+        }
+
+        // Apply frequency from preset dropdown
+        function applyFrequencyPreset() {
+            const presetSelect = getElement('freqPresets');
+            if (!presetSelect || !presetSelect.value) return;
+
+            const freq = parseFloat(presetSelect.value);
+            const freqInput = getElement('freqInput');
+            if (freqInput) {
+                freqInput.value = freq.toFixed(2);
+            }
+
+            // Apply the frequency
+            applyFrequency();
+
+            // Reset dropdown to default selection
+            presetSelect.selectedIndex = 0;
+
+            // Save preset usage to Settings if available
+            if (typeof Settings !== 'undefined') {
+                Settings.set('last_preset_frequency', freq);
+            }
+
+            showNotification(`Tuned to ${freq} MHz`, 'success', 2000);
         }
 
         // Apply sample rate change
@@ -4045,6 +4628,58 @@ const char* html_page = R"HTMLDELIM(
                 option.value = name;
                 option.textContent = name;
                 select.appendChild(option);
+            }
+        }
+
+        // Export ALL application settings
+        function exportAllSettings() {
+            if (typeof Settings !== 'undefined') {
+                Settings.downloadConfig();
+            } else {
+                showNotification('Settings module not loaded', 'error');
+            }
+        }
+
+        // Trigger file input for importing settings
+        function importAllSettings() {
+            document.getElementById('settingsImportFile').click();
+        }
+
+        // Handle imported settings file
+        function handleSettingsImport(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            if (typeof Settings === 'undefined') {
+                showNotification('Settings module not loaded', 'error');
+                event.target.value = '';
+                return;
+            }
+
+            Settings.uploadConfig(event.target).then(settings => {
+                showNotification(`Imported ${Object.keys(settings).length} settings successfully. Reloading...`, 'success', 3000);
+                // Reload page after 3 seconds to apply settings
+                setTimeout(() => window.location.reload(), 3000);
+            }).catch(err => {
+                showNotification('Error importing settings: ' + err.message, 'error');
+            });
+
+            // Reset the file input
+            event.target.value = '';
+        }
+
+        // Reset ALL settings to defaults
+        function resetAllSettings() {
+            if (!confirm('Are you sure you want to reset ALL settings to defaults? This cannot be undone.')) {
+                return;
+            }
+
+            if (typeof Settings !== 'undefined') {
+                Settings.clear();
+                showNotification('Settings reset to defaults. Reloading...', 'success', 2000);
+                setTimeout(() => window.location.reload(), 2000);
+            } else {
+                showNotification('Settings module not loaded', 'error');
             }
         }
 
@@ -4493,6 +5128,43 @@ const char* html_page = R"HTMLDELIM(
         let lastUpdateTime = 0;
         let isUpdating = false;
 
+        // Intelligent throttling with adaptive performance monitoring
+        const performanceMonitor = {
+            frameTimes: [],
+            maxSamples: 30,
+            targetFPS: 30,
+            minInterval: 100,  // 10 Hz minimum
+            currentInterval: 100,
+            consecutiveSlowFrames: 0,
+
+            recordFrame(duration) {
+                this.frameTimes.push(duration);
+                if (this.frameTimes.length > this.maxSamples) {
+                    this.frameTimes.shift();
+                }
+
+                // Calculate average frame time
+                const avgFrameTime = this.frameTimes.reduce((a, b) => a + b, 0) / this.frameTimes.length;
+
+                // If frames are taking too long, reduce update rate
+                if (avgFrameTime > 50) {  // Slower than 20 FPS
+                    this.consecutiveSlowFrames++;
+                    if (this.consecutiveSlowFrames > 5) {
+                        this.currentInterval = Math.min(this.currentInterval * 1.1, 200);  // Max 5 Hz
+                        this.consecutiveSlowFrames = 0;
+                    }
+                } else if (avgFrameTime < 25) {  // Faster than 40 FPS
+                    // Can handle faster updates
+                    this.currentInterval = Math.max(this.currentInterval * 0.95, this.minInterval);
+                    this.consecutiveSlowFrames = 0;
+                }
+            },
+
+            getInterval() {
+                return Math.floor(this.currentInterval);
+            }
+        };
+
         // Throttling flags to prevent overlapping requests
         let isUpdatingStatus = false;
         let isUpdatingIQ = false;
@@ -4500,9 +5172,11 @@ const char* html_page = R"HTMLDELIM(
         let isUpdatingLinkQuality = false;
 
         function updateLoop(timestamp) {
+            // Adaptive throttling based on performance
+            const updateInterval = performanceMonitor.getInterval();
+
             // Only start new fetch if previous one finished
-            // Throttle to 100ms (10 Hz) to match server update rate
-            if (!isUpdating && timestamp - lastUpdateTime >= 100) {
+            if (!isUpdating && timestamp - lastUpdateTime >= updateInterval) {
                 isUpdating = true;
                 lastUpdateTime = timestamp;
                 updateWaterfall();
@@ -4653,34 +5327,62 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
-        // Canvas mouse handlers for zoom selection
+        // Canvas mouse handlers for zoom and filter selection
         canvas.addEventListener('mousedown', (e) => {
             if (e.button === 0) {  // Left click
-                zoomState.isSelecting = true;
-                zoomState.startX = e.offsetX;
-                zoomState.currentX = e.offsetX;
+                if (filterState.enabled) {
+                    // Filter selection mode
+                    filterState.isSelecting = true;
+                    filterState.startX = e.offsetX;
+                    filterState.currentX = e.offsetX;
+                } else {
+                    // Zoom selection mode
+                    zoomState.isSelecting = true;
+                    zoomState.startX = e.offsetX;
+                    zoomState.currentX = e.offsetX;
+                }
             }
         });
 
         canvas.addEventListener('mousemove', (e) => {
-            if (zoomState.isSelecting) {
+            if (filterState.enabled && filterState.isSelecting) {
+                filterState.currentX = e.offsetX;
+                drawSelectionBox();
+            } else if (zoomState.isSelecting) {
                 zoomState.currentX = e.offsetX;
                 drawSelectionBox();
             }
         });
 
         canvas.addEventListener('mouseup', (e) => {
-            if (e.button === 0 && zoomState.isSelecting) {
-                zoomState.isSelecting = false;
-                const x1 = Math.min(zoomState.startX, zoomState.currentX);
-                const x2 = Math.max(zoomState.startX, zoomState.currentX);
+            if (e.button === 0) {
+                if (filterState.enabled && filterState.isSelecting) {
+                    // Complete filter selection
+                    filterState.isSelecting = false;
+                    const x1 = Math.min(filterState.startX, filterState.currentX);
+                    const x2 = Math.max(filterState.startX, filterState.currentX);
 
-                // Only zoom if selection is at least 20 pixels wide
-                if (x2 - x1 > 20) {
-                    applyZoom(x1, x2);
+                    // Apply filter if selection is wide enough
+                    if (x2 - x1 > 10) {
+                        applyFilter(x1, x2);
+                    }
+
+                    // Clear selection box
+                    drawSelectionBox(true);
+                } else if (zoomState.isSelecting) {
+                    // Complete zoom selection
+                    zoomState.isSelecting = false;
+                    const x1 = Math.min(zoomState.startX, zoomState.currentX);
+                    const x2 = Math.max(zoomState.startX, zoomState.currentX);
+
+                    // Zoom if selection is wide enough
+                    if (x2 - x1 > 20) {
+                        applyZoom(x1, x2);
+                    }
+
+                    // Clear selection box
+                    drawSelectionBox(true);
                 }
-                // Clear selection box
-                drawSelectionBox(true);
             }
         });
 
@@ -4688,6 +5390,43 @@ const char* html_page = R"HTMLDELIM(
             e.preventDefault();
             zoomOut();
             return false;
+        });
+
+        // Double-click to tune to frequency
+        canvas.addEventListener('dblclick', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const canvasWidth = canvas.width;
+
+            // Get current frequency and sample rate from display elements
+            const freqElem = document.getElementById('freq');
+            const srElem = document.getElementById('sr');
+
+            if (!freqElem || !srElem) {
+                console.warn('Frequency/samplerate elements not found');
+                return;
+            }
+
+            const centerFreq = parseFloat(freqElem.textContent) || 915;
+            const sampleRate = parseFloat(srElem.textContent) || 40;
+
+            // Take zoom into account
+            const zoomedRange = sampleRate * (zoomState.zoomEndBin - zoomState.zoomStartBin) / FFT_SIZE;
+            const zoomedStart = centerFreq - sampleRate / 2 + (zoomState.zoomStartBin / FFT_SIZE) * sampleRate;
+
+            const clickedFreq = zoomedStart + (x / canvasWidth) * zoomedRange;
+
+            // Update frequency input element
+            const freqInput = document.getElementById('freqInput');
+            if (freqInput) {
+                freqInput.value = clickedFreq.toFixed(3);
+                updateConfig();
+            }
+
+            // Show notification
+            if (typeof showNotification === 'function') {
+                showNotification(`Tuned to ${clickedFreq.toFixed(3)} MHz`, 'success', 2000);
+            }
         });
 
         // Draw selection box overlay
@@ -4710,17 +5449,37 @@ const char* html_page = R"HTMLDELIM(
             const octx = overlayCanvas.getContext('2d');
             octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
-            if (!clear && zoomState.isSelecting) {
-                const x1 = Math.min(zoomState.startX, zoomState.currentX);
-                const x2 = Math.max(zoomState.startX, zoomState.currentX);
+            // Draw filter selection overlay (if active and not cleared)
+            if (!clear && filterState.isFiltered) {
+                const x1 = Math.floor((filterState.filterStartBin - zoomState.zoomStartBin) * canvas.width / (zoomState.zoomEndBin - zoomState.zoomStartBin + 1));
+                const x2 = Math.floor((filterState.filterEndBin - zoomState.zoomStartBin) * canvas.width / (zoomState.zoomEndBin - zoomState.zoomStartBin + 1));
+                octx.fillStyle = 'rgba(255, 165, 0, 0.15)';
+                octx.fillRect(x1, 0, x2 - x1, canvas.height);
+                octx.strokeStyle = '#fa0';
+                octx.lineWidth = 2;
+                octx.setLineDash([5, 5]);
+                octx.strokeRect(x1, 0, x2 - x1, canvas.height);
+                octx.setLineDash([]);
+            }
+
+            if (!clear && (zoomState.isSelecting || filterState.isSelecting)) {
+                const isFilter = filterState.isSelecting;
+                const state = isFilter ? filterState : zoomState;
+                const x1 = Math.min(state.startX, state.currentX);
+                const x2 = Math.max(state.startX, state.currentX);
                 const width = x2 - x1;
 
+                // Selection box colors
+                const fillColor = isFilter ? 'rgba(255, 165, 0, 0.2)' : 'rgba(0, 255, 255, 0.1)';
+                const borderColor = isFilter ? '#fa0' : '#0ff';
+                const label = isFilter ? 'Filter' : 'Zoom';
+
                 // Semi-transparent selection box
-                octx.fillStyle = 'rgba(0, 255, 255, 0.1)';
+                octx.fillStyle = fillColor;
                 octx.fillRect(x1, 0, width, canvas.height);
 
                 // Border
-                octx.strokeStyle = '#0ff';
+                octx.strokeStyle = borderColor;
                 octx.lineWidth = 2;
                 octx.strokeRect(x1, 0, width, canvas.height);
 
@@ -4739,9 +5498,9 @@ const char* html_page = R"HTMLDELIM(
                 const freq2 = displayedStartFreq + (x2 / canvas.width) * displayedBandwidth;
                 const bw = freq2 - freq1;
 
-                octx.fillStyle = '#0ff';
+                octx.fillStyle = borderColor;
                 octx.font = '12px monospace';
-                octx.fillText(`BW: ${(bw / 1e6).toFixed(2)} MHz`, x1 + 5, 20);
+                octx.fillText(`${label} BW: ${(bw / 1e6).toFixed(2)} MHz`, x1 + 5, 20);
             }
         }
 
@@ -5711,12 +6470,12 @@ const char* html_page = R"HTMLDELIM(
         }
 
         // Main demodulation processing loop
-        function processDemodulation() {
+        async function processDemodulation() {
             if (!demodState.active) return;
 
-            fetch('/iq_data?t=' + Date.now())
-                .then(response => response.arrayBuffer())
-                .then(buffer => {
+            try {
+                const response = await fetchWithTimeout('/iq_data?t=' + Date.now());
+                const buffer = await response.arrayBuffer();
                     const int16View = new Int16Array(buffer);
                     const samplesPerChannel = int16View.length / 4;
 
@@ -5771,16 +6530,15 @@ const char* html_page = R"HTMLDELIM(
                             break;
                     }
 
-                    // Update statistics
-                    updateDemodStats();
+                // Update statistics
+                updateDemodStats();
 
-                    // Schedule next processing
-                    setTimeout(processDemodulation, 50);  // 20 Hz update rate
-                })
-                .catch(err => {
-                    console.error('Demodulation error:', err);
-                    setTimeout(processDemodulation, 100);
-                });
+                // Schedule next processing
+                setTimeout(processDemodulation, 50);  // 20 Hz update rate
+            } catch (err) {
+                console.error('Demodulation error:', err);
+                setTimeout(processDemodulation, 100);
+            }
         }
 
         // Display decoded protocol data
@@ -6812,7 +7570,7 @@ const char* html_page = R"HTMLDELIM(
             stopTimeout: null
         };
 
-        function startRecording() {
+        async function startRecording() {
             if (recorder.recording) return;
 
             const format = document.getElementById('record_format').value;
@@ -6825,23 +7583,25 @@ const char* html_page = R"HTMLDELIM(
             recorder.filename = `bladerf_${freq}MHz_${timestamp}.bin`;
 
             // Call backend to start recording
-            fetch('/start_recording', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    filename: recorder.filename
-                })
-            })
-            .then(response => response.json())
-            .then(data => {
+            try {
+                const response = await fetchWithTimeout('/start_recording', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        filename: recorder.filename
+                    })
+                });
+                const data = await response.json();
+
                 if (data.status === 'ok') {
                     recorder.recording = true;
                     recorder.startTime = Date.now();
                     recorder.duration = duration;
 
-                    document.getElementById('record_state').textContent = 'Recording...';
-                    document.getElementById('record_state').style.color = '#f00';
-                    document.getElementById('record_filename').textContent = recorder.filename;
+                    setElementText('record_state', 'Recording...');
+                    const stateElem = getElement('record_state');
+                    if (stateElem) stateElem.style.color = '#f00';
+                    setElementText('record_filename', recorder.filename);
 
                     console.log('Recording started:', recorder.filename);
 
@@ -6855,14 +7615,13 @@ const char* html_page = R"HTMLDELIM(
                 } else {
                     showNotification(`Failed to start recording: ${data.error || 'Unknown error'}`, 'error');
                 }
-            })
-            .catch(err => {
+            } catch (err) {
                 console.error('Recording start error:', err);
                 showNotification('Failed to start recording', 'error');
-            });
+            }
         }
 
-        function stopRecording() {
+        async function stopRecording() {
             if (!recorder.recording) return;
 
             // Clear timers
@@ -6876,60 +7635,62 @@ const char* html_page = R"HTMLDELIM(
             }
 
             // Call backend to stop recording
-            fetch('/stop_recording', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'}
-            })
-            .then(response => response.json())
-            .then(data => {
+            try {
+                const response = await fetchWithTimeout('/stop_recording', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'}
+                });
+                const data = await response.json();
                 recorder.recording = false;
-                document.getElementById('record_state').textContent = 'Stopped';
-                document.getElementById('record_state').style.color = '#888';
+                setElementText('record_state', 'Stopped');
+                const stateElem = getElement('record_state');
+                if (stateElem) stateElem.style.color = '#888';
 
                 console.log('Recording stopped:', recorder.filename);
 
                 // Add to recordings list
-                const list = document.getElementById('recordings_list');
-                if (list.innerHTML.includes('No recordings')) {
-                    list.innerHTML = '';
+                const list = getElement('recordings_list');
+                if (list) {
+                    if (list.innerHTML.includes('No recordings')) {
+                        list.innerHTML = '';
+                    }
+                    const entry = document.createElement('div');
+                    entry.style.cssText = 'padding: 5px; border-bottom: 1px solid #222; cursor: pointer;';
+                    entry.innerHTML = `
+                        <div style="color: #0ff;">${recorder.filename}</div>
+                        <div style="color: #888; font-size: 8px;">${recorder.samples.toLocaleString()} samples, ${((recorder.samples * 4) / 1024 / 1024).toFixed(2)} MB</div>
+                    `;
+                    list.insertBefore(entry, list.firstChild);
                 }
-                const entry = document.createElement('div');
-                entry.style.cssText = 'padding: 5px; border-bottom: 1px solid #222; cursor: pointer;';
-                entry.innerHTML = `
-                    <div style="color: #0ff;">${recorder.filename}</div>
-                    <div style="color: #888; font-size: 8px;">${recorder.samples.toLocaleString()} samples, ${((recorder.samples * 4) / 1024 / 1024).toFixed(2)} MB</div>
-                `;
-                list.insertBefore(entry, list.firstChild);
-            })
-            .catch(err => {
+            } catch (err) {
                 console.error('Recording stop error:', err);
                 recorder.recording = false;
-            });
+            }
         }
 
-        function updateRecordingStatus() {
+        async function updateRecordingStatus() {
             if (!recorder.recording) return;
 
-            fetch('/recording_status')
-            .then(response => response.json())
-            .then(data => {
+            try {
+                const response = await fetchWithTimeout('/recording_status');
+                const data = await response.json();
+
                 if (data.recording) {
                     recorder.samples = data.samples;
                     const sizeBytes = data.samples * 4; // 2 channels * 2 bytes per sample
                     const sizeMB = sizeBytes / 1024 / 1024;
 
-                    document.getElementById('record_samples').textContent = data.samples.toLocaleString();
-                    document.getElementById('record_size').textContent = sizeMB.toFixed(2) + ' MB';
+                    setElementText('record_samples', data.samples.toLocaleString());
+                    setElementText('record_size', sizeMB.toFixed(2) + ' MB');
                 } else {
                     // Recording stopped unexpectedly
                     if (recorder.recording) {
                         stopRecording();
                     }
                 }
-            })
-            .catch(err => {
+            } catch (err) {
                 console.error('Status poll error:', err);
-            });
+            }
         }
 
         // ===== DIRECTION FINDING (DoA) =====
@@ -7009,70 +7770,71 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
-        function updateDoA() {
-            // Fetch IQ data from both channels and calculate phase difference
-            fetch('/iq_data?t=' + Date.now())
-                .then(response => response.arrayBuffer())
-                .then(buffer => {
-                    const view = new DataView(buffer);
-                    const samplesPerChannel = 256;
+        async function updateDoA() {
+            try {
+                // Fetch IQ data from both channels and calculate phase difference
+                const response = await fetchWithTimeout('/iq_data?t=' + Date.now());
+                const buffer = await response.arrayBuffer();
+                const view = new DataView(buffer);
+                const samplesPerChannel = 256;
 
-                    // Extract CH1 and CH2 I/Q
-                    let ch1_i = [], ch1_q = [], ch2_i = [], ch2_q = [];
-                    let offset = 0;
+                // Extract CH1 and CH2 I/Q
+                let ch1_i = [], ch1_q = [], ch2_i = [], ch2_q = [];
+                let offset = 0;
 
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch1_i.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch1_q.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch2_i.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        ch2_q.push(view.getInt16(offset, true));
-                        offset += 2;
-                    }
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch1_i.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch1_q.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch2_i.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    ch2_q.push(view.getInt16(offset, true));
+                    offset += 2;
+                }
 
-                    // Calculate average phase difference
-                    let phaseDiffSum = 0;
-                    let count = 0;
+                // Calculate average phase difference
+                let phaseDiffSum = 0;
+                let count = 0;
 
-                    for (let i = 0; i < samplesPerChannel; i++) {
-                        const phase1 = Math.atan2(ch1_q[i], ch1_i[i]);
-                        const phase2 = Math.atan2(ch2_q[i], ch2_i[i]);
-                        let diff = phase2 - phase1;
+                for (let i = 0; i < samplesPerChannel; i++) {
+                    const phase1 = Math.atan2(ch1_q[i], ch1_i[i]);
+                    const phase2 = Math.atan2(ch2_q[i], ch2_i[i]);
+                    let diff = phase2 - phase1;
 
-                        // Wrap to [-π, π]
-                        while (diff > Math.PI) diff -= 2 * Math.PI;
-                        while (diff < -Math.PI) diff += 2 * Math.PI;
+                    // Wrap to [-π, π]
+                    while (diff > Math.PI) diff -= 2 * Math.PI;
+                    while (diff < -Math.PI) diff += 2 * Math.PI;
 
-                        phaseDiffSum += diff;
-                        count++;
-                    }
+                    phaseDiffSum += diff;
+                    count++;
+                }
 
-                    const avgPhaseDiff = phaseDiffSum / count;
-                    const phaseDiffDeg = avgPhaseDiff * 180 / Math.PI;
+                const avgPhaseDiff = phaseDiffSum / count;
+                const phaseDiffDeg = avgPhaseDiff * 180 / Math.PI;
 
-                    // Calculate azimuth from phase difference
-                    const spacing = parseFloat(document.getElementById('doa_spacing').value);
-                    const wavelength = 1.0; // Normalized
-                    const azimuth = Math.asin(avgPhaseDiff / (2 * Math.PI * spacing)) * 180 / Math.PI;
+                // Calculate azimuth from phase difference
+                const spacing = parseFloat(document.getElementById('doa_spacing').value);
+                const wavelength = 1.0; // Normalized
+                const azimuth = Math.asin(avgPhaseDiff / (2 * Math.PI * spacing)) * 180 / Math.PI;
 
-                    // Update display
-                    document.getElementById('doa_azimuth').textContent = azimuth.toFixed(1) + '°';
-                    document.getElementById('doa_phase').textContent = phaseDiffDeg.toFixed(1) + '°';
-                    document.getElementById('doa_confidence').textContent = '75%';
-                    document.getElementById('doa_coherence').textContent = '0.85';
+                // Update display
+                document.getElementById('doa_azimuth').textContent = azimuth.toFixed(1) + '°';
+                document.getElementById('doa_phase').textContent = phaseDiffDeg.toFixed(1) + '°';
+                document.getElementById('doa_confidence').textContent = '75%';
+                document.getElementById('doa_coherence').textContent = '0.85';
 
-                    // Draw polar display
-                    drawDoAPolar(azimuth);
-                })
-                .catch(err => console.error('DoA update failed:', err));
+                // Draw polar display
+                drawDoAPolar(azimuth);
+            } catch (err) {
+                console.error('DoA update failed:', err);
+            }
         }
 
         function calibrateDoA() {
@@ -7103,6 +7865,8 @@ const char* html_page = R"HTMLDELIM(
 
             verticalOffset: 0,  // Vertical pan offset in dB
             running: false,
+            frozen: false,  // Freeze display updates
+            frozenData: null,  // Store frozen display state
             updateInterval: null,
             history: [],
             maxHistory: 200,
@@ -7582,6 +8346,37 @@ const char* html_page = R"HTMLDELIM(
             drawDoAPolarMain();
         }
 
+        // Bearing history for trail display
+        const bearingHistory = {
+            bearings: [],
+            maxLength: 20,
+            enabled: true
+        };
+
+        // Confidence alert state
+        const confidenceAlert = {
+            enabled: true,
+            threshold: 50,
+            consecutiveLowCount: 0,
+            lastAlertTime: 0,
+            alertCooldown: 10000  // 10 seconds between alerts
+        };
+
+        function addBearingToHistory(azimuth, confidence) {
+            if (!bearingHistory.enabled) return;
+
+            bearingHistory.bearings.push({
+                azimuth: azimuth,
+                confidence: confidence,
+                timestamp: Date.now()
+            });
+
+            // Keep only last N bearings
+            if (bearingHistory.bearings.length > bearingHistory.maxLength) {
+                bearingHistory.bearings.shift();
+            }
+        }
+
         function drawDoAPolarMain(azimuth = null, backAzimuth = null, sources = []) {
             if (!directionFinding.polarCtx) return;
 
@@ -7601,13 +8396,37 @@ const char* html_page = R"HTMLDELIM(
             ctx.strokeStyle = '#333';
             ctx.lineWidth = 1;
 
-            // Circles with labels
+            // Circles with confidence zone colors
             for (let i = 1; i <= 4; i++) {
                 const r = (radius / 4) * i;
+
+                // Color code the zones based on typical confidence ranges
+                // Outer ring (75-100%) = Green, Mid (50-75%) = Yellow, Inner (<50%) = Red
+                if (i === 4) {
+                    ctx.strokeStyle = 'rgba(0, 255, 0, 0.3)'; // Green - high confidence
+                    ctx.fillStyle = 'rgba(0, 255, 0, 0.05)';
+                } else if (i === 3) {
+                    ctx.strokeStyle = 'rgba(255, 255, 0, 0.3)'; // Yellow - medium confidence
+                    ctx.fillStyle = 'rgba(255, 255, 0, 0.05)';
+                } else {
+                    ctx.strokeStyle = 'rgba(255, 100, 0, 0.3)'; // Orange/Red - low confidence
+                    ctx.fillStyle = 'rgba(255, 100, 0, 0.05)';
+                }
+
+                ctx.lineWidth = 1.5;
                 ctx.beginPath();
                 ctx.arc(centerX, centerY, r, 0, 2 * Math.PI);
+                ctx.fill();
                 ctx.stroke();
             }
+
+            // Add confidence zone labels
+            ctx.fillStyle = '#888';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('Low Conf', width - 5, centerY - radius * 0.25);
+            ctx.fillText('Med Conf', width - 5, centerY - radius * 0.625);
+            ctx.fillText('High Conf', width - 5, centerY - radius * 0.875);
 
             // Radial lines with angle labels
             ctx.font = '10px monospace';
@@ -7631,6 +8450,43 @@ const char* html_page = R"HTMLDELIM(
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
                 ctx.fillText(angle + '°', lx, ly);
+            }
+
+            // Draw bearing history trail
+            if (bearingHistory.enabled && bearingHistory.bearings.length > 1) {
+                for (let i = 0; i < bearingHistory.bearings.length; i++) {
+                    const bearing = bearingHistory.bearings[i];
+                    const rad = bearing.azimuth * Math.PI / 180;
+
+                    // Fade older bearings
+                    const alpha = (i + 1) / bearingHistory.bearings.length;
+                    const opacity = alpha * 0.5; // Max 50% opacity
+
+                    // Draw small marker
+                    const markerDist = radius * 0.7;
+                    const mx = centerX + markerDist * Math.cos(rad - Math.PI / 2);
+                    const my = centerY + markerDist * Math.sin(rad - Math.PI / 2);
+
+                    ctx.fillStyle = `rgba(0, 255, 255, ${opacity})`;
+                    ctx.beginPath();
+                    ctx.arc(mx, my, 2 + (alpha * 2), 0, 2 * Math.PI);
+                    ctx.fill();
+
+                    // Connect with lines
+                    if (i > 0) {
+                        const prevBearing = bearingHistory.bearings[i - 1];
+                        const prevRad = prevBearing.azimuth * Math.PI / 180;
+                        const prevX = centerX + markerDist * Math.cos(prevRad - Math.PI / 2);
+                        const prevY = centerY + markerDist * Math.sin(prevRad - Math.PI / 2);
+
+                        ctx.strokeStyle = `rgba(0, 255, 255, ${opacity * 0.3})`;
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.moveTo(prevX, prevY);
+                        ctx.lineTo(mx, my);
+                        ctx.stroke();
+                    }
+                }
             }
 
             // Draw BACK azimuth indicator (180° ambiguity) - dotted/dim
@@ -7810,6 +8666,250 @@ const char* html_page = R"HTMLDELIM(
             console.log('Direction finding stopped');
         }
 
+        function toggleDoAFreeze() {
+            directionFinding.frozen = !directionFinding.frozen;
+
+            const btn = document.getElementById('doa_freeze_btn');
+            if (!btn) return;
+
+            if (directionFinding.frozen) {
+                // Freeze mode - change button appearance
+                btn.style.background = '#046';
+                btn.style.borderColor = '#0af';
+                btn.innerHTML = '▶ Resume';
+
+                // Show notification
+                showNotification('Direction finding display frozen', 'info', 2000);
+
+                // Store current display state
+                console.log('Direction finding frozen');
+            } else {
+                // Resume mode - restore button appearance
+                btn.style.background = '#1a1a1a';
+                btn.style.borderColor = '#666';
+                btn.innerHTML = '❄ Freeze';
+
+                // Clear frozen data
+                directionFinding.frozenData = null;
+
+                showNotification('Direction finding resumed', 'success', 2000);
+                console.log('Direction finding resumed');
+            }
+
+            // Save freeze state
+            if (typeof Settings !== 'undefined') {
+                Settings.set('direction_frozen', directionFinding.frozen);
+            }
+        }
+
+        function showBearingExportDialog() {
+            if (!directionFinding.history || directionFinding.history.length === 0) {
+                showNotification('No bearing history to export. Run direction finding first.', 'warning', 3000);
+                return;
+            }
+
+            const options = `
+                <div style="padding: 20px;">
+                    <h3 style="margin: 0 0 15px 0; color: #0ff;">Export Bearing Data</h3>
+                    <p style="margin-bottom: 15px; color: #888;">
+                        ${directionFinding.history.length} bearing measurements ready to export
+                    </p>
+                    <div style="display: flex; flex-direction: column; gap: 10px;">
+                        <button onclick="exportBearingCSV(); closeDialog();" style="padding: 12px; background: #046; border: none; color: #fff; cursor: pointer; border-radius: 4px; font-size: 14px;">
+                            📊 Export as CSV (Spreadsheet)
+                        </button>
+                        <button onclick="exportBearingJSON(); closeDialog();" style="padding: 12px; background: #046; border: none; color: #fff; cursor: pointer; border-radius: 4px; font-size: 14px;">
+                            📄 Export as JSON
+                        </button>
+                        <button onclick="exportBearingKML(); closeDialog();" style="padding: 12px; background: #046; border: none; color: #fff; cursor: pointer; border-radius: 4px; font-size: 14px;">
+                            🌍 Export as KML (Google Earth)
+                        </button>
+                        <button onclick="closeDialog();" style="padding: 10px; background: #222; border: 1px solid #666; color: #ccc; cursor: pointer; border-radius: 4px; font-size: 13px; margin-top: 10px;">
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            `;
+
+            showDialog(options);
+        }
+
+        function exportBearingCSV() {
+            if (!directionFinding.history || directionFinding.history.length === 0) {
+                showNotification('No data to export', 'warning');
+                return;
+            }
+
+            // Build CSV content
+            let csv = 'Timestamp,Azimuth,Back Azimuth,Has Ambiguity,Confidence (%),Frequency (MHz),Bandwidth (Hz),SNR (dB),Phase Diff (deg),Phase Std (deg),Coherence\n';
+
+            directionFinding.history.forEach(item => {
+                const timestamp = new Date(item.timestamp).toISOString();
+                const freqMHz = (item.frequency / 1e6).toFixed(6);
+                const bwHz = item.bandwidth.toFixed(0);
+
+                csv += `${timestamp},${item.azimuth.toFixed(2)},${item.backAzimuth.toFixed(2)},${item.hasAmbiguity},${item.confidence.toFixed(1)},${freqMHz},${bwHz},${item.snr.toFixed(2)},${item.phaseDiff.toFixed(2)},${item.phaseStd.toFixed(3)},${item.coherence.toFixed(3)}\n`;
+            });
+
+            // Download CSV file
+            if (typeof Utils !== 'undefined' && Utils.downloadFile) {
+                const filename = `bearing_data_${new Date().toISOString().split('T')[0]}.csv`;
+                Utils.downloadFile(csv, filename, 'text/csv');
+                showNotification(`Exported ${directionFinding.history.length} bearings to ${filename}`, 'success', 3000);
+            } else {
+                console.error('Utils.downloadFile not available');
+            }
+        }
+
+        function exportBearingJSON() {
+            if (!directionFinding.history || directionFinding.history.length === 0) {
+                showNotification('No data to export', 'warning');
+                return;
+            }
+
+            const data = {
+                exportTime: new Date().toISOString(),
+                sensorLocation: {
+                    latitude: parseFloat(document.getElementById('sensor_lat')?.value || 0),
+                    longitude: parseFloat(document.getElementById('sensor_lon')?.value || 0),
+                    altitude: parseFloat(document.getElementById('sensor_alt')?.value || 0)
+                },
+                bearings: directionFinding.history.map(item => ({
+                    timestamp: new Date(item.timestamp).toISOString(),
+                    azimuth: item.azimuth,
+                    backAzimuth: item.backAzimuth,
+                    hasAmbiguity: item.hasAmbiguity,
+                    confidence: item.confidence,
+                    frequencyMHz: item.frequency / 1e6,
+                    bandwidthHz: item.bandwidth,
+                    snr: item.snr,
+                    phaseDiff: item.phaseDiff,
+                    phaseStd: item.phaseStd,
+                    coherence: item.coherence
+                }))
+            };
+
+            const json = JSON.stringify(data, null, 2);
+            const filename = `bearing_data_${new Date().toISOString().split('T')[0]}.json`;
+
+            if (typeof Utils !== 'undefined' && Utils.downloadFile) {
+                Utils.downloadFile(json, filename, 'application/json');
+                showNotification(`Exported ${directionFinding.history.length} bearings to ${filename}`, 'success', 3000);
+            }
+        }
+
+        function exportBearingKML() {
+            if (!directionFinding.history || directionFinding.history.length === 0) {
+                showNotification('No data to export', 'warning');
+                return;
+            }
+
+            // Get sensor location from settings
+            const sensorLat = parseFloat(document.getElementById('sensor_lat')?.value || 37.7749);
+            const sensorLon = parseFloat(document.getElementById('sensor_lon')?.value || -122.4194);
+            const sensorAlt = parseFloat(document.getElementById('sensor_alt')?.value || 10);
+
+            // Build KML content
+            let kml = '<?xml version="1.0" encoding="UTF-8"?>\n';
+            kml += '<kml xmlns="http://www.opengis.net/kml/2.2">\n';
+            kml += '<Document>\n';
+            kml += '  <name>BladeRF Direction Finding Data</name>\n';
+            kml += '  <description>Bearing measurements exported from BladeRF Sensor</description>\n\n';
+
+            // Add sensor location
+            kml += '  <Placemark>\n';
+            kml += '    <name>Sensor Location</name>\n';
+            kml += '    <description>BladeRF Antenna Array</description>\n';
+            kml += '    <Point>\n';
+            kml += `      <coordinates>${sensorLon},${sensorLat},${sensorAlt}</coordinates>\n`;
+            kml += '    </Point>\n';
+            kml += '  </Placemark>\n\n';
+
+            // Add bearing lines (draw lines from sensor in detected directions)
+            directionFinding.history.forEach((item, index) => {
+                const timestamp = new Date(item.timestamp).toISOString();
+                const freqMHz = (item.frequency / 1e6).toFixed(3);
+
+                // Calculate endpoint 10km away in bearing direction
+                const bearingRad = item.azimuth * Math.PI / 180;
+                const distance = 10; // 10 km
+                const R = 6371; // Earth radius in km
+
+                const lat1 = sensorLat * Math.PI / 180;
+                const lon1 = sensorLon * Math.PI / 180;
+
+                const lat2 = Math.asin(Math.sin(lat1) * Math.cos(distance / R) +
+                                      Math.cos(lat1) * Math.sin(distance / R) * Math.cos(bearingRad));
+                const lon2 = lon1 + Math.atan2(Math.sin(bearingRad) * Math.sin(distance / R) * Math.cos(lat1),
+                                              Math.cos(distance / R) - Math.sin(lat1) * Math.sin(lat2));
+
+                const endLat = lat2 * 180 / Math.PI;
+                const endLon = lon2 * 180 / Math.PI;
+
+                // Color code by confidence
+                let color = 'ff00ff00'; // Green (AABBGGRR format)
+                if (item.confidence < 70) color = 'ff00ffff'; // Yellow
+                if (item.confidence < 40) color = 'ff0088ff'; // Orange
+
+                kml += '  <Placemark>\n';
+                kml += `    <name>Bearing ${index + 1}: ${item.azimuth.toFixed(1)}°</name>\n`;
+                kml += `    <description>Time: ${timestamp}\\nFrequency: ${freqMHz} MHz\\nConfidence: ${item.confidence.toFixed(0)}%\\nSNR: ${item.snr.toFixed(1)} dB</description>\n`;
+                kml += '    <Style>\n';
+                kml += '      <LineStyle>\n';
+                kml += `        <color>${color}</color>\n`;
+                kml += '        <width>2</width>\n';
+                kml += '      </LineStyle>\n';
+                kml += '    </Style>\n';
+                kml += '    <LineString>\n';
+                kml += '      <coordinates>\n';
+                kml += `        ${sensorLon},${sensorLat},${sensorAlt}\n`;
+                kml += `        ${endLon},${endLat},${sensorAlt}\n`;
+                kml += '      </coordinates>\n';
+                kml += '    </LineString>\n';
+                kml += '  </Placemark>\n\n';
+
+                // Add back azimuth if ambiguity exists
+                if (item.hasAmbiguity) {
+                    const backBearingRad = item.backAzimuth * Math.PI / 180;
+                    const backLat2 = Math.asin(Math.sin(lat1) * Math.cos(distance / R) +
+                                              Math.cos(lat1) * Math.sin(distance / R) * Math.cos(backBearingRad));
+                    const backLon2 = lon1 + Math.atan2(Math.sin(backBearingRad) * Math.sin(distance / R) * Math.cos(lat1),
+                                                      Math.cos(distance / R) - Math.sin(lat1) * Math.sin(backLat2));
+
+                    const backEndLat = backLat2 * 180 / Math.PI;
+                    const backEndLon = backLon2 * 180 / Math.PI;
+
+                    kml += '  <Placemark>\n';
+                    kml += `    <name>Bearing ${index + 1} (Back): ${item.backAzimuth.toFixed(1)}°</name>\n`;
+                    kml += `    <description>Ambiguous bearing (180° from primary)\\nTime: ${timestamp}\\nFrequency: ${freqMHz} MHz</description>\n`;
+                    kml += '    <Style>\n';
+                    kml += '      <LineStyle>\n';
+                    kml += `        <color>88${color.substring(2)}</color>\n`; // Semi-transparent
+                    kml += '        <width>1</width>\n';
+                    kml += '      </LineStyle>\n';
+                    kml += '    </Style>\n';
+                    kml += '    <LineString>\n';
+                    kml += '      <coordinates>\n';
+                    kml += `        ${sensorLon},${sensorLat},${sensorAlt}\n`;
+                    kml += `        ${backEndLon},${backEndLat},${sensorAlt}\n`;
+                    kml += '      </coordinates>\n';
+                    kml += '    </LineString>\n';
+                    kml += '  </Placemark>\n\n';
+                }
+            });
+
+            kml += '</Document>\n';
+            kml += '</kml>\n';
+
+            // Download KML file
+            const filename = `bearing_data_${new Date().toISOString().split('T')[0]}.kml`;
+
+            if (typeof Utils !== 'undefined' && Utils.downloadFile) {
+                Utils.downloadFile(kml, filename, 'application/vnd.google-earth.kml+xml');
+                showNotification(`Exported ${directionFinding.history.length} bearings to ${filename}`, 'success', 3000);
+            }
+        }
+
         /**
          * Validate DoA result data
          * @param {object} result - DoA result from backend
@@ -7859,6 +8959,11 @@ const char* html_page = R"HTMLDELIM(
         }
 
         async function performDoAUpdate() {
+            // Skip update if frozen
+            if (directionFinding.frozen) {
+                return;
+            }
+
             try {
                 // Fetch DoA result calculated by backend (C++ phase-based interferometry)
                 const response = await fetchWithTimeout('/doa_result?t=' + Date.now());
@@ -7979,6 +9084,39 @@ const char* html_page = R"HTMLDELIM(
             }
 
             setElementText('doa_samples', String(directionFinding.history.length));
+
+            // Add to bearing history
+            if (typeof addBearingToHistory === 'function') {
+                addBearingToHistory(result.azimuth, result.confidence);
+            }
+
+            // Check confidence and trigger alert if needed
+            if (confidenceAlert.enabled) {
+                const now = Date.now();
+
+                if (result.confidence < confidenceAlert.threshold) {
+                    confidenceAlert.consecutiveLowCount++;
+
+                    // Trigger alert after 3 consecutive low readings and cooldown has passed
+                    if (confidenceAlert.consecutiveLowCount >= 3 &&
+                        (now - confidenceAlert.lastAlertTime) > confidenceAlert.alertCooldown) {
+
+                        showNotification(
+                            `⚠ Low DF Confidence: ${result.confidence.toFixed(0)}% (threshold: ${confidenceAlert.threshold}%)`,
+                            'warning',
+                            5000
+                        );
+
+                        console.warn(`Low DF confidence alert: ${result.confidence}% (SNR: ${result.snr} dB, Phase Std: ${result.phaseStd}°)`);
+
+                        confidenceAlert.lastAlertTime = now;
+                        confidenceAlert.consecutiveLowCount = 0; // Reset after alert
+                    }
+                } else {
+                    // Reset counter when confidence is good
+                    confidenceAlert.consecutiveLowCount = 0;
+                }
+            }
 
             // Update polar display with both bearings
             drawDoAPolarMain(result.azimuth, result.backAzimuth, result.sources);
@@ -8463,16 +9601,22 @@ const char* html_page = R"HTMLDELIM(
 
             // Send platform position
             if (streamOutConfig.protocol === 'udp') {
-                fetch('/stream_udp_relay', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        endpoint: streamOutConfig.endpoint,
-                        port: streamOutConfig.port,
-                        data: platformCot,
-                        format: 'cot'
-                    })
-                }).catch(err => console.error('Platform position send failed:', err));
+                (async () => {
+                    try {
+                        await fetchWithTimeout('/stream_udp_relay', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                endpoint: streamOutConfig.endpoint,
+                                port: streamOutConfig.port,
+                                data: platformCot,
+                                format: 'cot'
+                            })
+                        });
+                    } catch (err) {
+                        console.error('Platform position send failed:', err.message);
+                    }
+                })();
             }
         }
 
@@ -8512,63 +9656,57 @@ const char* html_page = R"HTMLDELIM(
             // Send based on protocol
             if (streamOutConfig.protocol === 'udp') {
                 // Send via UDP relay endpoint on server
-                fetch('/stream_udp_relay', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        endpoint: streamOutConfig.endpoint,
-                        port: streamOutConfig.port,
-                        data: isBinary ? Array.from(payload) : payload,
-                        format: streamOutConfig.format
-                    })
-                })
-                .then(response => {
-                    if (response.ok) {
+                (async () => {
+                    try {
+                        const response = await fetchWithTimeout('/stream_udp_relay', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                endpoint: streamOutConfig.endpoint,
+                                port: streamOutConfig.port,
+                                data: isBinary ? Array.from(payload) : payload,
+                                format: streamOutConfig.format
+                            })
+                        });
+
                         streamOutConfig.stats.sent++;
                         if (streamOutConfig.stats.sent % 10 === 0) {
                             console.log('Streamed', streamOutConfig.stats.sent, 'DF reports via UDP');
                         }
-                    } else {
+                    } catch (err) {
                         streamOutConfig.stats.errors++;
-                        console.error('UDP relay error:', response.status, response.statusText);
+                        if (streamOutConfig.stats.errors % 10 === 0) {
+                            console.error('UDP relay failed:', err.message, '(', streamOutConfig.stats.errors, 'errors)');
+                        }
                     }
-                })
-                .catch(err => {
-                    streamOutConfig.stats.errors++;
-                    if (streamOutConfig.stats.errors % 10 === 0) {
-                        console.error('UDP relay failed:', err.message, '(', streamOutConfig.stats.errors, 'errors)');
-                    }
-                });
+                })();
             } else {
                 // Send via HTTP
                 const url = 'http://' + streamOutConfig.endpoint + ':' + streamOutConfig.port;
 
-                fetch(url, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': contentType
-                    },
-                    body: payload
-                })
-                .then(response => {
-                    if (response.ok) {
+                (async () => {
+                    try {
+                        await fetchWithTimeout(url, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': contentType
+                            },
+                            body: payload
+                        });
+
                         streamOutConfig.stats.sent++;
                         if (streamOutConfig.stats.sent % 10 === 0) {
                             console.log('Streamed', streamOutConfig.stats.sent, 'DF reports via HTTP');
                         }
-                    } else {
+                    } catch (err) {
                         streamOutConfig.stats.errors++;
-                        console.error('HTTP stream error:', response.status, response.statusText);
+                        if (streamOutConfig.stats.errors % 10 === 0) {
+                            console.error('HTTP stream failed:', err.message, '(', streamOutConfig.stats.errors, 'errors)');
+                        }
                     }
-                })
-                .catch(err => {
-                    streamOutConfig.stats.errors++;
-                    if (streamOutConfig.stats.errors % 10 === 0) {
-                        console.error('HTTP stream failed:', err.message, '(', streamOutConfig.stats.errors, 'errors)');
-                    }
-                });
+                })();
             }
         }
 
@@ -8679,172 +9817,6 @@ const char* html_page = R"HTMLDELIM(
             return encodeProtobuf(doaData);
         }
 
-        // ===== SIGNAL CLASSIFIER =====
-
-        function toggleClassifier() {
-            const panel = document.getElementById('classifier_panel');
-            const toggle = document.getElementById('classifier_toggle');
-            if (!panel || !toggle) return;  // Elements don't exist
-            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
-            toggle.classList.toggle('active', panel.style.display !== 'none');
-        }
-
-        function classifySignal() {
-            if (!latestFFTData || latestFFTData.length === 0) {
-                showNotification('No signal data available', 'warning');
-                return;
-            }
-
-            const data = latestFFTData;
-            const results = analyzeSignalCharacteristics(data);
-
-            // Display results
-            const resultsDiv = document.getElementById('classifier_results');
-            if (!resultsDiv) return;  // Element doesn't exist
-
-            let html = '<div style="color: #0f0;">';
-            html += `<strong>Signal Type:</strong> ${results.type}<br>`;
-            html += `<strong>Confidence:</strong> ${results.confidence}%<br><br>`;
-            html += `<strong>Bandwidth:</strong> ${results.bandwidth.toFixed(2)} MHz<br>`;
-            html += `<strong>Peak Power:</strong> ${results.peakPower.toFixed(1)} dBFS<br>`;
-            html += `<strong>SNR:</strong> ${results.snr.toFixed(1)} dB<br>`;
-            html += `<strong>Spectral Flatness:</strong> ${results.spectralFlatness.toFixed(3)}<br>`;
-            html += '</div>';
-
-            resultsDiv.innerHTML = html;
-
-            // Display features
-            let featuresHtml = '<div style="display: flex; flex-wrap: wrap; gap: 5px;">';
-            results.features.forEach(f => {
-                featuresHtml += `<span style="background: #222; padding: 2px 6px; border-radius: 2px; color: #0ff;">${f}</span>`;
-            });
-            featuresHtml += '</div>';
-            document.getElementById('signal_features').innerHTML = featuresHtml;
-
-            console.log('Signal classification:', results);
-        }
-
-        function analyzeSignalCharacteristics(data) {
-            // Calculate various signal characteristics
-            let peakIdx = 0;
-            let peakVal = 0;
-            let sumPower = 0;
-            let sumMagnitude = 0;
-
-            for (let i = 0; i < data.length; i++) {
-                const val = data[i];
-                sumMagnitude += val;
-                sumPower += val * val;
-                if (val > peakVal) {
-                    peakVal = val;
-                    peakIdx = i;
-                }
-            }
-
-            const avgMagnitude = sumMagnitude / data.length;
-            const avgPower = sumPower / data.length;
-
-            // Spectral flatness (Wiener entropy)
-            let geometricMean = 1;
-            let count = 0;
-            for (let i = 0; i < data.length; i++) {
-                if (data[i] > 0) {
-                    geometricMean *= Math.pow(data[i], 1.0 / data.length);
-                    count++;
-                }
-            }
-            const spectralFlatness = geometricMean / avgMagnitude;
-
-            // Estimate noise floor
-            const sorted = Array.from(data).sort((a, b) => a - b);
-            const noiseFloorRaw = sorted[Math.floor(sorted.length * 0.1)];
-            const noiseFloorDb = rawToDb(noiseFloorRaw);
-            const peakDb = rawToDb(peakVal);
-            const snr = peakDb - noiseFloorDb;
-
-            // Calculate -3dB bandwidth
-            // Raw data is quantized dB: raw = (dB + 100) / 120 * 255
-            // For -3dB: threshold_raw = peakVal - 6.375
-            const threshold3db = peakVal - 6.375;
-            let firstIdx = -1, lastIdx = -1;
-            for (let i = 0; i < data.length; i++) {
-                if (data[i] >= threshold3db) {
-                    if (firstIdx === -1) firstIdx = i;
-                    lastIdx = i;
-                }
-            }
-            const sr = parseFloat(document.getElementById('srInput').value) * 1e6;
-            const bandwidth = firstIdx >= 0 ? ((lastIdx - firstIdx) * sr / FFT_SIZE) / 1e6 : 0;
-
-            // Count peaks
-            let numPeaks = 0;
-            for (let i = 5; i < data.length - 5; i++) {
-                if (data[i] > avgMagnitude * 1.5) {
-                    let isLocalMax = true;
-                    for (let j = i - 3; j <= i + 3; j++) {
-                        if (j !== i && data[j] > data[i]) {
-                            isLocalMax = false;
-                            break;
-                        }
-                    }
-                    if (isLocalMax) numPeaks++;
-                }
-            }
-
-            // Classify based on characteristics
-            let type = 'Unknown';
-            let confidence = 0;
-            let features = [];
-
-            if (spectralFlatness > 0.8) {
-                type = 'Wideband Noise / OFDM';
-                confidence = 70;
-                features.push('Flat Spectrum');
-            } else if (numPeaks === 1 && bandwidth < 0.1) {
-                type = 'Narrowband (CW / Carrier)';
-                confidence = 85;
-                features.push('Single Carrier');
-            } else if (numPeaks === 1 && bandwidth > 0.1 && bandwidth < 2) {
-                if (spectralFlatness > 0.4) {
-                    type = 'Digital Modulation (PSK/QAM)';
-                    confidence = 65;
-                    features.push('Moderate BW');
-                } else {
-                    type = 'Analog FM / AM';
-                    confidence = 60;
-                    features.push('Voice-like');
-                }
-            } else if (numPeaks > 1 && numPeaks < 10) {
-                type = 'Multi-carrier (FSK / Tones)';
-                confidence = 70;
-                features.push(`${numPeaks} Carriers`);
-            } else if (bandwidth > 5) {
-                type = 'Wideband Spread Spectrum';
-                confidence = 60;
-                features.push('Wide BW');
-            }
-
-            if (snr > 30) features.push('High SNR');
-            else if (snr > 15) features.push('Good SNR');
-            else if (snr > 5) features.push('Low SNR');
-            else features.push('Poor SNR');
-
-            if (bandwidth < 0.01) features.push('Very Narrow');
-            else if (bandwidth < 0.1) features.push('Narrow');
-            else if (bandwidth < 1) features.push('Medium BW');
-            else features.push('Wide');
-
-            return {
-                type: type,
-                confidence: confidence,
-                bandwidth: bandwidth,
-                peakPower: peakDb,
-                snr: snr,
-                spectralFlatness: spectralFlatness,
-                numPeaks: numPeaks,
-                features: features
-            };
-        }
 
         // ===== ENHANCED EXPORT FUNCTIONS =====
 
@@ -8973,7 +9945,6 @@ const char* html_page = R"HTMLDELIM(
         }, 100);
 
         console.log('Advanced signal analysis features loaded');
-        console.log('Signal classifier ready');
         console.log('Activity timeline ready');
 
         // ========================================================================
@@ -9211,6 +10182,18 @@ const char* html_page = R"HTMLDELIM(
             document.getElementById('live_avg_power').textContent = avgDbm.toFixed(1) + ' dBm';
             document.getElementById('live_noise_floor').textContent = floorDbm.toFixed(1) + ' dBm';
 
+            // Update signal strength meter (based on peak power)
+            // Map -120 dBm to 0%, 0 dBm to 100%
+            const signalPercent = Math.max(0, Math.min(100, ((peakDbm + 120) / 120) * 100));
+            const signalBar = document.getElementById('signal_strength_bar');
+            const signalText = document.getElementById('signal_strength_text');
+            if (signalBar) {
+                signalBar.style.width = signalPercent.toFixed(1) + '%';
+            }
+            if (signalText) {
+                signalText.textContent = peakDbm.toFixed(0) + ' dBm';
+            }
+
             // FPS is already updated elsewhere
             const fpsElement = document.getElementById('fps');
             if (fpsElement) {
@@ -9271,6 +10254,13 @@ const char* html_page = R"HTMLDELIM(
     </script>
 
     <!-- Load modular JavaScript components -->
+    <!-- Core utilities (load first) -->
+    <script src="/js/utils.js"></script>
+    <script src="/js/settings.js"></script>
+
+    <!-- Feature modules -->
+    <script src="/js/scanner_enhanced.js"></script>
+    <script src="/js/signal_filters.js"></script>
     <script src="/js/rf_measurements.js"></script>
     <script src="/js/marker_system.js"></script>
     <script src="/js/vsa_analysis.js"></script>
@@ -9308,6 +10298,11 @@ const char* html_page = R"HTMLDELIM(
         // ========================================================================
 
         function switchWorkspace(tabName) {
+            // Save workspace selection
+            if (typeof Settings !== 'undefined') {
+                Settings.set('last_workspace', tabName);
+            }
+
             // Hide all workspace content
             document.querySelectorAll('.workspace-content').forEach(content => {
                 content.classList.remove('active');
@@ -9565,10 +10560,34 @@ const char* html_page = R"HTMLDELIM(
         // Initialize LIVE workspace as default (already active in HTML)
         console.log('Workspace tab system initialized - LIVE workspace active by default');
 
+        // ===== INITIALIZE ENHANCED MODULES =====
+        setTimeout(() => {
+            // Initialize Scanner module
+            if (typeof Scanner !== 'undefined') {
+                Scanner.init();
+            }
+
+            // Restore last workspace
+            const lastWorkspace = Settings.get('last_workspace', 'live');
+            if (lastWorkspace && lastWorkspace !== 'live') {
+                switchWorkspace(lastWorkspace);
+            }
+
+            console.log('✓ Enhanced modules initialized');
+        }, 500);
+
         // ===== FREQUENCY SCANNER FUNCTIONS =====
         let scannerUpdateInterval = null;
+        let scannerState = {
+            startFreq: 0,
+            stopFreq: 0,
+            step: 0,
+            dwellMs: 0,
+            totalSteps: 0,
+            startTime: 0
+        };
 
-        function startScanner() {
+        async function startScanner() {
             const params = {
                 start_freq: parseInt(document.getElementById('scan_start').value),
                 stop_freq: parseInt(document.getElementById('scan_stop').value),
@@ -9577,13 +10596,43 @@ const char* html_page = R"HTMLDELIM(
                 dwell_ms: parseInt(document.getElementById('scan_dwell').value)
             };
 
-            fetch('/start_scanner', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(params)
-            })
-            .then(response => response.json())
-            .then(data => {
+            // Validate parameters
+            if (isNaN(params.start_freq) || isNaN(params.stop_freq) || isNaN(params.step) || isNaN(params.threshold) || isNaN(params.dwell_ms)) {
+                showNotification('Invalid scanner parameters. Please check all fields.', 'error');
+                return;
+            }
+
+            if (params.start_freq >= params.stop_freq) {
+                showNotification('Start frequency must be less than stop frequency', 'error');
+                return;
+            }
+
+            if (params.step <= 0 || params.step > (params.stop_freq - params.start_freq)) {
+                showNotification('Invalid step size. Must be positive and less than scan range.', 'error');
+                return;
+            }
+
+            if (params.dwell_ms < 10) {
+                showNotification('Dwell time too short. Minimum is 10ms.', 'error');
+                return;
+            }
+
+            // Store scanner parameters for progress calculation
+            scannerState.startFreq = params.start_freq;
+            scannerState.stopFreq = params.stop_freq;
+            scannerState.step = params.step;
+            scannerState.dwellMs = params.dwell_ms;
+            scannerState.totalSteps = Math.ceil((params.stop_freq - params.start_freq) / params.step);
+            scannerState.startTime = Date.now();
+
+            try {
+                const response = await fetchWithTimeout('/start_scanner', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(params)
+                });
+                const data = await response.json();
+
                 if (data.status === 'ok') {
                     document.getElementById('scan_start_btn').style.display = 'none';
                     document.getElementById('scan_stop_btn').style.display = 'block';
@@ -9592,17 +10641,24 @@ const char* html_page = R"HTMLDELIM(
 
                     // Start polling for updates
                     scannerUpdateInterval = setInterval(updateScannerStatus, 500);
+                    showNotification('Scanner started successfully', 'success', 2000);
+                } else {
+                    showNotification(`Failed to start scanner: ${data.error || 'Unknown error'}`, 'error');
                 }
-            });
+            } catch (err) {
+                console.error('Scanner start error:', err);
+                showNotification(`Failed to start scanner: ${err.message}`, 'error');
+            }
         }
 
-        function stopScanner() {
-            fetch('/stop_scanner', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'}
-            })
-            .then(response => response.json())
-            .then(data => {
+        async function stopScanner() {
+            try {
+                const response = await fetchWithTimeout('/stop_scanner', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'}
+                });
+                const data = await response.json();
+
                 document.getElementById('scan_start_btn').style.display = 'block';
                 document.getElementById('scan_stop_btn').style.display = 'none';
                 document.getElementById('scan_status').textContent = 'Stopped';
@@ -9613,30 +10669,89 @@ const char* html_page = R"HTMLDELIM(
                     clearInterval(scannerUpdateInterval);
                     scannerUpdateInterval = null;
                 }
-            });
+
+                showNotification('Scanner stopped', 'info', 2000);
+            } catch (err) {
+                console.error('Scanner stop error:', err);
+                showNotification(`Failed to stop scanner: ${err.message}`, 'error');
+
+                // Try to stop polling anyway
+                if (scannerUpdateInterval) {
+                    clearInterval(scannerUpdateInterval);
+                    scannerUpdateInterval = null;
+                }
+            }
         }
 
-        function clearScanner() {
-            fetch('/clear_scanner', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'}
-            })
-            .then(response => response.json())
-            .then(data => {
+        async function clearScanner() {
+            try {
+                const response = await fetchWithTimeout('/clear_scanner', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'}
+                });
+                const data = await response.json();
+
                 document.getElementById('scanner_signal_list').innerHTML = '<div style="color: #888; text-align: center; padding: 20px;">No signals detected</div>';
                 document.getElementById('scan_count').textContent = '0';
                 document.getElementById('scan_signal_count').textContent = '0';
-            });
+
+                // Reset progress indicators
+                document.getElementById('scan_progress_bar').style.width = '0%';
+                document.getElementById('scan_progress_pct').textContent = '0%';
+                document.getElementById('scan_eta').textContent = '--';
+
+                showNotification('Scanner cleared', 'info', 2000);
+            } catch (err) {
+                console.error('Scanner clear error:', err);
+                showNotification(`Failed to clear scanner: ${err.message}`, 'error');
+            }
         }
 
-        function updateScannerStatus() {
-            fetch('/scanner_status')
-            .then(response => response.json())
-            .then(data => {
+        async function updateScannerStatus() {
+            try {
+                const response = await fetchWithTimeout('/scanner_status');
+                const data = await response.json();
+
                 // Update status
                 document.getElementById('scan_current_freq').textContent = data.current_freq.toFixed(1);
                 document.getElementById('scan_count').textContent = data.scan_count;
                 document.getElementById('scan_signal_count').textContent = data.signals.length;
+
+                // Calculate and update progress
+                if (data.scanning && scannerState.totalSteps > 0) {
+                    const currentStep = Math.floor((data.current_freq - scannerState.startFreq) / scannerState.step);
+                    const progressPct = Math.min(100, Math.max(0, (currentStep / scannerState.totalSteps) * 100));
+
+                    document.getElementById('scan_progress_bar').style.width = progressPct.toFixed(1) + '%';
+                    document.getElementById('scan_progress_pct').textContent = progressPct.toFixed(0) + '%';
+
+                    // Calculate ETA
+                    const elapsedMs = Date.now() - scannerState.startTime;
+                    if (progressPct > 5) { // Wait for at least 5% to get reasonable estimate
+                        const totalEstimatedMs = (elapsedMs / progressPct) * 100;
+                        const remainingMs = totalEstimatedMs - elapsedMs;
+
+                        if (remainingMs > 0) {
+                            const remainingSec = Math.ceil(remainingMs / 1000);
+                            if (remainingSec < 60) {
+                                document.getElementById('scan_eta').textContent = remainingSec + 's';
+                            } else {
+                                const mins = Math.floor(remainingSec / 60);
+                                const secs = remainingSec % 60;
+                                document.getElementById('scan_eta').textContent = mins + 'm ' + secs + 's';
+                            }
+                        } else {
+                            document.getElementById('scan_eta').textContent = 'Soon';
+                        }
+                    } else {
+                        document.getElementById('scan_eta').textContent = 'Calculating...';
+                    }
+                } else {
+                    // Reset progress when not scanning
+                    document.getElementById('scan_progress_bar').style.width = '0%';
+                    document.getElementById('scan_progress_pct').textContent = '0%';
+                    document.getElementById('scan_eta').textContent = '--';
+                }
 
                 // Update signal list
                 const listDiv = document.getElementById('scanner_signal_list');
@@ -9665,8 +10780,22 @@ const char* html_page = R"HTMLDELIM(
                     scannerUpdateInterval = null;
                     document.getElementById('scan_status').textContent = 'Stopped';
                     document.getElementById('scan_status').style.color = '#888';
+
+                    // Show completion notification if scan completed (not manually stopped)
+                    const currentFreq = data.current_freq;
+                    if (scannerState.stopFreq > 0 && Math.abs(currentFreq - scannerState.stopFreq) < scannerState.step * 2) {
+                        showNotification(`Scan complete! Found ${data.signals.length} signals.`, 'success', 4000);
+                    }
+
+                    // Reset progress indicators
+                    document.getElementById('scan_progress_bar').style.width = '0%';
+                    document.getElementById('scan_progress_pct').textContent = '0%';
+                    document.getElementById('scan_eta').textContent = '--';
                 }
-            });
+            } catch (err) {
+                console.error('Scanner status update error:', err);
+                // Don't show notification since this runs frequently
+            }
         }
 
     </script>
@@ -9740,32 +10869,142 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
         else if (mg_strcmp(hm->uri, mg_str("/iq_data")) == 0) {
             std::lock_guard<std::mutex> lock(g_iq_data.mutex);
 
-            // Calculate total data size: 4 arrays * 256 samples * 2 bytes per sample = 2048 bytes
+            // Parse optional filter parameters
+            char start_bin_str[32] = "0";
+            char end_bin_str[32] = "";
+            mg_http_get_var(&hm->query, "start_bin", start_bin_str, sizeof(start_bin_str));
+            mg_http_get_var(&hm->query, "end_bin", end_bin_str, sizeof(end_bin_str));
+
             const size_t sample_bytes = IQ_SAMPLES * sizeof(int16_t);
             const size_t total_bytes = sample_bytes * 4;
 
-            // Send headers with exact Content-Length
-            mg_printf(c, "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/octet-stream\r\n"
-                        "Cache-Control: no-cache\r\n"
-                        "Content-Length: %zu\r\n"
-                        "\r\n", total_bytes);
+            // Check if filtering is requested and FFT data is available
+            const bool filter_requested = (end_bin_str[0] != '\0');
+            const bool fft_available = !g_iq_data.ch1_fft.empty() && !g_iq_data.ch2_fft.empty();
 
-            // Send data in order: CH1_I, CH1_Q, CH2_I, CH2_Q
-            mg_send(c, g_iq_data.ch1_i, sample_bytes);
-            mg_send(c, g_iq_data.ch1_q, sample_bytes);
-            mg_send(c, g_iq_data.ch2_i, sample_bytes);
-            mg_send(c, g_iq_data.ch2_q, sample_bytes);
-            g_http_bytes_sent.fetch_add(total_bytes);
-            c->is_draining = 1;
+            if (filter_requested && fft_available) {
+                // Perform frequency-domain bandpass filtering
+                const size_t fft_size = g_iq_data.ch1_fft.size();
+                size_t start_bin = std::atoi(start_bin_str);
+                size_t end_bin = std::atoi(end_bin_str);
+
+                // Clamp to valid range
+                start_bin = std::min(start_bin, fft_size - 1);
+                end_bin = std::min(end_bin, fft_size - 1);
+                if (start_bin > end_bin) std::swap(start_bin, end_bin);
+
+                // Create FFTW plans for IFFT (reuse for both channels)
+                static fftwf_plan ifft_plan = nullptr;
+                static fftwf_complex* ifft_in = nullptr;
+                static fftwf_complex* ifft_out = nullptr;
+                static size_t plan_size = 0;
+
+                if (!ifft_plan || plan_size != fft_size) {
+                    if (ifft_plan) {
+                        fftwf_destroy_plan(ifft_plan);
+                        fftwf_free(ifft_in);
+                        fftwf_free(ifft_out);
+                    }
+                    ifft_in = fftwf_alloc_complex(fft_size);
+                    ifft_out = fftwf_alloc_complex(fft_size);
+                    ifft_plan = fftwf_plan_dft_1d(fft_size, ifft_in, ifft_out, FFTW_BACKWARD, FFTW_ESTIMATE);
+                    plan_size = fft_size;
+                }
+
+                int16_t filtered_ch1_i[IQ_SAMPLES], filtered_ch1_q[IQ_SAMPLES];
+                int16_t filtered_ch2_i[IQ_SAMPLES], filtered_ch2_q[IQ_SAMPLES];
+
+                // Process CH1
+                for (size_t i = 0; i < fft_size; i++) {
+                    if (i >= start_bin && i <= end_bin) {
+                        ifft_in[i][0] = g_iq_data.ch1_fft[i].real();
+                        ifft_in[i][1] = g_iq_data.ch1_fft[i].imag();
+                    } else {
+                        ifft_in[i][0] = 0.0f;
+                        ifft_in[i][1] = 0.0f;
+                    }
+                }
+                fftwf_execute(ifft_plan);
+
+                // Decimate IFFT output to 256 samples
+                const int decimation_step = fft_size / IQ_SAMPLES;
+                const float scale = 1.0f / fft_size;  // FFTW doesn't normalize IFFT
+                for (int i = 0; i < IQ_SAMPLES; i++) {
+                    const size_t idx = i * decimation_step;
+                    filtered_ch1_i[i] = static_cast<int16_t>(ifft_out[idx][0] * scale * 32767.0f);
+                    filtered_ch1_q[i] = static_cast<int16_t>(ifft_out[idx][1] * scale * 32767.0f);
+                }
+
+                // Process CH2
+                for (size_t i = 0; i < fft_size; i++) {
+                    if (i >= start_bin && i <= end_bin) {
+                        ifft_in[i][0] = g_iq_data.ch2_fft[i].real();
+                        ifft_in[i][1] = g_iq_data.ch2_fft[i].imag();
+                    } else {
+                        ifft_in[i][0] = 0.0f;
+                        ifft_in[i][1] = 0.0f;
+                    }
+                }
+                fftwf_execute(ifft_plan);
+
+                // Decimate IFFT output to 256 samples
+                for (int i = 0; i < IQ_SAMPLES; i++) {
+                    const size_t idx = i * decimation_step;
+                    filtered_ch2_i[i] = static_cast<int16_t>(ifft_out[idx][0] * scale * 32767.0f);
+                    filtered_ch2_q[i] = static_cast<int16_t>(ifft_out[idx][1] * scale * 32767.0f);
+                }
+
+                // Send filtered data
+                mg_printf(c, "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/octet-stream\r\n"
+                            "Cache-Control: no-cache\r\n"
+                            "Content-Length: %zu\r\n"
+                            "\r\n", total_bytes);
+
+                mg_send(c, filtered_ch1_i, sample_bytes);
+                mg_send(c, filtered_ch1_q, sample_bytes);
+                mg_send(c, filtered_ch2_i, sample_bytes);
+                mg_send(c, filtered_ch2_q, sample_bytes);
+                g_http_bytes_sent.fetch_add(total_bytes);
+                c->is_draining = 1;
+            } else {
+                // Send unfiltered data
+                mg_printf(c, "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/octet-stream\r\n"
+                            "Cache-Control: no-cache\r\n"
+                            "Content-Length: %zu\r\n"
+                            "\r\n", total_bytes);
+
+                mg_send(c, g_iq_data.ch1_i, sample_bytes);
+                mg_send(c, g_iq_data.ch1_q, sample_bytes);
+                mg_send(c, g_iq_data.ch2_i, sample_bytes);
+                mg_send(c, g_iq_data.ch2_q, sample_bytes);
+                g_http_bytes_sent.fetch_add(total_bytes);
+                c->is_draining = 1;
+            }
         }
         // Serve cross-correlation data
         else if (mg_strcmp(hm->uri, mg_str("/xcorr_data")) == 0) {
             std::lock_guard<std::mutex> lock(g_xcorr_data.mutex);
 
-            // Calculate data size: magnitude + phase arrays (4096 floats each)
+            // Parse optional filter parameters
+            char start_bin_str[32] = "0";
+            char end_bin_str[32] = "";
+            mg_http_get_var(&hm->query, "start_bin", start_bin_str, sizeof(start_bin_str));
+            mg_http_get_var(&hm->query, "end_bin", end_bin_str, sizeof(end_bin_str));
+
             const size_t array_size = g_xcorr_data.magnitude.size();
-            const size_t mag_bytes = array_size * sizeof(float);
+            size_t start_bin = std::atoi(start_bin_str);
+            size_t end_bin = (end_bin_str[0] != '\0') ? std::atoi(end_bin_str) : array_size - 1;
+
+            // Clamp to valid range
+            start_bin = std::min(start_bin, array_size - 1);
+            end_bin = std::min(end_bin, array_size - 1);
+            if (start_bin > end_bin) std::swap(start_bin, end_bin);
+
+            // Calculate filtered data size
+            const size_t filtered_size = end_bin - start_bin + 1;
+            const size_t mag_bytes = filtered_size * sizeof(float);
             const size_t total_bytes = mag_bytes * 2;
 
             // Send headers with exact Content-Length
@@ -9775,9 +11014,9 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
                         "Content-Length: %zu\r\n"
                         "\r\n", total_bytes);
 
-            // Send binary data - magnitude then phase
-            mg_send(c, g_xcorr_data.magnitude.data(), mag_bytes);
-            mg_send(c, g_xcorr_data.phase.data(), mag_bytes);
+            // Send binary data - magnitude then phase (filtered range)
+            mg_send(c, g_xcorr_data.magnitude.data() + start_bin, mag_bytes);
+            mg_send(c, g_xcorr_data.phase.data() + start_bin, mag_bytes);
             g_http_bytes_sent.fetch_add(total_bytes);
             c->is_draining = 1;
         }
@@ -10114,6 +11353,34 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/statistics.js")) == 0) {
             std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/statistics.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/utils.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/utils.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/settings.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/settings.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/scanner_enhanced.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/scanner_enhanced.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/signal_filters.js")) == 0) {
+            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/signal_filters.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",

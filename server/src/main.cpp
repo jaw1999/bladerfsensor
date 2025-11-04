@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -398,36 +399,45 @@ void compute_fft(fftwf_complex *in, fftwf_complex *out, fftwf_plan plan) {
 }
 
 void compute_magnitude_db(fftwf_complex *fft_out, uint8_t *mag_out, size_t size) {
-    // Compute absolute magnitude in dB
-    // This makes gain changes directly visible on the display
+    // Compute absolute magnitude in dB with optimized math
+    // Avoid sqrt by using power directly: 10*log10(mag^2) = 20*log10(mag)
+    // But we compute 10*log10(power) which is equivalent
 
     static int debug_counter = 0;
     float min_db = 1000.0f;
     float max_db = -1000.0f;
 
+    // Constants for fast scaling
+    constexpr float DB_SCALE = 10.0f;
+    constexpr float DB_OFFSET = 100.0f;
+    constexpr float DB_RANGE = 120.0f;
+    constexpr float NORM_SCALE = 255.0f / DB_RANGE;
+    constexpr float MIN_POWER = 1e-20f;
+
     for (size_t i = 0; i < size; i++) {
         float real = fft_out[i][0];
         float imag = fft_out[i][1];
-        float mag = std::sqrt(real * real + imag * imag);
 
-        // Convert to absolute dB (magnitude squared gives power)
-        float db = 10.0f * std::log10(std::max(mag * mag, 1e-20f));
+        // Power = I^2 + Q^2 (no sqrt needed!)
+        float power = real * real + imag * imag;
+
+        // Convert to dB: 10*log10(power)
+        float db = DB_SCALE * std::log10(std::max(power, MIN_POWER));
 
         // Track min/max for debugging
         if (db < min_db) min_db = db;
         if (db > max_db) max_db = db;
 
-        // Map wider range (-100 dB to +20 dB) to 0 to 255
-        // This accommodates signals from noise floor to strong peaks
-        // Total range 120 dB mapped to 0-255
-        float normalized = (db + 100.0f) / 120.0f * 255.0f;
-        mag_out[i] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, normalized)));
+        // Map -100 dB to +20 dB range to 0-255
+        float normalized = (db + DB_OFFSET) * NORM_SCALE;
+        mag_out[i] = static_cast<uint8_t>(std::clamp(normalized, 0.0f, 255.0f));
     }
 
     // Print debug info every 60 frames
     debug_counter++;
     if (debug_counter % 60 == 0) {
-        std::cout << "FFT dB range: " << min_db << " to " << max_db
+        std::cout << "FFT dB range: " << std::fixed << std::setprecision(1)
+                  << min_db << " to " << max_db
                   << " dB (gain RX1=" << g_gain_rx1.load() << " dB)" << std::endl;
     }
 }
@@ -435,34 +445,54 @@ void compute_magnitude_db(fftwf_complex *fft_out, uint8_t *mag_out, size_t size)
 void remove_dc_offset(uint8_t *magnitude, size_t size) {
     const size_t dc_bin = size / 2;
 
-    // Only smooth the immediate center bin to avoid artifacts
-    // Don't aggressively interpolate as it can create dips
-    if (dc_bin < 2 || dc_bin >= size - 2) return;
+    // Robust DC spike removal with bounds checking
+    if (dc_bin < 3 || dc_bin >= size - 3) return;
 
-    // Simple 3-bin averaging to smooth center without creating dip
-    const uint32_t avg = (static_cast<uint32_t>(magnitude[dc_bin - 1]) +
-                          static_cast<uint32_t>(magnitude[dc_bin]) +
-                          static_cast<uint32_t>(magnitude[dc_bin + 1])) / 3;
+    // Use 5-point averaging for smoother interpolation
+    // Weights: [1, 2, _, 2, 1] / 6 to emphasize nearby bins
+    const uint32_t weighted_avg = (
+        static_cast<uint32_t>(magnitude[dc_bin - 2]) +
+        2 * static_cast<uint32_t>(magnitude[dc_bin - 1]) +
+        2 * static_cast<uint32_t>(magnitude[dc_bin + 1]) +
+        static_cast<uint32_t>(magnitude[dc_bin + 2])
+    ) / 6;
 
-    magnitude[dc_bin] = static_cast<uint8_t>(avg);
+    magnitude[dc_bin] = static_cast<uint8_t>(weighted_avg);
+
+    // Also smooth adjacent bins slightly to avoid sharp edges
+    for (int offset = -1; offset <= 1; offset += 2) {
+        size_t idx = dc_bin + offset;
+        uint32_t local_avg = (
+            static_cast<uint32_t>(magnitude[idx - 1]) +
+            2 * static_cast<uint32_t>(magnitude[idx]) +
+            static_cast<uint32_t>(magnitude[idx + 1])
+        ) / 4;
+        magnitude[idx] = static_cast<uint8_t>(local_avg);
+    }
 }
 
 void compute_cross_correlation(fftwf_complex *fft_ch1, fftwf_complex *fft_ch2,
                               float *correlation, float *phase_diff) {
-    // Cross-correlation in frequency domain conj(FFT1) * FFT2
+    // Cross-correlation in frequency domain: conj(FFT1) * FFT2
+    // This provides both magnitude and phase difference between channels
+    // Useful for direction finding and coherence analysis
+
     for (size_t i = 0; i < FFT_SIZE; i++) {
-        float real1 = fft_ch1[i][0];
-        float imag1 = -fft_ch1[i][1];  // Complex conjugate
-        float real2 = fft_ch2[i][0];
-        float imag2 = fft_ch2[i][1];
+        const float real1 = fft_ch1[i][0];
+        const float imag1 = -fft_ch1[i][1];  // Complex conjugate
+        const float real2 = fft_ch2[i][0];
+        const float imag2 = fft_ch2[i][1];
 
-        // Complex multiplication
-        float corr_real = real1 * real2 - imag1 * imag2;
-        float corr_imag = real1 * imag2 + imag1 * real2;
+        // Complex multiplication: (a + bi)(c + di) = (ac - bd) + (ad + bc)i
+        const float corr_real = real1 * real2 - imag1 * imag2;
+        const float corr_imag = real1 * imag2 + imag1 * real2;
 
-        // Magnitude and phase
-        correlation[i] = std::sqrt(corr_real * corr_real + corr_imag * corr_imag);
-        phase_diff[i] = std::atan2(corr_imag, corr_real);
+        // Magnitude: use sqrtf for single precision (faster than sqrt)
+        const float power = corr_real * corr_real + corr_imag * corr_imag;
+        correlation[i] = sqrtf(power);
+
+        // Phase difference: atan2f is faster than atan2 for single precision
+        phase_diff[i] = atan2f(corr_imag, corr_real);
     }
 }
 
@@ -788,7 +818,9 @@ int main(int argc, char *argv[]) {
                 ch2_iq[i][0] = static_cast<int16_t>(fft_in_ch2[idx][0] * 32767.0f);
                 ch2_iq[i][1] = static_cast<int16_t>(fft_in_ch2[idx][1] * 32767.0f);
             }
-            update_iq_data(reinterpret_cast<int16_t*>(ch1_iq), reinterpret_cast<int16_t*>(ch2_iq), 256);
+            // Update IQ data with FFT output for frequency-domain filtering
+            update_iq_data(reinterpret_cast<int16_t*>(ch1_iq), reinterpret_cast<int16_t*>(ch2_iq), 256,
+                          fft_out_ch1.data(), fft_out_ch2.data(), FFT_SIZE);
 
             // Compute and update cross-correlation data
             float xcorr_mag[FFT_SIZE], xcorr_phase[FFT_SIZE];
@@ -855,18 +887,33 @@ int main(int argc, char *argv[]) {
 
             // Apply interferometer equation: sin(θ) = (Δφ * λ) / (2π * d)
             float sin_theta = (avg_phase_diff_rad * lambda) / (2.0f * M_PI * antenna_spacing_wavelengths);
-            sin_theta = std::max(-1.0f, std::min(1.0f, sin_theta));  // Clamp to [-1, 1] for asin
+            sin_theta = std::max(-1.0f, std::min(1.0f, sin_theta));  // Clamp to [-1, 1]
 
-            // Get primary angle from arcsin (returns angle in [-90°, 90°])
-            const float azimuth_deg = std::asin(sin_theta) * 180.0f / M_PI;
+            // Calculate azimuth using atan2 for full [-180°, 180°] range
+            // This provides better angle resolution across all quadrants than asin alone
+            float cos_theta_sq = 1.0f - sin_theta * sin_theta;
+            float cos_theta = std::sqrt(std::max(0.0f, cos_theta_sq));
 
-            // Calculate back azimuth (180° ambiguity inherent to 2-channel DF)
-            // For 2-element array: sin(θ) = sin(180° - θ)
-            const float back_azimuth_deg = 180.0f - azimuth_deg;
+            // Use atan2(sin, cos) for proper quadrant handling
+            // Note: We compute both positive and negative cos_theta solutions
+            float azimuth_rad_pos = std::atan2(sin_theta, cos_theta);   // [0°, 180°] solution
+            float azimuth_rad_neg = std::atan2(sin_theta, -cos_theta);  // [180°, 360°] solution
+
+            float azimuth_deg_pos = azimuth_rad_pos * 180.0f / M_PI;
+            float azimuth_deg_neg = azimuth_rad_neg * 180.0f / M_PI;
+
+            // For display, we present the solution in [0°, 180°] as primary
+            // and its 180° complement as the ambiguous back azimuth
+            float azimuth_deg = azimuth_deg_pos;
+            float back_azimuth_deg = azimuth_deg_neg;
 
             // Normalize to [0, 360) for display
             float azimuth_norm = azimuth_deg < 0 ? azimuth_deg + 360.0f : azimuth_deg;
             float back_azimuth_norm = back_azimuth_deg < 0 ? back_azimuth_deg + 360.0f : back_azimuth_deg;
+
+            // Ensure both azimuths are in [0, 360)
+            azimuth_norm = std::fmod(azimuth_norm + 360.0f, 360.0f);
+            back_azimuth_norm = std::fmod(back_azimuth_norm + 360.0f, 360.0f);
 
             // Calculate SNR estimate from IQ power (RMS power)
             float sum_power = 0.0f;

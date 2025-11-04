@@ -7,6 +7,8 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <complex>
+#include <fftw3.h>
 
 constexpr int WEB_SERVER_PORT = 8080;          // HTTP server port for web interface
 constexpr int WATERFALL_HEIGHT = 512;          // Number of FFT frames stored in history
@@ -35,15 +37,20 @@ struct WaterfallBuffer {
 };
 
 // IQ constellation data buffer for both channels
-// Stores decimated IQ samples for constellation display
+// Stores decimated IQ samples for constellation display and full FFT data for filtering
 struct IQBuffer {
-    int16_t ch1_i[IQ_SAMPLES];     // Channel 1 I samples
-    int16_t ch1_q[IQ_SAMPLES];     // Channel 1 Q samples
-    int16_t ch2_i[IQ_SAMPLES];     // Channel 2 I samples
-    int16_t ch2_q[IQ_SAMPLES];     // Channel 2 Q samples
+    int16_t ch1_i[IQ_SAMPLES];     // Channel 1 I samples (decimated)
+    int16_t ch1_q[IQ_SAMPLES];     // Channel 1 Q samples (decimated)
+    int16_t ch2_i[IQ_SAMPLES];     // Channel 2 I samples (decimated)
+    int16_t ch2_q[IQ_SAMPLES];     // Channel 2 Q samples (decimated)
+
+    // FFT data for frequency-domain filtering
+    std::vector<std::complex<float>> ch1_fft;  // Channel 1 FFT output (4096 bins)
+    std::vector<std::complex<float>> ch2_fft;  // Channel 2 FFT output (4096 bins)
+
     std::mutex mutex;               // Mutex for thread-safe access
 
-    IQBuffer() {
+    IQBuffer() : ch1_fft(WATERFALL_WIDTH), ch2_fft(WATERFALL_WIDTH) {
         memset(ch1_i, 0, sizeof(ch1_i));
         memset(ch1_q, 0, sizeof(ch1_q));
         memset(ch2_i, 0, sizeof(ch2_i));
@@ -119,6 +126,31 @@ struct ScannerState {
                      dwell_ms(100), scan_count(0) {}
 };
 
+// Classified signal entry
+struct ClassifiedSignal {
+    uint64_t frequency_hz;      // Signal frequency in Hz
+    float bandwidth_hz;         // Occupied bandwidth in Hz
+    char modulation[32];        // Detected modulation type (e.g., "FM", "AM", "BPSK")
+    uint8_t confidence;         // Confidence percentage (0-100)
+    float power_db;             // Signal power in dB
+    uint64_t timestamp_ms;      // Timestamp of classification (milliseconds since epoch)
+};
+
+// Signal classification buffer
+// Stores recent signal classifications for display
+constexpr int MAX_CLASSIFICATIONS = 50;  // Maximum number of classifications to store
+
+struct ClassificationBuffer {
+    ClassifiedSignal classifications[MAX_CLASSIFICATIONS];  // Circular buffer of classifications
+    int write_index;                                        // Current write position
+    int count;                                              // Number of valid classifications
+    std::mutex mutex;                                       // Mutex for thread-safe access
+
+    ClassificationBuffer() : write_index(0), count(0) {
+        memset(classifications, 0, sizeof(classifications));
+    }
+};
+
 // Global buffer instances
 extern WaterfallBuffer g_waterfall;
 extern IQBuffer g_iq_data;
@@ -126,6 +158,7 @@ extern XCorrBuffer g_xcorr_data;
 extern LinkQuality g_link_quality;
 extern DoAResult g_doa_result;
 extern ScannerState g_scanner;
+extern ClassificationBuffer g_classifications;
 
 // Web server function declarations
 
@@ -144,7 +177,8 @@ void update_waterfall(const uint8_t* ch1_mag, const uint8_t* ch2_mag, size_t fft
 //   ch1_iq: Channel 1 IQ samples as interleaved I Q pairs
 //   ch2_iq: Channel 2 IQ samples as interleaved I Q pairs
 //   count: Number of IQ pairs (should be IQ_SAMPLES)
-void update_iq_data(const int16_t* ch1_iq, const int16_t* ch2_iq, size_t count);
+void update_iq_data(const int16_t* ch1_iq, const int16_t* ch2_iq, size_t count,
+                    const fftwf_complex* ch1_fft = nullptr, const fftwf_complex* ch2_fft = nullptr, size_t fft_size = 0);
 
 // Update cross-correlation data
 // Args:
@@ -170,6 +204,17 @@ void update_link_quality(float fps, uint64_t bytes);
 //   coherence: Coherence metric (0-1)
 void update_doa_result(float azimuth, float back_azimuth, float phase_diff,
                        float phase_std, float confidence, float snr, float coherence);
+
+// Add a signal classification result
+// Args:
+//   frequency_hz: Signal frequency in Hz
+//   bandwidth_hz: Occupied bandwidth in Hz
+//   modulation: Modulation type string
+//   confidence: Confidence percentage (0-100)
+//   power_db: Signal power in dB
+//   timestamp_ms: Timestamp in milliseconds
+void add_classification(uint64_t frequency_hz, float bandwidth_hz, const char* modulation,
+                       uint8_t confidence, float power_db, uint64_t timestamp_ms);
 
 // Get and reset HTTP bytes sent counter
 // Returns the number of bytes sent since last call and resets counter to zero

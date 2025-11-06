@@ -9558,6 +9558,49 @@ const char* html_page = R"HTMLDELIM(
             console.log('Stream Out stopped. Sent:', streamOutConfig.stats.sent, 'Errors:', streamOutConfig.stats.errors);
         }
 
+        function sendTargetRegistration() {
+            const now = new Date();
+            const time = now.toISOString();
+            const stale = new Date(now.getTime() + 300000).toISOString(); // 5 min stale
+
+            const lat = streamOutConfig.position.lat;
+            const lon = streamOutConfig.position.lon;
+            const alt = Math.round(streamOutConfig.position.alt);
+            const uid = streamOutConfig.sensorUid;
+
+            // Target registration message
+            const registrationCot = `<?xml version='1.0' encoding='UTF-8' standalone='yes'?>
+<event version='2.0' uid='${uid}-target-reg' type='b-t-f' time='${time}' start='${time}' stale='${stale}' how='m-g'>
+    <point lat='${lat}' lon='${lon}' hae='${alt}' ce='10' le='10'/>
+    <detail>
+        <contact callsign='RF-Target'/>
+        <__registrationStatus deviceType='bladeRF xA9' signalType='RF' unitId='${uid}'/>
+        <remarks>RF Target Registration for LoB</remarks>
+    </detail>
+</event>`;
+
+            // Send registration
+            if (streamOutConfig.protocol === 'udp') {
+                (async () => {
+                    try {
+                        await fetchWithTimeout('/stream_udp_relay', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                endpoint: streamOutConfig.endpoint,
+                                port: streamOutConfig.port,
+                                data: registrationCot,
+                                format: 'cot'
+                            })
+                        });
+                        console.log('Target registration sent');
+                    } catch (err) {
+                        console.error('Target registration send failed:', err.message);
+                    }
+                })();
+            }
+        }
+
         function sendPlatformPosition() {
             const now = new Date();
             const time = now.toISOString();
@@ -9765,7 +9808,7 @@ const char* html_page = R"HTMLDELIM(
 <event version='2.0' uid='${uid}-lob-${Date.now()}' type='b-d' time='${time}' start='${time}' stale='${stale}' how='m-p'>
     <point lat='0.0' lon='0.0' hae='9999999.0' ce='9999999.0' le='9999999.0'/>
     <detail>
-        <__lob deviceType='bladeRF xA9' rssi='${rssi}' confidence='${confidence}' unitId='${uid}' azimuth='${bearing}' family='com.nuand.bladerf' deviceTime='${deviceTime}' elevationAngle='0' frequency='${frequency}' range='${lobRange}'>
+        <__lob deviceType='bladeRF xA9' rssi='${rssi}' confidence='${confidence}' unitId='${uid}' azimuth='${bearing}' family='com.nuand.bladerf' deviceTime='${deviceTime}' elevationAngle='0' frequency='${frequency}' range='${lobRange}' strokeColor='-16711936' strokeWeight='2.0' signalType='RF'>
             <startLocation ce='0' le='0' lon='${lon}' hae='${alt}' lat='${lat}'/>
             <__rf rssi='${rssi}' uplinkRssi='${rssi}' comments='2-ch DF SNR:${snr.toFixed(1)}dB Coh:${(coherence*100).toFixed(0)}% BW:${(bandwidth/1e3).toFixed(1)}kHz' downlinkRssi='-999.0' tag='${platformName} - ${(frequency/1e6).toFixed(3)} MHz' errorRadius='${errorRadius}' frequency='${frequency}'/>
         </__lob>

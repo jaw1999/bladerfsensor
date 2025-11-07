@@ -6,6 +6,7 @@
 #include "df_processing.h"
 #include "recording.h"
 #include "config_validation.h"
+#include "scanner.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -53,24 +54,15 @@ std::vector<fftwf_complex> fft_in_ch2(FFT_SIZE);      // Channel 2 FFT input buf
 std::vector<fftwf_complex> fft_out_ch1(FFT_SIZE);     // Channel 1 FFT output buffer
 std::vector<fftwf_complex> fft_out_ch2(FFT_SIZE);     // Channel 2 FFT output buffer
 
-// Overlap-add buffers for smoother spectrum (50% overlap)
-std::vector<fftwf_complex> overlap_buf_ch1(FFT_SIZE / 2);
-std::vector<fftwf_complex> overlap_buf_ch2(FFT_SIZE / 2);
-std::vector<uint8_t> prev_magnitude_ch1(FFT_SIZE);
-std::vector<uint8_t> prev_magnitude_ch2(FFT_SIZE);
-bool has_prev_fft = false;
-
-// DC offset correction using exponentially weighted moving average (EWMA)
-// Tracks and removes DC bias from IQ samples for cleaner spectrum display
-float g_dc_i_ch1 = 0.0f;                              // Channel 1 I component DC offset
-float g_dc_q_ch1 = 0.0f;                              // Channel 1 Q component DC offset
-float g_dc_i_ch2 = 0.0f;                              // Channel 2 I component DC offset
-float g_dc_q_ch2 = 0.0f;                              // Channel 2 Q component DC offset
-uint64_t g_last_freq_for_dc = 0;                      // Last frequency (for reset detection)
-int g_dc_convergence_counter = 0;                     // Convergence tracking counter
+// IQ processing state
+DCOffsetState g_dc_offset;                            // DC offset correction state
+OverlapState g_overlap;                               // Overlap-add state for smoother spectrum
 
 // Automatic gain control (AGC) state
 AGCState g_agc;
+
+// Noise floor estimation state
+NoiseFloorState g_noise_floor;
 
 // FFT window function state
 uint32_t g_window_type = WINDOW_HAMMING;              // Current window function type
@@ -214,6 +206,14 @@ int main(int argc, char *argv[]) {
     // Initialize AGC
     std::cout << "Initializing AGC..." << std::endl;
     init_agc(g_agc, GAIN_RX1, GAIN_RX2);
+
+    // Initialize IQ processing states
+    std::cout << "Initializing DC offset correction..." << std::endl;
+    init_dc_offset(g_dc_offset);
+    std::cout << "Initializing overlap-add buffers..." << std::endl;
+    init_overlap(g_overlap, FFT_SIZE);
+    std::cout << "Initializing noise floor estimation..." << std::endl;
+    init_noise_floor(g_noise_floor, FFT_SIZE);
 
     // Initialize bladeRF
     status = initialize_bladerf(&dev);
@@ -360,124 +360,41 @@ int main(int argc, char *argv[]) {
             // Write samples to recording file if active
             write_samples_to_file(thread_rx_buffer.data(), BUFFER_SIZE * 2);
 
-            // ===== OVERLAP-ADD PROCESSING (50% overlap for smoother spectrum) =====
-            constexpr size_t OVERLAP_SIZE = FFT_SIZE / 2;
-            const size_t new_samples = std::min(static_cast<size_t>(BUFFER_SIZE / 2), OVERLAP_SIZE);
-            constexpr float scale = 1.0f / 32768.0f;
+            // ===== IQ PROCESSING PIPELINE =====
+            // Process IQ samples through complete pipeline: overlap-add, DC removal, window, FFT, magnitude
+            uint8_t ch1_mag[FFT_SIZE], ch2_mag[FFT_SIZE];
+            IQProcessingResult iq_result = process_iq_to_fft(
+                thread_rx_buffer.data(),
+                BUFFER_SIZE * 2,
+                FFT_SIZE,
+                g_center_freq.load(),
+                fft_in_ch1.data(),
+                fft_in_ch2.data(),
+                fft_out_ch1.data(),
+                fft_out_ch2.data(),
+                ch1_mag,
+                ch2_mag,
+                g_dc_offset,
+                g_overlap,
+                g_window,
+                fft_plan_ch1,
+                fft_plan_ch2
+            );
 
-            // Track peak sample for debugging
-            static int web_sample_debug_counter = 0;
-            int16_t peak_sample = 0;
-
-            // Copy previous second half to first half (overlap)
-            std::memcpy(fft_in_ch1.data(), overlap_buf_ch1.data(), OVERLAP_SIZE * sizeof(fftwf_complex));
-            std::memcpy(fft_in_ch2.data(), overlap_buf_ch2.data(), OVERLAP_SIZE * sizeof(fftwf_complex));
-
-            // Deinterleave new samples into second half
-            for (size_t i = 0; i < new_samples; i++) {
-                const size_t idx = i * 4;
-                const size_t buf_idx = OVERLAP_SIZE + i;
-
-                // Track peak ADC values
-                if (std::abs(thread_rx_buffer[idx + 0]) > std::abs(peak_sample))
-                    peak_sample = thread_rx_buffer[idx + 0];
-                if (std::abs(thread_rx_buffer[idx + 1]) > std::abs(peak_sample))
-                    peak_sample = thread_rx_buffer[idx + 1];
-
-                fft_in_ch1[buf_idx][0] = static_cast<float>(thread_rx_buffer[idx + 0]) * scale;
-                fft_in_ch1[buf_idx][1] = static_cast<float>(thread_rx_buffer[idx + 1]) * scale;
-                fft_in_ch2[buf_idx][0] = static_cast<float>(thread_rx_buffer[idx + 2]) * scale;
-                fft_in_ch2[buf_idx][1] = static_cast<float>(thread_rx_buffer[idx + 3]) * scale;
+            // Reset held DoA on frequency change
+            if (iq_result.freq_changed) {
+                g_last_valid_doa.has_valid = false;
             }
 
-            // Save current second half for next iteration
-            std::memcpy(overlap_buf_ch1.data(), fft_in_ch1.data() + OVERLAP_SIZE, OVERLAP_SIZE * sizeof(fftwf_complex));
-            std::memcpy(overlap_buf_ch2.data(), fft_in_ch2.data() + OVERLAP_SIZE, OVERLAP_SIZE * sizeof(fftwf_complex));
-
             // Debug: Print peak sample every 60 frames
+            static int web_sample_debug_counter = 0;
             web_sample_debug_counter++;
             if (web_sample_debug_counter % 60 == 0) {
-                float saturation_pct = (std::abs(peak_sample) / 32768.0f) * 100.0f;
-                std::cout << "Peak ADC sample: " << peak_sample << " ("
+                float saturation_pct = (std::abs(iq_result.peak_sample) / 32768.0f) * 100.0f;
+                std::cout << "Peak ADC sample: " << iq_result.peak_sample << " ("
                           << std::fixed << std::setprecision(1) << saturation_pct
                           << "% of full scale) [Gain=" << g_gain_rx1.load() << "dB]" << std::endl;
             }
-
-            // Zero-pad if needed (shouldn't happen with proper buffer sizes)
-            if (new_samples < OVERLAP_SIZE) {
-                std::memset(fft_in_ch1.data() + OVERLAP_SIZE + new_samples, 0,
-                           (OVERLAP_SIZE - new_samples) * sizeof(fftwf_complex));
-                std::memset(fft_in_ch2.data() + OVERLAP_SIZE + new_samples, 0,
-                           (OVERLAP_SIZE - new_samples) * sizeof(fftwf_complex));
-            }
-
-            // Remove DC offset from IQ samples using EWMA
-            const uint64_t current_freq = g_center_freq.load();
-            if (current_freq != g_last_freq_for_dc) {
-                g_last_freq_for_dc = current_freq;
-                g_dc_convergence_counter = 0;
-                g_dc_i_ch1 = 0.0f;
-                g_dc_q_ch1 = 0.0f;
-                g_dc_i_ch2 = 0.0f;
-                g_dc_q_ch2 = 0.0f;
-                has_prev_fft = false;  // Reset overlap-add on frequency change
-                g_last_valid_doa.has_valid = false;  // Reset held DoA on frequency change
-            }
-
-            float dc_i_ch1 = 0.0f, dc_q_ch1 = 0.0f;
-            float dc_i_ch2 = 0.0f, dc_q_ch2 = 0.0f;
-
-            for (size_t i = 0; i < FFT_SIZE; i++) {
-                dc_i_ch1 += fft_in_ch1[i][0];
-                dc_q_ch1 += fft_in_ch1[i][1];
-                dc_i_ch2 += fft_in_ch2[i][0];
-                dc_q_ch2 += fft_in_ch2[i][1];
-            }
-
-            dc_i_ch1 /= FFT_SIZE;
-            dc_q_ch1 /= FFT_SIZE;
-            dc_i_ch2 /= FFT_SIZE;
-            dc_q_ch2 /= FFT_SIZE;
-
-            float alpha = (g_dc_convergence_counter < 20) ? 0.5f : 0.1f;
-            g_dc_convergence_counter++;
-
-            g_dc_i_ch1 = alpha * dc_i_ch1 + (1.0f - alpha) * g_dc_i_ch1;
-            g_dc_q_ch1 = alpha * dc_q_ch1 + (1.0f - alpha) * g_dc_q_ch1;
-            g_dc_i_ch2 = alpha * dc_i_ch2 + (1.0f - alpha) * g_dc_i_ch2;
-            g_dc_q_ch2 = alpha * dc_q_ch2 + (1.0f - alpha) * g_dc_q_ch2;
-
-            for (size_t i = 0; i < FFT_SIZE; i++) {
-                fft_in_ch1[i][0] -= g_dc_i_ch1;
-                fft_in_ch1[i][1] -= g_dc_q_ch1;
-                fft_in_ch2[i][0] -= g_dc_i_ch2;
-                fft_in_ch2[i][1] -= g_dc_q_ch2;
-            }
-
-            // Apply window function
-            apply_window(fft_in_ch1.data(), FFT_SIZE, g_window);
-            apply_window(fft_in_ch2.data(), FFT_SIZE, g_window);
-
-            // Compute FFTs
-            compute_fft(fft_in_ch1.data(), fft_out_ch1.data(), fft_plan_ch1);
-            compute_fft(fft_in_ch2.data(), fft_out_ch2.data(), fft_plan_ch2);
-
-            // Compute magnitudes
-            uint8_t ch1_mag[FFT_SIZE], ch2_mag[FFT_SIZE];
-            compute_magnitude_db(fft_out_ch1.data(), ch1_mag, FFT_SIZE);
-            compute_magnitude_db(fft_out_ch2.data(), ch2_mag, FFT_SIZE);
-
-            // Apply overlap-add averaging (50% blend with previous FFT)
-            if (has_prev_fft) {
-                for (size_t i = 0; i < FFT_SIZE; i++) {
-                    ch1_mag[i] = (ch1_mag[i] + prev_magnitude_ch1[i]) / 2;
-                    ch2_mag[i] = (ch2_mag[i] + prev_magnitude_ch2[i]) / 2;
-                }
-            }
-            // Store current magnitudes for next iteration
-            std::memcpy(prev_magnitude_ch1.data(), ch1_mag, FFT_SIZE);
-            std::memcpy(prev_magnitude_ch2.data(), ch2_mag, FFT_SIZE);
-            has_prev_fft = true;
 
             // Apply time-domain averaging
             apply_averaging(ch1_mag, ch2_mag, FFT_SIZE, g_averaging_frames,
@@ -493,6 +410,9 @@ int main(int argc, char *argv[]) {
                 g_gain_rx2.store(gain_rx2);
                 g_params_changed.store(true);
             }
+
+            // Update noise floor estimation (15th percentile, 0.1 smoothing factor)
+            update_noise_floor(g_noise_floor, ch1_mag, ch2_mag, FFT_SIZE, 15.0f, 0.1f);
 
             // Remove DC offset spike/dip at center frequency
             remove_dc_offset(ch1_mag, FFT_SIZE);
@@ -540,13 +460,18 @@ int main(int argc, char *argv[]) {
             const size_t bin_end = (df_start == 0 && df_end == 0) ? FFT_SIZE - 1 : std::min(static_cast<size_t>(df_end), static_cast<size_t>(FFT_SIZE - 1));
             const size_t bin_count = bin_end - bin_start + 1;
 
-            // Perform complete direction finding analysis
+            // Get current noise floor estimates for improved CFAR and SNR
+            float nf_ch1, nf_ch2;
+            get_noise_floor(g_noise_floor, nf_ch1, nf_ch2);
+
+            // Perform complete direction finding analysis with dynamic noise floor
             DFResult df_result = compute_direction_finding(
                 fft_out_ch1.data(), fft_out_ch2.data(),
                 ch1_mag, ch2_mag,
                 FFT_SIZE, bin_start, bin_end,
                 g_center_freq.load(),
-                g_last_valid_doa
+                g_last_valid_doa,
+                nf_ch1, nf_ch2
             );
 
             // Debug output every 60 frames
@@ -592,45 +517,24 @@ int main(int argc, char *argv[]) {
             {
                 std::lock_guard<std::mutex> lock(g_scanner.mutex);
                 if (g_scanner.active) {
-                    // Detect signals in current FFT data
-                    // Find peak power in spectrum
-                    uint8_t peak_mag = 0;
-                    size_t peak_bin = 0;
-                    for (size_t i = 0; i < FFT_SIZE; i++) {
-                        if (ch1_mag[i] > peak_mag) {
-                            peak_mag = ch1_mag[i];
-                            peak_bin = i;
-                        }
-                    }
-
-                    // Convert 8-bit magnitude to approximate dBm
-                    // Assuming 0-255 maps to roughly -120 to 0 dBm range
-                    const float power_dbm = (peak_mag / 255.0f) * 120.0f - 120.0f;
+                    // Analyze spectrum to extract signal characteristics
+                    SignalCharacteristics signal = analyze_spectrum(
+                        ch1_mag,
+                        FFT_SIZE,
+                        g_center_freq.load(),
+                        g_sample_rate.load()
+                    );
 
                     // If above threshold, add or update signal
-                    if (power_dbm > g_scanner.threshold_dbm) {
-                        // Calculate signal frequency (peak bin relative to center)
-                        const uint64_t current_freq = g_center_freq.load();
-                        const uint32_t sample_rate = g_sample_rate.load();
-                        const int64_t bin_offset = static_cast<int64_t>(peak_bin) - static_cast<int64_t>(FFT_SIZE / 2);
-                        const uint64_t signal_freq = current_freq + (bin_offset * sample_rate / FFT_SIZE);
-
-                        // Estimate bandwidth (count bins above threshold - 6dB)
-                        const uint8_t bw_threshold = peak_mag > 12 ? peak_mag - 12 : 0;
-                        size_t bw_bins = 0;
-                        for (size_t i = 0; i < FFT_SIZE; i++) {
-                            if (ch1_mag[i] >= bw_threshold) bw_bins++;
-                        }
-                        const float bandwidth_hz = (bw_bins * sample_rate) / static_cast<float>(FFT_SIZE);
-
+                    if (signal.power_dbm > g_scanner.threshold_dbm) {
                         // Check if signal already exists (within 1 MHz tolerance)
                         bool found = false;
                         const int64_t tolerance = 1000000; // 1 MHz
                         for (auto& sig : g_scanner.signals) {
-                            if (std::abs(static_cast<int64_t>(sig.frequency) - static_cast<int64_t>(signal_freq)) < tolerance) {
+                            if (std::abs(static_cast<int64_t>(sig.frequency) - static_cast<int64_t>(signal.frequency)) < tolerance) {
                                 // Update existing signal
-                                sig.power_dbm = std::max(sig.power_dbm, power_dbm);
-                                sig.bandwidth_hz = std::max(sig.bandwidth_hz, bandwidth_hz);
+                                sig.power_dbm = std::max(sig.power_dbm, signal.power_dbm);
+                                sig.bandwidth_hz = std::max(sig.bandwidth_hz, signal.bandwidth_hz);
                                 sig.last_seen = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::system_clock::now().time_since_epoch()).count();
                                 sig.hit_count++;
@@ -642,9 +546,9 @@ int main(int argc, char *argv[]) {
                         // Add new signal if not found
                         if (!found && g_scanner.signals.size() < 1000) { // Limit to 1000 signals
                             DetectedSignal new_sig;
-                            new_sig.frequency = signal_freq;
-                            new_sig.power_dbm = power_dbm;
-                            new_sig.bandwidth_hz = bandwidth_hz;
+                            new_sig.frequency = signal.frequency;
+                            new_sig.power_dbm = signal.power_dbm;
+                            new_sig.bandwidth_hz = signal.bandwidth_hz;
                             const uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch()).count();
                             new_sig.first_seen = now_ms;

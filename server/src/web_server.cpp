@@ -4,6 +4,7 @@
 
 #include "web_server.h"
 #include "bladerf_sensor.h"
+#include "signal_processing.h"
 #include "recording.h"
 #include <iostream>
 #include <sstream>
@@ -80,6 +81,7 @@ extern std::atomic<uint32_t> g_gain_rx1;
 extern std::atomic<uint32_t> g_gain_rx2;
 extern std::atomic<bool> g_params_changed;
 extern std::mutex g_config_mutex;
+extern NoiseFloorState g_noise_floor;
 
 // Direction finding bin range selection
 extern std::atomic<uint32_t> g_df_start_bin;
@@ -11973,14 +11975,21 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         // Serve status JSON
         else if (mg_strcmp(hm->uri, mg_str("/status")) == 0) {
-            char json[256];
+            char json[384];
+
+            // Get noise floor values (0-255 scale)
+            float nf_ch1, nf_ch2;
+            get_noise_floor(g_noise_floor, nf_ch1, nf_ch2);
+
             snprintf(json, sizeof(json),
-                    "{\"freq\":%llu,\"sr\":%u,\"bw\":%u,\"g1\":%u,\"g2\":%u}",
+                    "{\"freq\":%llu,\"sr\":%u,\"bw\":%u,\"g1\":%u,\"g2\":%u,\"nf1\":%.1f,\"nf2\":%.1f}",
                     (unsigned long long)g_center_freq.load(),
                     g_sample_rate.load(),
                     g_bandwidth.load(),
                     g_gain_rx1.load(),
-                    g_gain_rx2.load());
+                    g_gain_rx2.load(),
+                    nf_ch1,
+                    nf_ch2);
             mg_http_reply(c, 200,
                 "Content-Type: application/json\r\n",
                 "%s", json);

@@ -35,9 +35,22 @@ float compute_cfar_threshold(const uint8_t* magnitude, size_t bin_idx, size_t ff
                              const CFARParams& params, size_t dc_exclusion_start,
                              size_t dc_exclusion_end);
 
+// Compute CFAR threshold using global noise floor estimate
+// noise_floor: Global noise floor estimate (0-255 scale), use < 0 to disable
+float compute_cfar_threshold_with_floor(const uint8_t* magnitude, size_t bin_idx, size_t fft_size,
+                                        const CFARParams& params, size_t dc_exclusion_start,
+                                        size_t dc_exclusion_end, float noise_floor);
+
 // Detect signal regions using CA-CFAR with bandwidth integration
 std::vector<SignalRegion> detect_signals_cfar(const uint8_t* ch1_mag, const uint8_t* ch2_mag,
                                                size_t fft_size, const CFARParams& params,
                                                size_t bin_start, size_t bin_end);
+
+// Detect signal regions using CA-CFAR with dynamic noise floor
+// noise_floor_ch1, noise_floor_ch2: Global noise floor estimates (0-255 scale), use < 0 to disable
+std::vector<SignalRegion> detect_signals_cfar_with_floor(const uint8_t* ch1_mag, const uint8_t* ch2_mag,
+                                                          size_t fft_size, const CFARParams& params,
+                                                          size_t bin_start, size_t bin_end,
+                                                          float noise_floor_ch1, float noise_floor_ch2);
 
 #endif // CFAR_DETECTOR_H

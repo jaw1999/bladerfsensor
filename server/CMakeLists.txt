@@ -28,6 +28,7 @@ set(SOURCES
     src/df_processing.cpp
     src/recording.cpp
     src/config_validation.cpp
+    src/scanner.cpp
 )
 
 # Optional: Add mongoose support

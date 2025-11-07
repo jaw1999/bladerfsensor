@@ -50,6 +50,7 @@ struct LastValidDoA {
 //   bin_start, bin_end: Frequency range to process (0 = full spectrum)
 //   center_freq: Current center frequency in Hz (for calibration)
 //   last_valid: Last valid DoA state (for bearing hold logic)
+//   noise_floor_ch1, noise_floor_ch2: Optional noise floor estimates (< 0 to disable)
 // Returns: DFResult with azimuth, confidence, and quality metrics
 DFResult compute_direction_finding(
     const fftwf_complex* fft_out_ch1,
@@ -60,7 +61,9 @@ DFResult compute_direction_finding(
     size_t bin_start,
     size_t bin_end,
     uint64_t center_freq,
-    LastValidDoA& last_valid
+    LastValidDoA& last_valid,
+    float noise_floor_ch1 = -1.0f,
+    float noise_floor_ch2 = -1.0f
 );
 
 #endif // DF_PROCESSING_H

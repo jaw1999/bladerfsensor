@@ -12,7 +12,9 @@ DFResult compute_direction_finding(
     size_t bin_start,
     size_t bin_end,
     uint64_t center_freq,
-    LastValidDoA& last_valid
+    LastValidDoA& last_valid,
+    float noise_floor_ch1,
+    float noise_floor_ch2
 ) {
     // Detect selection changes and reset bearing hold
     if (last_valid.has_valid &&
@@ -27,9 +29,16 @@ DFResult compute_direction_finding(
     // ===== CA-CFAR SIGNAL DETECTION =====
     // Use bandwidth-integrated CFAR to detect real signals, reject noise spikes and DC
 
-    // Detect signal regions using CFAR
-    std::vector<SignalRegion> detected_signals = detect_signals_cfar(ch1_mag, ch2_mag, fft_size,
-                                                                      DEFAULT_CFAR, bin_start, bin_end);
+    // Detect signal regions using CFAR with dynamic noise floor if available
+    std::vector<SignalRegion> detected_signals;
+    if (noise_floor_ch1 >= 0.0f && noise_floor_ch2 >= 0.0f) {
+        detected_signals = detect_signals_cfar_with_floor(ch1_mag, ch2_mag, fft_size,
+                                                          DEFAULT_CFAR, bin_start, bin_end,
+                                                          noise_floor_ch1, noise_floor_ch2);
+    } else {
+        detected_signals = detect_signals_cfar(ch1_mag, ch2_mag, fft_size,
+                                              DEFAULT_CFAR, bin_start, bin_end);
+    }
 
     // Collect all bins from detected signal regions with their phase differences
     std::vector<BinInfo> strong_bins;
@@ -148,7 +157,6 @@ DFResult compute_direction_finding(
     // Use the average power of strong signal bins vs noise floor
     float signal_power = 0.0f;
     float noise_power = 0.0f;
-    size_t noise_bin_count = 0;
 
     if (strong_bins.size() >= min_bins_for_df) {
         // Calculate average signal power from strong bins
@@ -160,20 +168,32 @@ DFResult compute_direction_finding(
         }
         signal_power /= strong_bins.size();
 
-        // Estimate noise floor from bins below mean (noise reference)
-        // Only use bins within selected range for fair comparison
-        for (size_t i = bin_start; i <= bin_end; i++) {
-            const uint8_t avg_mag = (ch1_mag[i] + ch2_mag[i]) / 2;
-            if (avg_mag <= mean_mag) {  // Use bins at or below mean as noise reference
-                const float real1 = fft_out_ch1[i][0];
-                const float imag1 = fft_out_ch1[i][1];
-                noise_power += (real1 * real1 + imag1 * imag1);
-                noise_bin_count++;
+        // Use dynamic noise floor if available, otherwise estimate locally
+        if (noise_floor_ch1 >= 0.0f && noise_floor_ch2 >= 0.0f) {
+            // Convert noise floor from 0-255 magnitude scale to power
+            // Magnitude scale: 0-255 represents -120 to 0 dBm (120 dB range)
+            // noise_mag = 0-255, convert to linear power
+            const float avg_noise_mag = (noise_floor_ch1 + noise_floor_ch2) / 2.0f;
+            // Approximate conversion: magnitude relates to power logarithmically
+            // Use empirical scaling based on FFT output characteristics
+            const float noise_scale = 1e-6f;  // Scaling factor for FFT power units
+            noise_power = noise_scale * avg_noise_mag * avg_noise_mag;
+        } else {
+            // Fallback: Estimate noise floor from bins below mean (noise reference)
+            size_t noise_bin_count = 0;
+            for (size_t i = bin_start; i <= bin_end; i++) {
+                const uint8_t avg_mag = (ch1_mag[i] + ch2_mag[i]) / 2;
+                if (avg_mag <= mean_mag) {  // Use bins at or below mean as noise reference
+                    const float real1 = fft_out_ch1[i][0];
+                    const float imag1 = fft_out_ch1[i][1];
+                    noise_power += (real1 * real1 + imag1 * imag1);
+                    noise_bin_count++;
+                }
             }
-        }
 
-        if (noise_bin_count > 0) {
-            noise_power /= noise_bin_count;
+            if (noise_bin_count > 0) {
+                noise_power /= noise_bin_count;
+            }
         }
     }
 

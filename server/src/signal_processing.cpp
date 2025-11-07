@@ -1,6 +1,7 @@
 #include "signal_processing.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <iomanip>
 
@@ -279,4 +280,208 @@ void update_agc(AGCState& agc, const uint8_t* ch1_mag, const uint8_t* ch2_mag, s
     else {
         agc.hysteresis_counter = 0;
     }
+}
+
+void init_noise_floor(NoiseFloorState& nf, size_t fft_size) {
+    nf.noise_floor_ch1 = 0.0f;
+    nf.noise_floor_ch2 = 0.0f;
+    nf.smoothed_floor_ch1 = 0.0f;
+    nf.smoothed_floor_ch2 = 0.0f;
+    nf.sorted_buffer.resize(fft_size);
+    nf.update_counter = 0;
+    nf.initialized = false;
+}
+
+void update_noise_floor(NoiseFloorState& nf, const uint8_t* ch1_mag, const uint8_t* ch2_mag,
+                       size_t len, float percentile, float alpha) {
+    // Update every 10 frames to reduce CPU load
+    nf.update_counter++;
+    if (nf.update_counter < 10) {
+        return;
+    }
+    nf.update_counter = 0;
+
+    // Calculate noise floor for CH1 using percentile method
+    // Copy magnitude data to temporary buffer for sorting
+    nf.sorted_buffer.resize(len);
+    std::copy(ch1_mag, ch1_mag + len, nf.sorted_buffer.begin());
+
+    // Sort to find percentile
+    std::sort(nf.sorted_buffer.begin(), nf.sorted_buffer.end());
+
+    // Get percentile value (e.g., 15th percentile)
+    const size_t percentile_idx = static_cast<size_t>(len * percentile / 100.0f);
+    nf.noise_floor_ch1 = static_cast<float>(nf.sorted_buffer[percentile_idx]);
+
+    // Calculate noise floor for CH2
+    std::copy(ch2_mag, ch2_mag + len, nf.sorted_buffer.begin());
+    std::sort(nf.sorted_buffer.begin(), nf.sorted_buffer.end());
+    nf.noise_floor_ch2 = static_cast<float>(nf.sorted_buffer[percentile_idx]);
+
+    // Apply temporal smoothing (exponential moving average)
+    if (!nf.initialized) {
+        // First time - initialize without smoothing
+        nf.smoothed_floor_ch1 = nf.noise_floor_ch1;
+        nf.smoothed_floor_ch2 = nf.noise_floor_ch2;
+        nf.initialized = true;
+    } else {
+        // EWMA: smoothed = alpha * new + (1-alpha) * smoothed
+        nf.smoothed_floor_ch1 = alpha * nf.noise_floor_ch1 + (1.0f - alpha) * nf.smoothed_floor_ch1;
+        nf.smoothed_floor_ch2 = alpha * nf.noise_floor_ch2 + (1.0f - alpha) * nf.smoothed_floor_ch2;
+    }
+}
+
+void get_noise_floor(const NoiseFloorState& nf, float& ch1_floor, float& ch2_floor) {
+    ch1_floor = nf.smoothed_floor_ch1;
+    ch2_floor = nf.smoothed_floor_ch2;
+}
+
+void init_dc_offset(DCOffsetState& dc) {
+    dc.dc_i_ch1 = 0.0f;
+    dc.dc_q_ch1 = 0.0f;
+    dc.dc_i_ch2 = 0.0f;
+    dc.dc_q_ch2 = 0.0f;
+    dc.last_freq = 0;
+    dc.convergence_counter = 0;
+}
+
+void init_overlap(OverlapState& overlap, size_t fft_size) {
+    const size_t overlap_size = fft_size / 2;
+    overlap.overlap_buf_ch1.resize(overlap_size * 2);  // * 2 for I/Q pairs
+    overlap.overlap_buf_ch2.resize(overlap_size * 2);  // * 2 for I/Q pairs
+    overlap.prev_magnitude_ch1.resize(fft_size);
+    overlap.prev_magnitude_ch2.resize(fft_size);
+    overlap.has_prev_fft = false;
+}
+
+IQProcessingResult process_iq_to_fft(
+    const int16_t* iq_buffer,
+    size_t buffer_size,
+    size_t fft_size,
+    uint64_t current_freq,
+    fftwf_complex* fft_in_ch1,
+    fftwf_complex* fft_in_ch2,
+    fftwf_complex* fft_out_ch1,
+    fftwf_complex* fft_out_ch2,
+    uint8_t* ch1_mag,
+    uint8_t* ch2_mag,
+    DCOffsetState& dc_state,
+    OverlapState& overlap_state,
+    const std::vector<float>& window,
+    fftwf_plan plan_ch1,
+    fftwf_plan plan_ch2
+) {
+    IQProcessingResult result = {0, false};
+
+    // ===== OVERLAP-ADD PROCESSING (50% overlap for smoother spectrum) =====
+    const size_t OVERLAP_SIZE = fft_size / 2;
+    const size_t new_samples = std::min(buffer_size / 2, OVERLAP_SIZE);
+    constexpr float scale = 1.0f / 32768.0f;
+
+    int16_t peak_sample = 0;
+
+    // Copy previous second half to first half (overlap)
+    // overlap_buf stores interleaved I/Q pairs as floats, cast to fftwf_complex (float[2])
+    memcpy(fft_in_ch1, overlap_state.overlap_buf_ch1.data(), OVERLAP_SIZE * 2 * sizeof(float));
+    memcpy(fft_in_ch2, overlap_state.overlap_buf_ch2.data(), OVERLAP_SIZE * 2 * sizeof(float));
+
+    // Deinterleave new samples into second half
+    for (size_t i = 0; i < new_samples; i++) {
+        const size_t idx = i * 4;
+        const size_t buf_idx = OVERLAP_SIZE + i;
+
+        // Track peak ADC values
+        if (std::abs(iq_buffer[idx + 0]) > std::abs(peak_sample))
+            peak_sample = iq_buffer[idx + 0];
+        if (std::abs(iq_buffer[idx + 1]) > std::abs(peak_sample))
+            peak_sample = iq_buffer[idx + 1];
+
+        fft_in_ch1[buf_idx][0] = static_cast<float>(iq_buffer[idx + 0]) * scale;
+        fft_in_ch1[buf_idx][1] = static_cast<float>(iq_buffer[idx + 1]) * scale;
+        fft_in_ch2[buf_idx][0] = static_cast<float>(iq_buffer[idx + 2]) * scale;
+        fft_in_ch2[buf_idx][1] = static_cast<float>(iq_buffer[idx + 3]) * scale;
+    }
+
+    result.peak_sample = peak_sample;
+
+    // Save current second half for next iteration
+    memcpy(overlap_state.overlap_buf_ch1.data(), fft_in_ch1 + OVERLAP_SIZE, OVERLAP_SIZE * 2 * sizeof(float));
+    memcpy(overlap_state.overlap_buf_ch2.data(), fft_in_ch2 + OVERLAP_SIZE, OVERLAP_SIZE * 2 * sizeof(float));
+
+    // Zero-pad if needed
+    if (new_samples < OVERLAP_SIZE) {
+        memset(fft_in_ch1 + OVERLAP_SIZE + new_samples, 0,
+               (OVERLAP_SIZE - new_samples) * 2 * sizeof(float));
+        memset(fft_in_ch2 + OVERLAP_SIZE + new_samples, 0,
+               (OVERLAP_SIZE - new_samples) * 2 * sizeof(float));
+    }
+
+    // Remove DC offset from IQ samples using EWMA
+    if (current_freq != dc_state.last_freq) {
+        dc_state.last_freq = current_freq;
+        dc_state.convergence_counter = 0;
+        dc_state.dc_i_ch1 = 0.0f;
+        dc_state.dc_q_ch1 = 0.0f;
+        dc_state.dc_i_ch2 = 0.0f;
+        dc_state.dc_q_ch2 = 0.0f;
+        overlap_state.has_prev_fft = false;  // Reset overlap-add on frequency change
+        result.freq_changed = true;
+    }
+
+    float dc_i_ch1 = 0.0f, dc_q_ch1 = 0.0f;
+    float dc_i_ch2 = 0.0f, dc_q_ch2 = 0.0f;
+
+    for (size_t i = 0; i < fft_size; i++) {
+        dc_i_ch1 += fft_in_ch1[i][0];
+        dc_q_ch1 += fft_in_ch1[i][1];
+        dc_i_ch2 += fft_in_ch2[i][0];
+        dc_q_ch2 += fft_in_ch2[i][1];
+    }
+
+    dc_i_ch1 /= fft_size;
+    dc_q_ch1 /= fft_size;
+    dc_i_ch2 /= fft_size;
+    dc_q_ch2 /= fft_size;
+
+    float alpha = (dc_state.convergence_counter < 20) ? 0.5f : 0.1f;
+    dc_state.convergence_counter++;
+
+    dc_state.dc_i_ch1 = alpha * dc_i_ch1 + (1.0f - alpha) * dc_state.dc_i_ch1;
+    dc_state.dc_q_ch1 = alpha * dc_q_ch1 + (1.0f - alpha) * dc_state.dc_q_ch1;
+    dc_state.dc_i_ch2 = alpha * dc_i_ch2 + (1.0f - alpha) * dc_state.dc_i_ch2;
+    dc_state.dc_q_ch2 = alpha * dc_q_ch2 + (1.0f - alpha) * dc_state.dc_q_ch2;
+
+    for (size_t i = 0; i < fft_size; i++) {
+        fft_in_ch1[i][0] -= dc_state.dc_i_ch1;
+        fft_in_ch1[i][1] -= dc_state.dc_q_ch1;
+        fft_in_ch2[i][0] -= dc_state.dc_i_ch2;
+        fft_in_ch2[i][1] -= dc_state.dc_q_ch2;
+    }
+
+    // Apply window function
+    apply_window(fft_in_ch1, fft_size, window);
+    apply_window(fft_in_ch2, fft_size, window);
+
+    // Compute FFTs
+    compute_fft(fft_in_ch1, fft_out_ch1, plan_ch1);
+    compute_fft(fft_in_ch2, fft_out_ch2, plan_ch2);
+
+    // Compute magnitudes
+    compute_magnitude_db(fft_out_ch1, ch1_mag, fft_size);
+    compute_magnitude_db(fft_out_ch2, ch2_mag, fft_size);
+
+    // Apply overlap-add averaging (50% blend with previous FFT)
+    if (overlap_state.has_prev_fft) {
+        for (size_t i = 0; i < fft_size; i++) {
+            ch1_mag[i] = (ch1_mag[i] + overlap_state.prev_magnitude_ch1[i]) / 2;
+            ch2_mag[i] = (ch2_mag[i] + overlap_state.prev_magnitude_ch2[i]) / 2;
+        }
+    }
+
+    // Store current magnitudes for next iteration
+    memcpy(overlap_state.prev_magnitude_ch1.data(), ch1_mag, fft_size);
+    memcpy(overlap_state.prev_magnitude_ch2.data(), ch2_mag, fft_size);
+    overlap_state.has_prev_fft = true;
+
+    return result;
 }

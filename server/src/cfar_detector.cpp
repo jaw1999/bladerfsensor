@@ -38,15 +38,18 @@ float compute_cfar_threshold(const uint8_t* magnitude, size_t bin_idx, size_t ff
 
     if (noise_count == 0) return 255.0f;  // No valid training cells
 
-    // Average noise level
+    // Average noise level (in uint8_t scale)
     const float noise_level = noise_sum / noise_count;
 
-    // Convert threshold from dB to uint8_t scale
-    // Magnitudes are already in dB scale: 0-255 represents 120 dB range
-    // So 1 dB = 255/120 = 2.125 uint8_t units
-    // threshold_db represents additional dB above noise floor
-    constexpr float DB_TO_UINT8 = 255.0f / 120.0f;  // 2.125
-    const float threshold = noise_level + params.threshold_db * DB_TO_UINT8;
+    // Convert noise level from uint8_t scale to dB
+    // Magnitudes are in uint8_t scale: 0-255 represents 120 dB range (-100 to +20 dBFS)
+    const float noise_db = (noise_level / 255.0f) * 120.0f - 100.0f;
+
+    // Add threshold in dB
+    const float threshold_db = noise_db + params.threshold_db;
+
+    // Convert back to uint8_t scale
+    const float threshold = (threshold_db + 100.0f) * (255.0f / 120.0f);
 
     return threshold;
 }
@@ -150,8 +153,11 @@ float compute_cfar_threshold_with_floor(const uint8_t* magnitude, size_t bin_idx
 
     // Blend global noise floor with local estimate (70% global, 30% local)
     // This maintains CFAR's adaptability while stabilizing against local variations
-    constexpr float DB_TO_UINT8 = 255.0f / 120.0f;  // 2.125
-    const float global_threshold = noise_floor + params.threshold_db * DB_TO_UINT8;
+
+    // Convert global noise floor from uint8_t scale to dB and add threshold
+    const float noise_floor_db = (noise_floor / 255.0f) * 120.0f - 100.0f;
+    const float global_threshold_db = noise_floor_db + params.threshold_db;
+    const float global_threshold = (global_threshold_db + 100.0f) * (255.0f / 120.0f);
 
     return 0.7f * global_threshold + 0.3f * local_threshold;
 }

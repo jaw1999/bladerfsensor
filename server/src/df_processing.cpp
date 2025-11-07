@@ -2,6 +2,89 @@
 #include "array_calibration.h"
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+
+// Helper function: Get current time in milliseconds
+static uint64_t get_time_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+// Kalman filter prediction step
+static void kalman_predict(KalmanState& state, float dt) {
+    // State transition: x(k) = x(k-1) + velocity * dt
+    state.azimuth += state.velocity * dt;
+
+    // Normalize azimuth to [0, 360)
+    state.azimuth = std::fmod(state.azimuth + 360.0f, 360.0f);
+
+    // Process noise covariance
+    const float process_noise_azimuth = 0.5f;  // degrees^2
+    const float process_noise_velocity = 0.1f; // (degrees/sec)^2
+
+    // Update error covariance: P = F*P*F' + Q
+    // State transition matrix F = [[1, dt], [0, 1]]
+    float P00 = state.P[0][0] + 2.0f * dt * state.P[0][1] + dt * dt * state.P[1][1] + process_noise_azimuth;
+    float P01 = state.P[0][1] + dt * state.P[1][1];
+    float P10 = P01;  // Symmetric
+    float P11 = state.P[1][1] + process_noise_velocity;
+
+    state.P[0][0] = P00;
+    state.P[0][1] = P01;
+    state.P[1][0] = P10;
+    state.P[1][1] = P11;
+}
+
+// Kalman filter update step
+static void kalman_update(KalmanState& state, float measurement, float measurement_variance) {
+    // Measurement model: z = H * x, where H = [1, 0] (we measure azimuth)
+    // Innovation (measurement residual)
+    float innovation = measurement - state.azimuth;
+
+    // Handle wraparound: find shortest angular distance
+    if (innovation > 180.0f) innovation -= 360.0f;
+    if (innovation < -180.0f) innovation += 360.0f;
+
+    // Innovation covariance: S = H*P*H' + R
+    float S = state.P[0][0] + measurement_variance;
+
+    // Kalman gain: K = P*H' * inv(S)
+    float K0 = state.P[0][0] / S;
+    float K1 = state.P[1][0] / S;
+
+    // Update state estimate: x = x + K * innovation
+    state.azimuth += K0 * innovation;
+    state.velocity += K1 * innovation;
+
+    // Normalize azimuth to [0, 360)
+    state.azimuth = std::fmod(state.azimuth + 360.0f, 360.0f);
+
+    // Update error covariance: P = (I - K*H) * P
+    float P00 = (1.0f - K0) * state.P[0][0];
+    float P01 = (1.0f - K0) * state.P[0][1];
+    float P10 = state.P[1][0] - K1 * state.P[0][0];
+    float P11 = state.P[1][1] - K1 * state.P[0][1];
+
+    state.P[0][0] = P00;
+    state.P[0][1] = P01;
+    state.P[1][0] = P10;
+    state.P[1][1] = P11;
+}
+
+// Initialize Kalman filter with first measurement
+static void kalman_initialize(KalmanState& state, float initial_azimuth, float initial_variance) {
+    state.azimuth = initial_azimuth;
+    state.velocity = 0.0f;
+
+    // Initial error covariance
+    state.P[0][0] = initial_variance;
+    state.P[0][1] = 0.0f;
+    state.P[1][0] = 0.0f;
+    state.P[1][1] = 10.0f;  // Initial velocity uncertainty
+
+    state.initialized = true;
+    state.last_update_ms = get_time_ms();
+}
 
 DFResult compute_direction_finding(
     const fftwf_complex* fft_out_ch1,
@@ -46,10 +129,10 @@ DFResult compute_direction_finding(
 
     for (const auto& signal : detected_signals) {
         // For each detected signal region, extract phase information from all bins
-        for (size_t i = signal.start_bin; i <= signal.end_bin; i++) {
-            // Average magnitude from both channels
-            const float avg_mag = (ch1_mag[i] + ch2_mag[i]) / 2.0f;
+        std::vector<float> raw_phase_diffs;
+        raw_phase_diffs.reserve(signal.end_bin - signal.start_bin + 1);
 
+        for (size_t i = signal.start_bin; i <= signal.end_bin; i++) {
             // Compute phase from FFT output (frequency domain)
             const float phase1 = atan2f(fft_out_ch1[i][1], fft_out_ch1[i][0]);
             const float phase2 = atan2f(fft_out_ch2[i][1], fft_out_ch2[i][0]);
@@ -57,11 +140,39 @@ DFResult compute_direction_finding(
             // Phase difference (CH2 - CH1)
             float diff = phase2 - phase1;
 
-            // Wrap to [-π, π] to handle 2π ambiguity
+            // Initial wrap to [-π, π]
             while (diff > M_PI) diff -= 2.0f * M_PI;
             while (diff < -M_PI) diff += 2.0f * M_PI;
 
-            strong_bins.push_back({i, avg_mag, diff});
+            raw_phase_diffs.push_back(diff);
+        }
+
+        // Phase unwrapping for wideband signals (Itoh's method)
+        // Corrects phase jumps across frequency bins for signals wider than one wavelength
+        if (raw_phase_diffs.size() > 1) {
+            for (size_t j = 1; j < raw_phase_diffs.size(); j++) {
+                float phase_jump = raw_phase_diffs[j] - raw_phase_diffs[j-1];
+
+                // Detect and correct 2π jumps
+                if (phase_jump > M_PI) {
+                    // Positive jump - unwrap by subtracting 2π
+                    for (size_t k = j; k < raw_phase_diffs.size(); k++) {
+                        raw_phase_diffs[k] -= 2.0f * M_PI;
+                    }
+                } else if (phase_jump < -M_PI) {
+                    // Negative jump - unwrap by adding 2π
+                    for (size_t k = j; k < raw_phase_diffs.size(); k++) {
+                        raw_phase_diffs[k] += 2.0f * M_PI;
+                    }
+                }
+            }
+        }
+
+        // Store unwrapped phases with magnitude weighting
+        for (size_t j = 0; j < raw_phase_diffs.size(); j++) {
+            size_t i = signal.start_bin + j;
+            const float avg_mag = (ch1_mag[i] + ch2_mag[i]) / 2.0f;
+            strong_bins.push_back({i, avg_mag, raw_phase_diffs[j]});
         }
     }
 
@@ -103,17 +214,27 @@ DFResult compute_direction_finding(
         avg_phase_diff_deg += phase_correction;
         avg_phase_diff_rad = avg_phase_diff_deg * M_PI / 180.0f;
 
-        // Calculate weighted standard deviation (measure of phase coherence)
-        float variance = 0.0f;
+        // Calculate weighted standard deviation using Welford's algorithm (numerically stable)
+        float M = 0.0f;  // Running mean
+        float S = 0.0f;  // Running sum of squared differences
+        float W = 0.0f;  // Running sum of weights
+
         for (const auto& bin : strong_bins) {
             float diff = bin.phase_diff - avg_phase_diff_rad;
-            // Handle phase wrapping in variance calculation
+            // Handle phase wrapping
             while (diff > M_PI) diff -= 2.0f * M_PI;
             while (diff < -M_PI) diff += 2.0f * M_PI;
+
             const float weight = bin.magnitude;
-            variance += weight * diff * diff;
+            W += weight;
+
+            // Numerically stable weighted variance update
+            const float delta = diff - M;
+            M += delta * weight / W;
+            S += weight * delta * (diff - M);
         }
-        std_dev_rad = std::sqrt(variance / weight_total);
+
+        std_dev_rad = std::sqrt(S / W);
         std_dev_deg = std_dev_rad * 180.0f / M_PI;
     }
 
@@ -220,8 +341,8 @@ DFResult compute_direction_finding(
     // Calculate coherence metric (exponential decay with std_dev)
     const float coherence = std::exp(-std_dev_deg / 10.0f);
 
-    // Hold last valid result when confidence is too low
-    // This prevents jumping to 0° when signal is weak or noisy
+    // Apply Kalman filter for smooth bearing tracking
+    // This reduces jitter and provides predictive capability
     constexpr float MIN_CONFIDENCE_THRESHOLD = 20.0f;  // Minimum confidence to report new bearing
 
     bool use_current_result = (confidence >= MIN_CONFIDENCE_THRESHOLD &&
@@ -236,11 +357,39 @@ DFResult compute_direction_finding(
     float final_coherence = coherence;
     bool is_holding = false;
 
+    // Get current time for Kalman filter
+    uint64_t current_time_ms = get_time_ms();
+
     if (use_current_result) {
+        // Measurement variance based on phase standard deviation
+        // Lower std_dev = more confident measurement
+        float measurement_variance = std::max(1.0f, std_dev_deg * std_dev_deg);
+
+        if (!last_valid.kalman.initialized) {
+            // Initialize Kalman filter with first good measurement
+            kalman_initialize(last_valid.kalman, azimuth_norm, measurement_variance);
+            final_azimuth = azimuth_norm;
+        } else {
+            // Kalman filter predict + update
+            float dt = (current_time_ms - last_valid.kalman.last_update_ms) / 1000.0f; // Convert to seconds
+            dt = std::max(0.001f, std::min(dt, 1.0f));  // Clamp to reasonable range
+
+            kalman_predict(last_valid.kalman, dt);
+            kalman_update(last_valid.kalman, azimuth_norm, measurement_variance);
+
+            // Use Kalman filtered azimuth
+            final_azimuth = last_valid.kalman.azimuth;
+
+            // Update back azimuth to maintain 180° offset
+            final_back_azimuth = std::fmod(final_azimuth + 180.0f, 360.0f);
+        }
+
+        last_valid.kalman.last_update_ms = current_time_ms;
+
         // Store this as the new valid result
         last_valid.has_valid = true;
-        last_valid.azimuth = azimuth_norm;
-        last_valid.back_azimuth = back_azimuth_norm;
+        last_valid.azimuth = final_azimuth;
+        last_valid.back_azimuth = final_back_azimuth;
         last_valid.phase_diff_deg = avg_phase_diff_deg;
         last_valid.phase_std_deg = std_dev_deg;
         last_valid.confidence = confidence;
@@ -248,13 +397,32 @@ DFResult compute_direction_finding(
         last_valid.coherence = coherence;
         last_valid.last_start_bin = static_cast<uint32_t>(bin_start);
         last_valid.last_end_bin = static_cast<uint32_t>(bin_end);
+
+    } else if (last_valid.has_valid && last_valid.kalman.initialized) {
+        // No good measurement, but we have Kalman state - use prediction only
+        float dt = (current_time_ms - last_valid.kalman.last_update_ms) / 1000.0f;
+        dt = std::max(0.001f, std::min(dt, 1.0f));
+
+        kalman_predict(last_valid.kalman, dt);
+        last_valid.kalman.last_update_ms = current_time_ms;
+
+        // Use predicted azimuth
+        final_azimuth = last_valid.kalman.azimuth;
+        final_back_azimuth = std::fmod(final_azimuth + 180.0f, 360.0f);
+        final_phase_diff = last_valid.phase_diff_deg;
+        final_phase_std = last_valid.phase_std_deg;
+        final_confidence = last_valid.confidence * 0.8f;  // Decay confidence to indicate prediction
+        final_snr = last_valid.snr_db;
+        final_coherence = last_valid.coherence;
+        is_holding = true;
+
     } else if (last_valid.has_valid) {
-        // Use last valid result instead of defaulting to 0
+        // No Kalman state but have last valid - fall back to hold logic
         final_azimuth = last_valid.azimuth;
         final_back_azimuth = last_valid.back_azimuth;
         final_phase_diff = last_valid.phase_diff_deg;
         final_phase_std = last_valid.phase_std_deg;
-        final_confidence = last_valid.confidence * 0.8f;  // Decay confidence slightly to indicate stale
+        final_confidence = last_valid.confidence * 0.8f;
         final_snr = last_valid.snr_db;
         final_coherence = last_valid.coherence;
         is_holding = true;

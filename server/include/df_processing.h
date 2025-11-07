@@ -28,7 +28,16 @@ struct DFResult {
     size_t num_signals;         // Number of CFAR detected signals
 };
 
-// Last valid DoA state (for bearing hold)
+// Kalman filter state for bearing smoothing
+struct KalmanState {
+    float azimuth;           // Estimated azimuth (degrees)
+    float velocity;          // Angular velocity (degrees/sec)
+    float P[2][2];           // Error covariance matrix
+    bool initialized;        // Whether filter has been initialized
+    uint64_t last_update_ms; // Timestamp of last update
+};
+
+// Last valid DoA state (for bearing hold and Kalman filtering)
 struct LastValidDoA {
     bool has_valid;
     float azimuth;
@@ -40,6 +49,7 @@ struct LastValidDoA {
     float coherence;
     uint32_t last_start_bin;  // Track bin range to detect selection changes
     uint32_t last_end_bin;
+    KalmanState kalman;       // Kalman filter state for smoothing
 };
 
 // Perform complete direction finding analysis on FFT data

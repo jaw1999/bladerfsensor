@@ -59,14 +59,19 @@ echo ""
 echo "Creating remote directory..."
 ssh -o ControlPath="$SSH_CONTROL_PATH" "$LATTEPANDA_USER@$LATTEPANDA_IP" "mkdir -p $DEPLOY_DIR/server"
 
-# Copy server files
-echo "Copying server files..."
+# Copy server files and web assets
+echo "Copying server files and web assets..."
 rsync -avz --progress \
     -e "ssh -o ControlPath=$SSH_CONTROL_PATH" \
     --exclude 'build' \
     --exclude '*.o' \
     --exclude '*.a' \
     server/ "$LATTEPANDA_USER@$LATTEPANDA_IP:$DEPLOY_DIR/server/"
+
+echo "Copying web assets..."
+rsync -avz --progress \
+    -e "ssh -o ControlPath=$SSH_CONTROL_PATH" \
+    server/web_assets/ "$LATTEPANDA_USER@$LATTEPANDA_IP:$DEPLOY_DIR/server/web_assets/"
 
 echo ""
 echo "Files copied successfully!"
@@ -123,11 +128,14 @@ echo "=================================="
 echo ""
 echo "To run the server on LattePanda:"
 echo "  ssh $LATTEPANDA_USER@$LATTEPANDA_IP"
-echo "  cd $DEPLOY_DIR/server/build"
-echo "  ./bladerf_server"
+echo "  cd $DEPLOY_DIR"
+echo "  ./server/build/bladerf_server"
 echo ""
 echo "Or run remotely:"
-echo "  ssh $LATTEPANDA_USER@$LATTEPANDA_IP 'cd $DEPLOY_DIR/server/build && ./bladerf_server'"
+echo "  ssh $LATTEPANDA_USER@$LATTEPANDA_IP 'cd $DEPLOY_DIR && ./server/build/bladerf_server'"
+echo ""
+echo "IMPORTANT: Server must be run from $DEPLOY_DIR (project root)"
+echo "           so it can find web_assets/ directory"
 echo ""
 echo "Web interface (once server is running):"
 echo "  Main UI: http://$LATTEPANDA_IP:8080/"

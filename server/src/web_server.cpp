@@ -776,6 +776,18 @@ const char* html_page = R"HTMLDELIM(
             padding: 0;
             margin: 0;
         }
+        #spectrum2 {
+            position: fixed;
+            top: 50px;
+            left: 50px;
+            width: calc(100% - 60px);
+            height: 200px;
+            display: none;
+            box-sizing: border-box;
+            border: none;
+            padding: 0;
+            margin: 0;
+        }
         .display-label {
             position: fixed;
             background: rgba(0, 0, 0, 0.7);
@@ -1256,11 +1268,14 @@ const char* html_page = R"HTMLDELIM(
         <div class="workspace-content active" id="workspace-live">
             <!-- Main Waterfall Display -->
             <canvas id="spectrum"></canvas>
+            <canvas id="spectrum2"></canvas>
             <canvas id="waterfall"></canvas>
             <canvas id="waterfall2"></canvas>
 
             <!-- Display labels -->
             <div id="spectrum-label" class="display-label" style="display: none;">SPECTRUM</div>
+            <div id="spectrum-label-ch1" class="display-label" style="display: none;">RX1 SPECTRUM</div>
+            <div id="spectrum-label-ch2" class="display-label" style="display: none;">RX2 SPECTRUM</div>
             <div id="waterfall-label" class="display-label">WATERFALL</div>
             <div id="waterfall-label-ch1" class="display-label">RX1 WATERFALL</div>
             <div id="waterfall-label-ch2" class="display-label">RX2 WATERFALL</div>
@@ -1773,34 +1788,34 @@ const char* html_page = R"HTMLDELIM(
     </div>
 
     <!-- Global draggable panels (outside workspaces) -->
-    <div id="iq_constellation" class="draggable-panel" style="display: none; top: 100px; right: 20px;">
+    <div id="iq_constellation" class="draggable-panel" style="display: none; top: 100px; right: 20px; width: 450px;">
         <div class="panel-header">
-            <span class="panel-title">IQ Constellation</span>
+            <span class="panel-title">IQ Constellation (Enhanced)</span>
             <div>
                 <span class="panel-detach" onclick="detachPanel('iq_constellation')" title="Detach to floating">&#8599;</span>
                 <span class="panel-close" onclick="toggleIQ()">&times;</span>
             </div>
         </div>
         <div style="padding: 10px;">
-            <canvas id="iq_canvas" width="320" height="300"></canvas>
+            <canvas id="iq_canvas" width="1720" height="1600" style="width: 430px; height: 400px;"></canvas>
         </div>
     </div>
 
-    <div id="xcorr_display" class="draggable-panel" style="display: none; bottom: 20px; left: 100px; width: 650px;">
+    <div id="xcorr_display" class="draggable-panel" style="display: none; bottom: 20px; left: 100px; width: 750px; max-height: 500px;">
         <div class="panel-header">
-            <span class="panel-title">Cross-Correlation Analysis</span>
+            <span class="panel-title">Cross-Correlation Analysis (Enhanced)</span>
             <div>
                 <span class="panel-detach" onclick="detachPanel('xcorr_display')" title="Detach to floating">&#8599;</span>
                 <span class="panel-close" onclick="toggleXCorr()">&times;</span>
             </div>
         </div>
-        <div style="padding: 10px;">
-            <div style="display: flex; gap: 10px; margin-bottom: 8px; font-size: 11px; color: #888;">
-                <div>Coherence: <span id="xcorr_coherence" style="color: #0ff;">--</span></div>
-                <div>Time Delay: <span id="xcorr_delay" style="color: #0ff;">--</span></div>
-                <div>Phase Diff: <span id="xcorr_phase" style="color: #0ff;">--</span></div>
+        <div style="padding: 10px; overflow-y: auto; max-height: 450px;">
+            <div style="display: flex; gap: 15px; margin-bottom: 8px; font-size: 10px; color: #888; flex-wrap: wrap;">
+                <div>Coherence: <span id="xcorr_coherence" style="color: #0f0; font-weight: bold;">--</span></div>
+                <div>Time Delay: <span id="xcorr_delay" style="color: #0ff; font-weight: bold;">--</span></div>
+                <div>Phase Diff: <span id="xcorr_phase" style="color: #fa0; font-weight: bold;">--</span></div>
             </div>
-            <div id="xcorr_canvas_container" style="width: 100%; height: 220px; position: relative;">
+            <div id="xcorr_canvas_container" style="width: 100%; height: 350px; position: relative;">
                 <canvas id="xcorr_canvas" style="width: 100%; height: 100%;"></canvas>
             </div>
         </div>
@@ -2931,6 +2946,8 @@ const char* html_page = R"HTMLDELIM(
         const ctx2 = canvas2.getContext('2d');
         const spectrumCanvas = document.getElementById('spectrum');
         const spectrumCtx = spectrumCanvas.getContext('2d');
+        const spectrumCanvas2 = document.getElementById('spectrum2');
+        const spectrumCtx2 = spectrumCanvas2.getContext('2d');
         const iqCanvas = document.getElementById('iq_canvas');
         const iqCtx = iqCanvas.getContext('2d');
         const xcorrCanvas = document.getElementById('xcorr_canvas');
@@ -2942,6 +2959,11 @@ const char* html_page = R"HTMLDELIM(
         spectrumOffscreen.width = spectrumCanvas.width;
         spectrumOffscreen.height = spectrumCanvas.height;
 
+        const spectrumOffscreen2 = document.createElement('canvas');
+        const spectrumOffscreenCtx2 = spectrumOffscreen2.getContext('2d');
+        spectrumOffscreen2.width = spectrumCanvas2.width;
+        spectrumOffscreen2.height = spectrumCanvas2.height;
+
         const iqOffscreen = document.createElement('canvas');
         const iqOffscreenCtx = iqOffscreen.getContext('2d');
         iqOffscreen.width = iqCanvas.width;
@@ -2950,6 +2972,10 @@ const char* html_page = R"HTMLDELIM(
         const FFT_SIZE = 4096;
         const IQ_SAMPLES = 256;
         let currentChannel = 1;
+
+        // Initialize display modules (loaded from modular JS files)
+        // Note: These will be properly initialized after zoomState is defined below
+        let modulesInitialized = false;
 
         // ===== SETTINGS PERSISTENCE INTEGRATION =====
         // Note: Settings module is loaded from settings.js
@@ -3373,14 +3399,16 @@ const char* html_page = R"HTMLDELIM(
             const chSelect = document.getElementById('channel_select').value;
             const isDualChannel = (chSelect === 'both');
 
-            console.log('resizeCanvas called: channel=' + chSelect + ', isDual=' + isDualChannel);
-
             // Update label visibility
             document.getElementById('waterfall-label').style.display = (!isDualChannel && !showSpectrum) ? 'block' : 'none';
             // Show dual-channel labels whenever dual-channel mode is active, not just when spectrum is on
             document.getElementById('waterfall-label-ch1').style.display = isDualChannel ? 'block' : 'none';
             document.getElementById('waterfall-label-ch2').style.display = isDualChannel ? 'block' : 'none';
-            document.getElementById('spectrum-label').style.display = showSpectrum ? 'block' : 'none';
+
+            // Spectrum labels
+            document.getElementById('spectrum-label').style.display = (showSpectrum && !isDualChannel) ? 'block' : 'none';
+            document.getElementById('spectrum-label-ch1').style.display = (showSpectrum && isDualChannel) ? 'block' : 'none';
+            document.getElementById('spectrum-label-ch2').style.display = (showSpectrum && isDualChannel) ? 'block' : 'none';
 
             if (isDualChannel) {
                 // Dual-channel mode: split screen 50/50
@@ -3416,16 +3444,24 @@ const char* html_page = R"HTMLDELIM(
                 canvas2.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
                 canvas2.style.display = 'block';
 
-                // Position dual-channel labels
+                // Position dual-channel waterfall labels
                 document.getElementById('waterfall-label-ch1').style.left = (50 + halfWidth / 2 - 50) + 'px';
                 document.getElementById('waterfall-label-ch2').style.left = (50 + halfWidth + halfWidth / 2 - 50) + 'px';
+
+                // Position dual-channel spectrum labels
+                if (showSpectrum) {
+                    document.getElementById('spectrum-label-ch1').style.left = (50 + halfWidth / 2 - 60) + 'px';
+                    document.getElementById('spectrum-label-ch1').style.top = '10px';
+                    document.getElementById('spectrum-label-ch2').style.left = (50 + halfWidth + halfWidth / 2 - 60) + 'px';
+                    document.getElementById('spectrum-label-ch2').style.top = '10px';
+                }
 
                 // Show and position channel divider
                 const divider = document.getElementById('channel-divider');
                 divider.style.display = 'block';
                 divider.style.left = (50 + halfWidth) + 'px';
-                divider.style.top = waterfallTop + 'px';
-                divider.style.height = `calc(100% - ${waterfallTop}px - ${waterfallBottom}px)`;
+                divider.style.top = (showSpectrum ? 50 : waterfallTop) + 'px';
+                divider.style.height = `calc(100% - ${showSpectrum ? 50 : waterfallTop}px - ${waterfallBottom}px)`;
 
                 console.log('Canvas1: left=50px, width=' + halfWidth + 'px, buffer=' + canvas.width + 'px');
                 console.log('Canvas2: left=' + (50 + halfWidth) + 'px, width=' + halfWidth + 'px, buffer=' + canvas2.width + 'px, display=' + canvas2.style.display);
@@ -3457,23 +3493,62 @@ const char* html_page = R"HTMLDELIM(
                 console.log('Single-channel: view=' + viewWidth + 'px, buffer=' + canvas.width + 'px');
             }
 
-            // Spectrum and XCorr also benefit from high resolution
-            const specWidth = window.innerWidth - 60;
-            const newSpecWidth = Math.max(specWidth, FFT_SIZE);
+            // Spectrum canvas sizing (handle dual-channel mode)
             const newSpecHeight = 200;
+            const specWidth = window.innerWidth - 60;  // Calculate specWidth for all modes
 
-            // Only resize if dimensions changed
-            if (spectrumCanvas.width !== newSpecWidth || spectrumCanvas.height !== newSpecHeight) {
-                spectrumCanvas.width = newSpecWidth;
-                spectrumCanvas.height = newSpecHeight;
-                // Also resize offscreen canvas for double buffering
-                spectrumOffscreen.width = newSpecWidth;
-                spectrumOffscreen.height = newSpecHeight;
+            if (isDualChannel && showSpectrum) {
+                // Dual spectrum mode: split 50/50 like waterfalls
+                const halfWidth = Math.floor((window.innerWidth - 60) / 2);
+                const newSpecWidth = Math.max(halfWidth, FFT_SIZE);
+
+                // Resize spectrum canvas 1
+                if (spectrumCanvas.width !== newSpecWidth || spectrumCanvas.height !== newSpecHeight) {
+                    spectrumCanvas.width = newSpecWidth;
+                    spectrumCanvas.height = newSpecHeight;
+                    spectrumOffscreen.width = newSpecWidth;
+                    spectrumOffscreen.height = newSpecHeight;
+                }
+                spectrumCanvas.style.left = '50px';
+                spectrumCanvas.style.width = halfWidth + 'px';
+                spectrumCanvas.style.display = 'block';
+
+                // Resize spectrum canvas 2
+                if (spectrumCanvas2.width !== newSpecWidth || spectrumCanvas2.height !== newSpecHeight) {
+                    spectrumCanvas2.width = newSpecWidth;
+                    spectrumCanvas2.height = newSpecHeight;
+                    spectrumOffscreen2.width = newSpecWidth;
+                    spectrumOffscreen2.height = newSpecHeight;
+                }
+                spectrumCanvas2.style.left = (50 + halfWidth) + 'px';
+                spectrumCanvas2.style.width = halfWidth + 'px';
+                spectrumCanvas2.style.display = 'block';
+
+                // Update SpectrumDisplay module's offscreen buffers
+                if (typeof SpectrumDisplay !== 'undefined') {
+                    SpectrumDisplay.resize(newSpecWidth, newSpecHeight, newSpecWidth, newSpecHeight);
+                }
+            } else {
+                // Single spectrum mode: full width
+                const newSpecWidth = Math.max(specWidth, FFT_SIZE);
+
+                if (spectrumCanvas.width !== newSpecWidth || spectrumCanvas.height !== newSpecHeight) {
+                    spectrumCanvas.width = newSpecWidth;
+                    spectrumCanvas.height = newSpecHeight;
+                    spectrumOffscreen.width = newSpecWidth;
+                    spectrumOffscreen.height = newSpecHeight;
+                }
+                spectrumCanvas.style.left = '50px';
+                spectrumCanvas.style.width = `calc(100% - 60px)`;
+
+                // Hide second spectrum canvas
+                spectrumCanvas2.style.display = 'none';
+
+                // Update SpectrumDisplay module's offscreen buffer (single-channel)
+                if (typeof SpectrumDisplay !== 'undefined') {
+                    SpectrumDisplay.resize(newSpecWidth, newSpecHeight);
+                }
             }
-
-            // Ensure spectrum positioning matches waterfall
-            spectrumCanvas.style.left = '50px';
-            spectrumCanvas.style.width = `calc(100% - 60px)`;
 
             if (showXCorr) {
                 const newXCorrWidth = Math.max(specWidth, FFT_SIZE);
@@ -3516,7 +3591,20 @@ const char* html_page = R"HTMLDELIM(
                     console.warn('IQ data appears to be all zeros');
                 }
 
-                drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q);
+                // Use IQ Constellation module
+                if (typeof IQConstellation !== 'undefined') {
+                    // Normalize int16 to float [-1, 1]
+                    const normalize = (arr) => {
+                        const result = new Float32Array(arr.length);
+                        for (let i = 0; i < arr.length; i++) {
+                            result[i] = arr[i] / 2048.0;
+                        }
+                        return result;
+                    };
+                    IQConstellation.draw(normalize(ch1_i), normalize(ch1_q), normalize(ch2_i), normalize(ch2_q));
+                } else {
+                    drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q);
+                }
             } catch (err) {
                 console.error('IQ data fetch error:', err);
             } finally {
@@ -3701,45 +3789,48 @@ const char* html_page = R"HTMLDELIM(
                     // Store latest FFT data for spectrum display
                     latestFFTData = data;
 
-                    // Scroll canvas down by 1 pixel (GPU-accelerated)
-                    // Check canvas has valid dimensions before attempting scroll
-                    if (canvas.width > 0 && canvas.height > 1) {
-                        try {
-                            ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
-                        } catch (e) {
-                            // Canvas might be in intermediate state during resize, skip scroll
-                            console.warn('Canvas scroll skipped:', e.message);
+                    // Use WaterfallDisplay module if available
+                    if (typeof WaterfallDisplay !== 'undefined') {
+                        WaterfallDisplay.draw(data, null);
+                    } else {
+                        // Fallback to inline waterfall rendering
+                        // Scroll canvas down by 1 pixel (GPU-accelerated)
+                        if (canvas.width > 0 && canvas.height > 1) {
+                            try {
+                                ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
+                            } catch (e) {
+                                console.warn('Canvas scroll skipped:', e.message);
+                            }
                         }
+
+                        // Draw new FFT line at top
+                        const lineData = ctx.createImageData(canvas.width, 1);
+                        for (let x = 0; x < canvas.width; x++) {
+                            const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                            const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas.width) * zoomedBins);
+                            let value = data[fftIdx];
+
+                            value = value * waterfallIntensity;
+                            value = 128 + (value - 128) * waterfallContrast;
+                            value = Math.max(0, Math.min(255, value));
+
+                            const mag = value / 255.0;
+                            const [r, g, b] = getColorForValue(mag, signalAnalysis.colorPalette);
+                            const idx = x * 4;
+                            lineData.data[idx + 0] = r;
+                            lineData.data[idx + 1] = g;
+                            lineData.data[idx + 2] = b;
+                            lineData.data[idx + 3] = 255;
+                        }
+                        ctx.putImageData(lineData, 0, 0);
                     }
-
-                    // Draw new FFT line at top
-                    const lineData = ctx.createImageData(canvas.width, 1);
-                    for (let x = 0; x < canvas.width; x++) {
-                        // Map canvas X to FFT bin, respecting zoom
-                        const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
-                        const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas.width) * zoomedBins);
-                        let value = data[fftIdx];
-
-                        value = value * waterfallIntensity;
-                        value = 128 + (value - 128) * waterfallContrast;
-                        value = Math.max(0, Math.min(255, value));
-
-                        const mag = value / 255.0;
-                        const [r, g, b] = getColorForValue(mag, signalAnalysis.colorPalette);
-                        const idx = x * 4;
-                        lineData.data[idx + 0] = r;
-                        lineData.data[idx + 1] = g;
-                        lineData.data[idx + 2] = b;
-                        lineData.data[idx + 3] = 255;
-                    }
-                    ctx.putImageData(lineData, 0, 0);
 
                     // Capture recording frame if recording
                     captureRecordingFrame(data);
 
                     // Draw spectrum if enabled
                     if (showSpectrum) {
-                        drawSpectrum(data);
+                        drawSpectrum(data, null);
                     }
 
                     // Update FPS counter
@@ -3796,63 +3887,67 @@ const char* html_page = R"HTMLDELIM(
                 latestFFTData = ch1Data;
                 latestFFTData2 = ch2Data;
 
-                // Update CH1 waterfall (left)
-                if (canvas.width > 0 && canvas.height > 1) {
-                    try {
-                        ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
-                    } catch (e) {
-                        console.warn('Canvas CH1 scroll skipped:', e.message);
+                // Use WaterfallDisplay module for dual-channel rendering
+                if (typeof WaterfallDisplay !== 'undefined') {
+                    WaterfallDisplay.draw(ch1Data, ch2Data);
+                } else {
+                    // Fallback to inline waterfall rendering
+                    // Update CH1 waterfall (left)
+                    if (canvas.width > 0 && canvas.height > 1) {
+                        try {
+                            ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height - 1, 0, 1, canvas.width, canvas.height - 1);
+                        } catch (e) {
+                            console.warn('Canvas CH1 scroll skipped:', e.message);
+                        }
                     }
-                }
 
-                const lineData1 = ctx.createImageData(canvas.width, 1);
-                for (let x = 0; x < canvas.width; x++) {
-                    // Map canvas X to FFT bin, respecting zoom
-                    const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
-                    const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas.width) * zoomedBins);
-                    let val = ch1Data[fftIdx];
+                    const lineData1 = ctx.createImageData(canvas.width, 1);
+                    for (let x = 0; x < canvas.width; x++) {
+                        const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                        const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas.width) * zoomedBins);
+                        let val = ch1Data[fftIdx];
 
-                    val = val * waterfallIntensity;
-                    val = 128 + (val - 128) * waterfallContrast;
-                    val = Math.max(0, Math.min(255, val));
+                        val = val * waterfallIntensity;
+                        val = 128 + (val - 128) * waterfallContrast;
+                        val = Math.max(0, Math.min(255, val));
 
-                    const rgb = getColorForValue(val / 255.0, signalAnalysis.colorPalette);
-                    const idx = x * 4;
-                    lineData1.data[idx + 0] = rgb[0];
-                    lineData1.data[idx + 1] = rgb[1];
-                    lineData1.data[idx + 2] = rgb[2];
-                    lineData1.data[idx + 3] = 255;
-                }
-                ctx.putImageData(lineData1, 0, 0);
-
-                // Update CH2 waterfall (right)
-                if (canvas2.width > 0 && canvas2.height > 1) {
-                    try {
-                        ctx2.drawImage(canvas2, 0, 0, canvas2.width, canvas2.height - 1, 0, 1, canvas2.width, canvas2.height - 1);
-                    } catch (e) {
-                        console.warn('Canvas CH2 scroll skipped:', e.message);
+                        const rgb = getColorForValue(val / 255.0, signalAnalysis.colorPalette);
+                        const idx = x * 4;
+                        lineData1.data[idx + 0] = rgb[0];
+                        lineData1.data[idx + 1] = rgb[1];
+                        lineData1.data[idx + 2] = rgb[2];
+                        lineData1.data[idx + 3] = 255;
                     }
+                    ctx.putImageData(lineData1, 0, 0);
+
+                    // Update CH2 waterfall (right)
+                    if (canvas2.width > 0 && canvas2.height > 1) {
+                        try {
+                            ctx2.drawImage(canvas2, 0, 0, canvas2.width, canvas2.height - 1, 0, 1, canvas2.width, canvas2.height - 1);
+                        } catch (e) {
+                            console.warn('Canvas CH2 scroll skipped:', e.message);
+                        }
+                    }
+
+                    const lineData2 = ctx2.createImageData(canvas2.width, 1);
+                    for (let x = 0; x < canvas2.width; x++) {
+                        const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                        const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas2.width) * zoomedBins);
+                        let val = ch2Data[fftIdx];
+
+                        val = val * waterfallIntensity;
+                        val = 128 + (val - 128) * waterfallContrast;
+                        val = Math.max(0, Math.min(255, val));
+
+                        const rgb = getColorForValue(val / 255.0, signalAnalysis.colorPalette);
+                        const idx = x * 4;
+                        lineData2.data[idx + 0] = rgb[0];
+                        lineData2.data[idx + 1] = rgb[1];
+                        lineData2.data[idx + 2] = rgb[2];
+                        lineData2.data[idx + 3] = 255;
+                    }
+                    ctx2.putImageData(lineData2, 0, 0);
                 }
-
-                const lineData2 = ctx2.createImageData(canvas2.width, 1);
-                for (let x = 0; x < canvas2.width; x++) {
-                    // Map canvas X to FFT bin, respecting zoom
-                    const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
-                    const fftIdx = zoomState.zoomStartBin + Math.floor((x / canvas2.width) * zoomedBins);
-                    let val = ch2Data[fftIdx];
-
-                    val = val * waterfallIntensity;
-                    val = 128 + (val - 128) * waterfallContrast;
-                    val = Math.max(0, Math.min(255, val));
-
-                    const rgb = getColorForValue(val / 255.0, signalAnalysis.colorPalette);
-                    const idx = x * 4;
-                    lineData2.data[idx + 0] = rgb[0];
-                    lineData2.data[idx + 1] = rgb[1];
-                    lineData2.data[idx + 2] = rgb[2];
-                    lineData2.data[idx + 3] = 255;
-                }
-                ctx2.putImageData(lineData2, 0, 0);
 
                 // Update FPS counter
                 frameCount++;
@@ -4124,61 +4219,85 @@ const char* html_page = R"HTMLDELIM(
         function drawSpectrum(data, data2) {
             if (!data) return;
 
-            // Log signals if enabled
+            // Log signals if enabled (only once)
             logSignals(data);
 
-            // Update peak hold data
-            if (peakHoldEnabled) {
-                if (!peakHoldData || peakHoldData.length !== data.length) {
-                    peakHoldData = new Uint8Array(data);
-                } else {
-                    for (let i = 0; i < data.length; i++) {
-                        if (data[i] > peakHoldData[i]) {
-                            peakHoldData[i] = data[i];
+            // Use SpectrumDisplay module if available
+            if (typeof SpectrumDisplay !== 'undefined') {
+                SpectrumDisplay.draw(data, data2);
+            } else {
+                // Fallback to inline rendering
+                // Update peak hold data (only once for channel 1)
+                if (peakHoldEnabled) {
+                    if (!peakHoldData || peakHoldData.length !== data.length) {
+                        peakHoldData = new Uint8Array(data);
+                    } else {
+                        for (let i = 0; i < data.length; i++) {
+                            if (data[i] > peakHoldData[i]) {
+                                peakHoldData[i] = data[i];
+                            }
                         }
                     }
                 }
+
+                // Check if we're in dual-channel mode
+                const chSelect = document.getElementById('channel_select').value;
+                const isDualChannel = (chSelect === 'both' && data2);
+
+                if (isDualChannel) {
+                    // Draw both channels side-by-side
+                    drawSpectrumToCanvas(data, spectrumOffscreenCtx, spectrumOffscreen, spectrumCtx);
+                    drawSpectrumToCanvas(data2, spectrumOffscreenCtx2, spectrumOffscreen2, spectrumCtx2);
+                } else {
+                    // Single channel mode - draw to first canvas only
+                    drawSpectrumToCanvas(data, spectrumOffscreenCtx, spectrumOffscreen, spectrumCtx);
+                }
             }
+        }
+
+        // Helper function to draw a single spectrum to specific canvas/context
+        function drawSpectrumToCanvas(data, offscreenCtx, offscreenCanvas, finalCtx) {
+            if (!data) return;
 
             // Render to offscreen canvas (double buffering)
-            const width = spectrumOffscreen.width;
-            const height = spectrumOffscreen.height;
+            const width = offscreenCanvas.width;
+            const height = offscreenCanvas.height;
 
             // Clear offscreen canvas with dark background
-            spectrumOffscreenCtx.fillStyle = '#0a0a0a';
-            spectrumOffscreenCtx.fillRect(0, 0, width, height);
+            offscreenCtx.fillStyle = '#0a0a0a';
+            offscreenCtx.fillRect(0, 0, width, height);
 
             // Draw horizontal grid lines (more visible)
-            spectrumOffscreenCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
-            spectrumOffscreenCtx.lineWidth = 1;
+            offscreenCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            offscreenCtx.lineWidth = 1;
             for (let i = 0; i <= 10; i++) {
                 const y = (height / 10) * i;
-                spectrumOffscreenCtx.beginPath();
-                spectrumOffscreenCtx.moveTo(0, y);
-                spectrumOffscreenCtx.lineTo(width, y);
-                spectrumOffscreenCtx.stroke();
+                offscreenCtx.beginPath();
+                offscreenCtx.moveTo(0, y);
+                offscreenCtx.lineTo(width, y);
+                offscreenCtx.stroke();
             }
 
             // Draw vertical grid lines
-            spectrumOffscreenCtx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
+            offscreenCtx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
             for (let i = 0; i <= 10; i++) {
                 const x = (width / 10) * i;
-                spectrumOffscreenCtx.beginPath();
-                spectrumOffscreenCtx.moveTo(x, 0);
-                spectrumOffscreenCtx.lineTo(x, height);
-                spectrumOffscreenCtx.stroke();
+                offscreenCtx.beginPath();
+                offscreenCtx.moveTo(x, 0);
+                offscreenCtx.lineTo(x, height);
+                offscreenCtx.stroke();
             }
 
             // Enable smoothing for better visual quality
-            spectrumOffscreenCtx.imageSmoothingEnabled = true;
-            spectrumOffscreenCtx.imageSmoothingQuality = 'high';
+            offscreenCtx.imageSmoothingEnabled = true;
+            offscreenCtx.imageSmoothingQuality = 'high';
 
             // Calculate Y-axis mapping based on current zoom/scroll range
             const dbRange = spectrumMaxDb - spectrumMinDb;
 
             // Store path for gradient fill
-            spectrumOffscreenCtx.beginPath();
-            spectrumOffscreenCtx.moveTo(0, height);
+            offscreenCtx.beginPath();
+            offscreenCtx.moveTo(0, height);
 
             // Draw spectrum line with gradient color based on amplitude
             const points = [];
@@ -4194,27 +4313,27 @@ const char* html_page = R"HTMLDELIM(
                 const y = height - (normalizedMag * height);
                 points.push({ x: x, y: y, mag: normalizedMag });
 
-                spectrumOffscreenCtx.lineTo(x, y);
+                offscreenCtx.lineTo(x, y);
             }
 
             // Complete the path for fill
-            spectrumOffscreenCtx.lineTo(width, height);
-            spectrumOffscreenCtx.closePath();
+            offscreenCtx.lineTo(width, height);
+            offscreenCtx.closePath();
 
             // Create gradient fill (green-yellow gradient like SDR++)
-            const gradient = spectrumOffscreenCtx.createLinearGradient(0, 0, 0, height);
+            const gradient = offscreenCtx.createLinearGradient(0, 0, 0, height);
             gradient.addColorStop(0, 'rgba(255, 255, 0, 0.4)');    // Yellow at top (strong signals)
             gradient.addColorStop(0.3, 'rgba(0, 255, 100, 0.3)');  // Green
             gradient.addColorStop(0.7, 'rgba(0, 255, 200, 0.2)');  // Cyan
             gradient.addColorStop(1, 'rgba(0, 100, 255, 0.1)');    // Blue at bottom (noise floor)
 
-            spectrumOffscreenCtx.fillStyle = gradient;
-            spectrumOffscreenCtx.fill();
+            offscreenCtx.fillStyle = gradient;
+            offscreenCtx.fill();
 
             // Draw spectrum line with variable color
-            spectrumOffscreenCtx.lineJoin = 'round';
-            spectrumOffscreenCtx.lineCap = 'round';
-            spectrumOffscreenCtx.lineWidth = 1.5;
+            offscreenCtx.lineJoin = 'round';
+            offscreenCtx.lineCap = 'round';
+            offscreenCtx.lineWidth = 1.5;
 
             // Draw line with gradient based on signal strength
             for (let i = 0; i < points.length - 1; i++) {
@@ -4224,48 +4343,48 @@ const char* html_page = R"HTMLDELIM(
                 // Color based on magnitude (green-yellow gradient)
                 const mag = (p1.mag + p2.mag) / 2;
                 if (mag > 0.8) {
-                    spectrumOffscreenCtx.strokeStyle = '#ffff00';  // Yellow for strong signals
+                    offscreenCtx.strokeStyle = '#ffff00';  // Yellow for strong signals
                 } else if (mag > 0.5) {
-                    spectrumOffscreenCtx.strokeStyle = '#88ff00';  // Yellow-green
+                    offscreenCtx.strokeStyle = '#88ff00';  // Yellow-green
                 } else if (mag > 0.3) {
-                    spectrumOffscreenCtx.strokeStyle = '#00ff88';  // Green-cyan
+                    offscreenCtx.strokeStyle = '#00ff88';  // Green-cyan
                 } else {
-                    spectrumOffscreenCtx.strokeStyle = '#00ffff';  // Cyan for weak signals
+                    offscreenCtx.strokeStyle = '#00ffff';  // Cyan for weak signals
                 }
 
-                spectrumOffscreenCtx.beginPath();
-                spectrumOffscreenCtx.moveTo(p1.x, p1.y);
-                spectrumOffscreenCtx.lineTo(p2.x, p2.y);
-                spectrumOffscreenCtx.stroke();
+                offscreenCtx.beginPath();
+                offscreenCtx.moveTo(p1.x, p1.y);
+                offscreenCtx.lineTo(p2.x, p2.y);
+                offscreenCtx.stroke();
             }
 
             // Draw dB scale labels (now shows scrolled/zoomed range)
-            spectrumOffscreenCtx.fillStyle = '#888';
-            spectrumOffscreenCtx.font = '10px monospace';
-            spectrumOffscreenCtx.textAlign = 'right';
+            offscreenCtx.fillStyle = '#888';
+            offscreenCtx.font = '10px monospace';
+            offscreenCtx.textAlign = 'right';
             for (let i = 0; i <= 10; i++) {
                 const y = (height / 10) * i;
                 const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
-                spectrumOffscreenCtx.fillText(dbValue + ' dB', width - 5, y + 3);
+                offscreenCtx.fillText(dbValue + ' dB', width - 5, y + 3);
             }
 
             // Draw Y-axis range indicator (top-left of spectrum)
             // Always show if not at default range
             if (spectrumMinDb !== -100 || spectrumMaxDb !== -10) {
-                spectrumOffscreenCtx.fillStyle = 'rgba(255, 255, 0, 0.8)';
-                spectrumOffscreenCtx.font = 'bold 11px monospace';
-                spectrumOffscreenCtx.textAlign = 'left';
-                spectrumOffscreenCtx.fillText(`Range: ${spectrumMinDb.toFixed(0)}-${spectrumMaxDb.toFixed(0)} dBFS`, 5, 15);
-                spectrumOffscreenCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
-                spectrumOffscreenCtx.font = '10px monospace';
-                spectrumOffscreenCtx.fillText('(Scroll: pan, Ctrl+Scroll: zoom, DblClick: reset)', 5, 28);
+                offscreenCtx.fillStyle = 'rgba(255, 255, 0, 0.8)';
+                offscreenCtx.font = 'bold 11px monospace';
+                offscreenCtx.textAlign = 'left';
+                offscreenCtx.fillText(`Range: ${spectrumMinDb.toFixed(0)}-${spectrumMaxDb.toFixed(0)} dBFS`, 5, 15);
+                offscreenCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+                offscreenCtx.font = '10px monospace';
+                offscreenCtx.fillText('(Scroll: pan, Ctrl+Scroll: zoom, DblClick: reset)', 5, 28);
             }
 
             // Draw peak hold overlay
             if (peakHoldEnabled && peakHoldData) {
-                spectrumOffscreenCtx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
-                spectrumOffscreenCtx.lineWidth = 1;
-                spectrumOffscreenCtx.beginPath();
+                offscreenCtx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
+                offscreenCtx.lineWidth = 1;
+                offscreenCtx.beginPath();
 
                 for (let x = 0; x < width; x++) {
                     const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
@@ -4276,19 +4395,19 @@ const char* html_page = R"HTMLDELIM(
                     const y = height - (normalizedMag * height);
 
                     if (x === 0) {
-                        spectrumOffscreenCtx.moveTo(x, y);
+                        offscreenCtx.moveTo(x, y);
                     } else {
-                        spectrumOffscreenCtx.lineTo(x, y);
+                        offscreenCtx.lineTo(x, y);
                     }
                 }
 
-                spectrumOffscreenCtx.stroke();
+                offscreenCtx.stroke();
 
                 // Draw "Peak Hold" label
-                spectrumOffscreenCtx.fillStyle = 'rgba(255, 0, 0, 0.8)';
-                spectrumOffscreenCtx.font = 'bold 10px monospace';
-                spectrumOffscreenCtx.textAlign = 'left';
-                spectrumOffscreenCtx.fillText('PEAK HOLD', 5, height - 5);
+                offscreenCtx.fillStyle = 'rgba(255, 0, 0, 0.8)';
+                offscreenCtx.font = 'bold 10px monospace';
+                offscreenCtx.textAlign = 'left';
+                offscreenCtx.fillText('PEAK HOLD', 5, height - 5);
             }
 
             // Update and draw min hold trace
@@ -4303,9 +4422,9 @@ const char* html_page = R"HTMLDELIM(
                     }
                 }
 
-                spectrumOffscreenCtx.strokeStyle = 'rgba(0, 128, 255, 0.6)';
-                spectrumOffscreenCtx.lineWidth = 1;
-                spectrumOffscreenCtx.beginPath();
+                offscreenCtx.strokeStyle = 'rgba(0, 128, 255, 0.6)';
+                offscreenCtx.lineWidth = 1;
+                offscreenCtx.beginPath();
 
                 for (let x = 0; x < width; x++) {
                     const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
@@ -4316,45 +4435,45 @@ const char* html_page = R"HTMLDELIM(
                     const y = height - (normalizedMag * height);
 
                     if (x === 0) {
-                        spectrumOffscreenCtx.moveTo(x, y);
+                        offscreenCtx.moveTo(x, y);
                     } else {
-                        spectrumOffscreenCtx.lineTo(x, y);
+                        offscreenCtx.lineTo(x, y);
                     }
                 }
 
-                spectrumOffscreenCtx.stroke();
+                offscreenCtx.stroke();
 
-                spectrumOffscreenCtx.fillStyle = 'rgba(0, 128, 255, 0.8)';
-                spectrumOffscreenCtx.font = 'bold 10px monospace';
-                spectrumOffscreenCtx.textAlign = 'left';
-                spectrumOffscreenCtx.fillText('MIN HOLD', 80, height - 5);
+                offscreenCtx.fillStyle = 'rgba(0, 128, 255, 0.8)';
+                offscreenCtx.font = 'bold 10px monospace';
+                offscreenCtx.textAlign = 'left';
+                offscreenCtx.fillText('MIN HOLD', 80, height - 5);
             }
 
             // Draw reference level markers
             if (refMarkersEnabled) {
                 const refLevels = [-100, -80, -60, -40, -20, 0];
-                spectrumOffscreenCtx.strokeStyle = 'rgba(255, 255, 0, 0.3)';
-                spectrumOffscreenCtx.setLineDash([5, 5]);
-                spectrumOffscreenCtx.lineWidth = 1;
+                offscreenCtx.strokeStyle = 'rgba(255, 255, 0, 0.3)';
+                offscreenCtx.setLineDash([5, 5]);
+                offscreenCtx.lineWidth = 1;
 
                 refLevels.forEach(dbLevel => {
                     if (dbLevel >= spectrumMinDb && dbLevel <= spectrumMaxDb) {
                         const normalizedPos = (dbLevel - spectrumMinDb) / dbRange;
                         const y = height - (normalizedPos * height);
 
-                        spectrumOffscreenCtx.beginPath();
-                        spectrumOffscreenCtx.moveTo(0, y);
-                        spectrumOffscreenCtx.lineTo(width, y);
-                        spectrumOffscreenCtx.stroke();
+                        offscreenCtx.beginPath();
+                        offscreenCtx.moveTo(0, y);
+                        offscreenCtx.lineTo(width, y);
+                        offscreenCtx.stroke();
 
-                        spectrumOffscreenCtx.fillStyle = 'rgba(255, 255, 0, 0.7)';
-                        spectrumOffscreenCtx.font = '9px monospace';
-                        spectrumOffscreenCtx.textAlign = 'left';
-                        spectrumOffscreenCtx.fillText(`${dbLevel} dB`, 2, y - 2);
+                        offscreenCtx.fillStyle = 'rgba(255, 255, 0, 0.7)';
+                        offscreenCtx.font = '9px monospace';
+                        offscreenCtx.textAlign = 'left';
+                        offscreenCtx.fillText(`${dbLevel} dB`, 2, y - 2);
                     }
                 });
 
-                spectrumOffscreenCtx.setLineDash([]);
+                offscreenCtx.setLineDash([]);
             }
 
             // Draw bandwidth measurement points and result
@@ -4364,24 +4483,24 @@ const char* html_page = R"HTMLDELIM(
                     const canvasX = point.normalizedX * width;
 
                     // Draw marker
-                    spectrumOffscreenCtx.fillStyle = '#ff00ff';
-                    spectrumOffscreenCtx.beginPath();
-                    spectrumOffscreenCtx.arc(canvasX, height - 20, 5, 0, 2 * Math.PI);
-                    spectrumOffscreenCtx.fill();
+                    offscreenCtx.fillStyle = '#ff00ff';
+                    offscreenCtx.beginPath();
+                    offscreenCtx.arc(canvasX, height - 20, 5, 0, 2 * Math.PI);
+                    offscreenCtx.fill();
 
                     // Draw vertical line
-                    spectrumOffscreenCtx.strokeStyle = 'rgba(255, 0, 255, 0.5)';
-                    spectrumOffscreenCtx.setLineDash([3, 3]);
-                    spectrumOffscreenCtx.beginPath();
-                    spectrumOffscreenCtx.moveTo(canvasX, 0);
-                    spectrumOffscreenCtx.lineTo(canvasX, height);
-                    spectrumOffscreenCtx.stroke();
-                    spectrumOffscreenCtx.setLineDash([]);
+                    offscreenCtx.strokeStyle = 'rgba(255, 0, 255, 0.5)';
+                    offscreenCtx.setLineDash([3, 3]);
+                    offscreenCtx.beginPath();
+                    offscreenCtx.moveTo(canvasX, 0);
+                    offscreenCtx.lineTo(canvasX, height);
+                    offscreenCtx.stroke();
+                    offscreenCtx.setLineDash([]);
 
                     // Label
-                    spectrumOffscreenCtx.fillStyle = '#ff00ff';
-                    spectrumOffscreenCtx.font = '10px monospace';
-                    spectrumOffscreenCtx.fillText(`${idx + 1}`, canvasX + 8, height - 15);
+                    offscreenCtx.fillStyle = '#ff00ff';
+                    offscreenCtx.font = '10px monospace';
+                    offscreenCtx.fillText(`${idx + 1}`, canvasX + 8, height - 15);
                 });
 
                 // Draw measurement result if two points selected
@@ -4392,19 +4511,19 @@ const char* html_page = R"HTMLDELIM(
                     const centerX = (canvasX0 + canvasX1) / 2;
 
                     // Draw bandwidth span
-                    spectrumOffscreenCtx.strokeStyle = '#ff00ff';
-                    spectrumOffscreenCtx.lineWidth = 2;
-                    spectrumOffscreenCtx.beginPath();
-                    spectrumOffscreenCtx.moveTo(canvasX0, height - 30);
-                    spectrumOffscreenCtx.lineTo(canvasX1, height - 30);
-                    spectrumOffscreenCtx.stroke();
+                    offscreenCtx.strokeStyle = '#ff00ff';
+                    offscreenCtx.lineWidth = 2;
+                    offscreenCtx.beginPath();
+                    offscreenCtx.moveTo(canvasX0, height - 30);
+                    offscreenCtx.lineTo(canvasX1, height - 30);
+                    offscreenCtx.stroke();
 
                     // Arrows
                     [canvasX0, canvasX1].forEach(x => {
-                        spectrumOffscreenCtx.beginPath();
-                        spectrumOffscreenCtx.moveTo(x, height - 30);
-                        spectrumOffscreenCtx.lineTo(x, height - 35);
-                        spectrumOffscreenCtx.stroke();
+                        offscreenCtx.beginPath();
+                        offscreenCtx.moveTo(x, height - 30);
+                        offscreenCtx.lineTo(x, height - 35);
+                        offscreenCtx.stroke();
                     });
 
                     // Update display
@@ -4415,11 +4534,11 @@ const char* html_page = R"HTMLDELIM(
 
             // Draw markers on spectrum (from marker_system.js)
             if (typeof drawMarkersOnSpectrum === 'function') {
-                drawMarkersOnSpectrum(spectrumOffscreenCtx, width, height);
+                drawMarkersOnSpectrum(offscreenCtx, width, height);
             }
 
             // Copy offscreen canvas to visible canvas (double buffering - eliminates flicker)
-            spectrumCtx.drawImage(spectrumOffscreen, 0, 0);
+            finalCtx.drawImage(offscreenCanvas, 0, 0);
         }
 
         // Toggle spectrum display
@@ -4428,13 +4547,20 @@ const char* html_page = R"HTMLDELIM(
             const button = document.getElementById('spectrum_toggle');
             const timeAxis = document.getElementById('time-axis');
             const freqAxis = document.getElementById('freq-axis');
+            const spectrum2Canvas = document.getElementById('spectrum2');
 
             if (showSpectrum) {
                 spectrumCanvas.style.display = 'block';
+                if (spectrum2Canvas) {
+                    spectrum2Canvas.style.display = 'block';
+                }
                 button.classList.add('active');
                 timeAxis.style.top = '250px';
             } else {
                 spectrumCanvas.style.display = 'none';
+                if (spectrum2Canvas) {
+                    spectrum2Canvas.style.display = 'none';
+                }
                 button.classList.remove('active');
                 timeAxis.style.top = '50px';
             }
@@ -4567,65 +4693,240 @@ const char* html_page = R"HTMLDELIM(
             statusDiv.style.color = '#fa0';
         }
 
-        // Draw IQ constellation plot
+        // Enhanced IQ constellation with density heatmap, EVM, and statistics
         function drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q) {
             const width = iqCanvas.width;
             const height = iqCanvas.height;
+            const centerX = width / 2;
+            const centerY = height / 2;
+            const plotRadius = Math.min(width, height) / 2 - 40;
 
             // Clear canvas
             iqCtx.fillStyle = '#0a0a0a';
             iqCtx.fillRect(0, 0, width, height);
 
-            // Draw grid
-            iqCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
-            iqCtx.lineWidth = 1;
+            // Enhanced grid with polar coordinates
+            iqCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
+            iqCtx.lineWidth = 0.5;
 
-            // Crosshairs
-            iqCtx.beginPath();
-            iqCtx.moveTo(width / 2, 0);
-            iqCtx.lineTo(width / 2, height);
-            iqCtx.moveTo(0, height / 2);
-            iqCtx.lineTo(width, height / 2);
-            iqCtx.stroke();
+            // Radial circles with dB labels
+            const radii = [0.25, 0.5, 0.75, 1.0];
+            iqCtx.font = '9px monospace';
+            iqCtx.fillStyle = '#666';
+            iqCtx.textAlign = 'center';
 
-            // Circle markers
-            for (let r of [0.25, 0.5, 0.75, 1.0]) {
+            for (let i = 0; i < radii.length; i++) {
+                const r = radii[i];
+                const radius = r * plotRadius;
+
+                // Draw circle
                 iqCtx.beginPath();
-                iqCtx.arc(width / 2, height / 2, r * (width / 2 - 10), 0, 2 * Math.PI);
+                iqCtx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
+                iqCtx.stroke();
+
+                // Label with relative power (dB)
+                const powerDb = 20 * Math.log10(r);
+                iqCtx.fillText(powerDb.toFixed(0) + ' dB', centerX + radius / Math.sqrt(2) + 5, centerY - radius / Math.sqrt(2) - 5);
+            }
+
+            // Angular grid lines (every 30°)
+            iqCtx.strokeStyle = 'rgba(80, 80, 80, 0.15)';
+            for (let angle = 0; angle < 360; angle += 30) {
+                const rad = angle * Math.PI / 180;
+                iqCtx.beginPath();
+                iqCtx.moveTo(centerX, centerY);
+                iqCtx.lineTo(centerX + plotRadius * Math.cos(rad), centerY + plotRadius * Math.sin(rad));
                 iqCtx.stroke();
             }
 
-            // Draw IQ samples
-            const scale = (width / 2 - 10) / 32768;  // Scale int16 to canvas
+            // Crosshairs (emphasized)
+            iqCtx.strokeStyle = 'rgba(100, 100, 100, 0.5)';
+            iqCtx.lineWidth = 1;
+            iqCtx.beginPath();
+            iqCtx.moveTo(centerX, centerY - plotRadius);
+            iqCtx.lineTo(centerX, centerY + plotRadius);
+            iqCtx.moveTo(centerX - plotRadius, centerY);
+            iqCtx.lineTo(centerX + plotRadius, centerY);
+            iqCtx.stroke();
 
-            // Channel 1 (cyan)
-            iqCtx.fillStyle = 'rgba(0, 255, 255, 0.6)';
-            for (let i = 0; i < IQ_SAMPLES; i++) {
-                const x = width / 2 + ch1_i[i] * scale;
-                const y = height / 2 - ch1_q[i] * scale;
-                iqCtx.fillRect(x - 1, y - 1, 2, 2);
+            // Axis labels
+            iqCtx.fillStyle = '#888';
+            iqCtx.font = '10px monospace';
+            iqCtx.textAlign = 'center';
+            iqCtx.fillText('I', centerX + plotRadius + 15, centerY + 4);
+            iqCtx.fillText('-I', centerX - plotRadius - 15, centerY + 4);
+            iqCtx.fillText('Q', centerX, centerY - plotRadius - 10);
+            iqCtx.fillText('-Q', centerX, centerY + plotRadius + 18);
+
+            // Calculate scaling and statistics for both channels
+            function calcStats(i_data, q_data) {
+                // Find maximum amplitude for auto-scaling
+                let maxAmp = 0;
+                let sumI = 0, sumQ = 0, sumPower = 0;
+
+                for (let i = 0; i < i_data.length; i++) {
+                    const amp = Math.sqrt(i_data[i] * i_data[i] + q_data[i] * q_data[i]);
+                    if (amp > maxAmp) maxAmp = amp;
+                    sumI += i_data[i];
+                    sumQ += q_data[i];
+                    sumPower += amp;
+                }
+
+                const meanI = sumI / i_data.length;
+                const meanQ = sumQ / i_data.length;
+                const meanPower = sumPower / i_data.length;
+
+                // Calculate standard deviations
+                let varI = 0, varQ = 0, evmSum = 0;
+                for (let i = 0; i < i_data.length; i++) {
+                    varI += (i_data[i] - meanI) ** 2;
+                    varQ += (q_data[i] - meanQ) ** 2;
+
+                    // EVM: error vector magnitude relative to average power
+                    const errI = i_data[i] - meanI;
+                    const errQ = q_data[i] - meanQ;
+                    evmSum += Math.sqrt(errI * errI + errQ * errQ);
+                }
+
+                const stdI = Math.sqrt(varI / i_data.length);
+                const stdQ = Math.sqrt(varQ / i_data.length);
+                const evm = (evmSum / i_data.length) / Math.max(meanPower, 1) * 100;
+
+                return { maxAmp, meanI, meanQ, meanPower, stdI, stdQ, evm };
             }
 
-            // Channel 2 (orange)
-            iqCtx.fillStyle = 'rgba(255, 165, 0, 0.6)';
+            const stats1 = calcStats(ch1_i, ch1_q);
+            const stats2 = calcStats(ch2_i, ch2_q);
+
+            // Auto-scale to fill plot area with 90% of max amplitude
+            const scale = plotRadius * 0.9 / Math.max(stats1.maxAmp, stats2.maxAmp, 1);
+
+            // Create density heatmap for Channel 1
+            const gridSize = 64;
+            const density1 = new Uint32Array(gridSize * gridSize);
+
             for (let i = 0; i < IQ_SAMPLES; i++) {
-                const x = width / 2 + ch2_i[i] * scale;
-                const y = height / 2 - ch2_q[i] * scale;
-                iqCtx.fillRect(x - 1, y - 1, 2, 2);
+                const x = Math.floor((ch1_i[i] * scale + plotRadius) / (2 * plotRadius) * gridSize);
+                const y = Math.floor((plotRadius - ch1_q[i] * scale) / (2 * plotRadius) * gridSize);
+
+                if (x >= 0 && x < gridSize && y >= 0 && y < gridSize) {
+                    density1[y * gridSize + x]++;
+                }
             }
 
-            // Labels
+            // Find max density for normalization
+            let maxDensity = 0;
+            for (let i = 0; i < density1.length; i++) {
+                if (density1[i] > maxDensity) maxDensity = density1[i];
+            }
+
+            // Draw density heatmap (Channel 1)
+            const cellSize = (2 * plotRadius) / gridSize;
+            for (let gy = 0; gy < gridSize; gy++) {
+                for (let gx = 0; gx < gridSize; gx++) {
+                    const d = density1[gy * gridSize + gx];
+                    if (d > 0) {
+                        const intensity = Math.log1p(d) / Math.log1p(maxDensity);
+                        const alpha = intensity * 0.8;
+
+                        // Heat colormap: blue -> cyan -> green -> yellow -> red
+                        let r, g, b;
+                        if (intensity < 0.25) {
+                            r = 0;
+                            g = intensity * 4 * 255;
+                            b = 255;
+                        } else if (intensity < 0.5) {
+                            r = 0;
+                            g = 255;
+                            b = (0.5 - intensity) * 4 * 255;
+                        } else if (intensity < 0.75) {
+                            r = (intensity - 0.5) * 4 * 255;
+                            g = 255;
+                            b = 0;
+                        } else {
+                            r = 255;
+                            g = (1 - intensity) * 4 * 255;
+                            b = 0;
+                        }
+
+                        iqCtx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+                        const px = centerX - plotRadius + gx * cellSize;
+                        const py = centerY - plotRadius + gy * cellSize;
+                        iqCtx.fillRect(px, py, cellSize, cellSize);
+                    }
+                }
+            }
+
+            // Draw individual points for Channel 2 (overlay)
+            iqCtx.fillStyle = 'rgba(255, 165, 0, 0.4)';
+            for (let i = 0; i < IQ_SAMPLES; i++) {
+                const x = centerX + ch2_i[i] * scale;
+                const y = centerY - ch2_q[i] * scale;
+                iqCtx.fillRect(x - 0.5, y - 0.5, 1, 1);
+            }
+
+            // Draw mean vectors
+            const mean1X = centerX + stats1.meanI * scale;
+            const mean1Y = centerY - stats1.meanQ * scale;
+            const mean2X = centerX + stats2.meanI * scale;
+            const mean2Y = centerY - stats2.meanQ * scale;
+
+            // CH1 mean vector (cyan arrow)
+            iqCtx.strokeStyle = '#0ff';
+            iqCtx.lineWidth = 2;
+            iqCtx.beginPath();
+            iqCtx.moveTo(centerX, centerY);
+            iqCtx.lineTo(mean1X, mean1Y);
+            iqCtx.stroke();
+
+            // CH2 mean vector (orange arrow)
+            iqCtx.strokeStyle = '#ffa500';
+            iqCtx.lineWidth = 2;
+            iqCtx.beginPath();
+            iqCtx.moveTo(centerX, centerY);
+            iqCtx.lineTo(mean2X, mean2Y);
+            iqCtx.stroke();
+
+            // Statistics panel (bottom)
+            iqCtx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+            iqCtx.fillRect(0, height - 60, width, 60);
+
+            iqCtx.font = '9px monospace';
+            iqCtx.textAlign = 'left';
+
+            // CH1 stats
+            iqCtx.fillStyle = '#0ff';
+            iqCtx.fillText('CH1:', 5, height - 48);
+            iqCtx.fillStyle = '#aaa';
+            iqCtx.fillText(`Mean: ${stats1.meanI.toFixed(0)}, ${stats1.meanQ.toFixed(0)}`, 35, height - 48);
+            iqCtx.fillText(`Std: ${stats1.stdI.toFixed(0)}, ${stats1.stdQ.toFixed(0)}`, 35, height - 38);
+            iqCtx.fillText(`EVM: ${stats1.evm.toFixed(2)}%`, 35, height - 28);
+            iqCtx.fillText(`Pwr: ${stats1.meanPower.toFixed(0)}`, 35, height - 18);
+
+            // CH2 stats
+            iqCtx.fillStyle = '#ffa500';
+            iqCtx.fillText('CH2:', width / 2 + 5, height - 48);
+            iqCtx.fillStyle = '#aaa';
+            iqCtx.fillText(`Mean: ${stats2.meanI.toFixed(0)}, ${stats2.meanQ.toFixed(0)}`, width / 2 + 35, height - 48);
+            iqCtx.fillText(`Std: ${stats2.stdI.toFixed(0)}, ${stats2.stdQ.toFixed(0)}`, width / 2 + 35, height - 38);
+            iqCtx.fillText(`EVM: ${stats2.evm.toFixed(2)}%`, width / 2 + 35, height - 28);
+            iqCtx.fillText(`Pwr: ${stats2.meanPower.toFixed(0)}`, width / 2 + 35, height - 18);
+
+            // Title
             iqCtx.fillStyle = '#888';
             iqCtx.font = '11px monospace';
             iqCtx.textAlign = 'left';
-            iqCtx.fillText('IQ Constellation', 5, 15);
-            iqCtx.fillText('RX1', 5, 30);
+            iqCtx.fillText('IQ Constellation (Density + Overlay)', 5, 15);
+
+            // Legend (top right)
             iqCtx.fillStyle = '#0ff';
-            iqCtx.fillRect(25, 23, 10, 2);
+            iqCtx.fillText('█', width - 60, 15);
             iqCtx.fillStyle = '#888';
-            iqCtx.fillText('RX2', 40, 30);
+            iqCtx.fillText('RX1 (heat)', width - 50, 15);
             iqCtx.fillStyle = '#ffa500';
-            iqCtx.fillRect(60, 23, 10, 2);
+            iqCtx.fillText('●', width - 60, 27);
+            iqCtx.fillStyle = '#888';
+            iqCtx.fillText('RX2 (pts)', width - 50, 27);
         }
 
         // Phase unwrapping helper
@@ -4688,7 +4989,7 @@ const char* html_page = R"HTMLDELIM(
             return delay;
         }
 
-        // Draw cross-correlation display with enhancements
+        // Enhanced cross-correlation with frequency-domain coherence and group delay
         function drawXCorr(magnitude, phase) {
             // Auto-resize canvas to match container
             const container = document.getElementById('xcorr_canvas_container');
@@ -4702,6 +5003,7 @@ const char* html_page = R"HTMLDELIM(
 
             const width = xcorrCanvas.width;
             const height = xcorrCanvas.height;
+            const plotHeight = height / 3 - 5;  // Three plots vertically
 
             // Clear canvas
             xcorrCtx.fillStyle = '#0a0a0a';
@@ -4713,39 +5015,145 @@ const char* html_page = R"HTMLDELIM(
             const timeDelay = calculateTimeDelay(phase, sampleRate);
             const avgPhase = phase.reduce((a, b) => a + b, 0) / phase.length;
 
-            // Update display values
-            document.getElementById('xcorr_coherence').textContent = coherence.toFixed(3);
+            // Calculate frequency-domain coherence (normalized magnitude)
+            const maxMag = Math.max(...magnitude);
+            const coherenceSpectrum = magnitude.map(m => m / Math.max(maxMag, 1e-10));
+
+            // Calculate group delay (derivative of unwrapped phase)
+            const unwrappedPhase = unwrapPhase(phase);
+            const groupDelay = new Float32Array(unwrappedPhase.length - 1);
+            const freqStep = sampleRate / FFT_SIZE;
+
+            for (let i = 0; i < groupDelay.length; i++) {
+                const phaseDiff = unwrappedPhase[i + 1] - unwrappedPhase[i];
+                groupDelay[i] = -phaseDiff / (2 * Math.PI * freqStep) * 1e9;  // Convert to nanoseconds
+            }
+
+            // Update display values (improved)
+            const peakCoherence = Math.max(...coherenceSpectrum);
+            const meanCoherence = coherenceSpectrum.reduce((a, b) => a + b) / coherenceSpectrum.length;
+
+            document.getElementById('xcorr_coherence').textContent = `${peakCoherence.toFixed(3)} (μ=${meanCoherence.toFixed(3)})`;
             document.getElementById('xcorr_delay').textContent = (timeDelay * 1e9).toFixed(2) + ' ns';
             document.getElementById('xcorr_phase').textContent = (avgPhase * 180 / Math.PI).toFixed(1) + '°';
 
-            // Unwrap phase for better display
-            const unwrappedPhase = unwrapPhase(phase);
+            // ===== PLOT 1: Coherence Spectrum (top third) =====
+            const plot1Y = 0;
+            const plot1Height = plotHeight;
 
-            // Draw grid
-            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
-            xcorrCtx.lineWidth = 1;
+            // Grid
+            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
+            xcorrCtx.lineWidth = 0.5;
             for (let i = 0; i <= 4; i++) {
-                const y = (height / 2 / 4) * i;
+                const y = plot1Y + (plot1Height / 4) * i;
                 xcorrCtx.beginPath();
                 xcorrCtx.moveTo(0, y);
                 xcorrCtx.lineTo(width, y);
-                xcorrCtx.moveTo(0, height / 2 + y);
-                xcorrCtx.lineTo(width, height / 2 + y);
                 xcorrCtx.stroke();
             }
 
-            // Downsample for performance (max 2 points per pixel)
-            const downsample = Math.max(1, Math.floor(magnitude.length / (width * 2)));
+            // Vertical grid
+            for (let i = 0; i <= 10; i++) {
+                const x = (width / 10) * i;
+                xcorrCtx.beginPath();
+                xcorrCtx.moveTo(x, plot1Y);
+                xcorrCtx.lineTo(x, plot1Y + plot1Height);
+                xcorrCtx.stroke();
+            }
 
-            // Draw magnitude (top half)
-            xcorrCtx.strokeStyle = '#00ff00';
+            // Fill area under coherence curve
+            xcorrCtx.fillStyle = 'rgba(0, 255, 100, 0.15)';
+            xcorrCtx.beginPath();
+            xcorrCtx.moveTo(0, plot1Y + plot1Height);
+
+            for (let x = 0; x < width; x++) {
+                const idx = Math.floor((x / width) * coherenceSpectrum.length);
+                const coh = Math.min(1.0, coherenceSpectrum[idx]);
+                const y = plot1Y + plot1Height * (1 - coh);
+                xcorrCtx.lineTo(x, y);
+            }
+
+            xcorrCtx.lineTo(width, plot1Y + plot1Height);
+            xcorrCtx.closePath();
+            xcorrCtx.fill();
+
+            // Draw coherence line with gradient color
+            for (let x = 0; x < width - 1; x++) {
+                const idx = Math.floor((x / width) * coherenceSpectrum.length);
+                const coh = Math.min(1.0, coherenceSpectrum[idx]);
+                const y = plot1Y + plot1Height * (1 - coh);
+
+                // Color by coherence: red (low) -> yellow -> green (high)
+                let r, g, b;
+                if (coh < 0.5) {
+                    r = 255;
+                    g = coh * 2 * 255;
+                    b = 0;
+                } else {
+                    r = (1 - coh) * 2 * 255;
+                    g = 255;
+                    b = 0;
+                }
+
+                xcorrCtx.strokeStyle = `rgb(${r},${g},${b})`;
+                xcorrCtx.lineWidth = 1.5;
+                xcorrCtx.beginPath();
+                xcorrCtx.moveTo(x, y);
+                xcorrCtx.lineTo(x + 1, y);
+                xcorrCtx.stroke();
+            }
+
+            // Threshold lines
+            xcorrCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            xcorrCtx.setLineDash([5, 5]);
+            xcorrCtx.lineWidth = 1;
+
+            // 0.7 threshold (good coherence)
+            let y07 = plot1Y + plot1Height * (1 - 0.7);
+            xcorrCtx.beginPath();
+            xcorrCtx.moveTo(0, y07);
+            xcorrCtx.lineTo(width, y07);
+            xcorrCtx.stroke();
+
+            xcorrCtx.fillStyle = '#888';
+            xcorrCtx.font = '8px monospace';
+            xcorrCtx.fillText('0.7', 3, y07 - 2);
+
+            xcorrCtx.setLineDash([]);
+
+            // Label
+            xcorrCtx.fillStyle = '#0f0';
+            xcorrCtx.font = '10px monospace';
+            xcorrCtx.textAlign = 'left';
+            xcorrCtx.fillText('Coherence (freq domain)', 5, plot1Y + 12);
+
+            // ===== PLOT 2: Magnitude (middle third) =====
+            const plot2Y = plot1Height + 10;
+            const plot2Height = plotHeight;
+
+            // Grid
+            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
+            xcorrCtx.lineWidth = 0.5;
+            for (let i = 0; i <= 4; i++) {
+                const y = plot2Y + (plot2Height / 4) * i;
+                xcorrCtx.beginPath();
+                xcorrCtx.moveTo(0, y);
+                xcorrCtx.lineTo(width, y);
+                xcorrCtx.stroke();
+            }
+
+            // Draw magnitude with peak highlighting
+            const peakIdx = magnitude.indexOf(Math.max(...magnitude));
+            const peakX = (peakIdx / magnitude.length) * width;
+
+            xcorrCtx.strokeStyle = '#00ffff';
             xcorrCtx.lineWidth = 1.5;
             xcorrCtx.beginPath();
 
             for (let x = 0; x < width; x++) {
                 const idx = Math.floor((x / width) * magnitude.length);
                 const mag = Math.min(1.0, magnitude[idx]);
-                const y = (height / 2 - 10) * (1 - mag) + 5;
+                const y = plot2Y + plot2Height * (1 - mag);
                 if (x === 0) {
                     xcorrCtx.moveTo(x, y);
                 } else {
@@ -4754,19 +5162,54 @@ const char* html_page = R"HTMLDELIM(
             }
             xcorrCtx.stroke();
 
-            // Draw unwrapped phase (bottom half) with auto-scaling
-            const phaseMin = Math.min(...unwrappedPhase);
-            const phaseMax = Math.max(...unwrappedPhase);
-            const phaseRange = phaseMax - phaseMin || 1;
+            // Mark peak
+            xcorrCtx.strokeStyle = '#ff0';
+            xcorrCtx.fillStyle = '#ff0';
+            xcorrCtx.lineWidth = 2;
+            const peakY = plot2Y + plot2Height * (1 - magnitude[peakIdx] / Math.max(maxMag, 1e-10));
+            xcorrCtx.beginPath();
+            xcorrCtx.arc(peakX, peakY, 3, 0, 2 * Math.PI);
+            xcorrCtx.fill();
 
-            xcorrCtx.strokeStyle = '#ffaa00';
+            // Peak label
+            xcorrCtx.font = '8px monospace';
+            xcorrCtx.fillText(`Peak: ${magnitude[peakIdx].toFixed(3)}`, peakX + 5, peakY - 5);
+
+            // Label
+            xcorrCtx.fillStyle = '#0ff';
+            xcorrCtx.font = '10px monospace';
+            xcorrCtx.fillText('Cross-Correlation Magnitude', 5, plot2Y + 12);
+
+            // ===== PLOT 3: Group Delay (bottom third) =====
+            const plot3Y = (plot1Height + plot2Height) + 20;
+            const plot3Height = plotHeight;
+
+            // Grid
+            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
+            xcorrCtx.lineWidth = 0.5;
+            for (let i = 0; i <= 4; i++) {
+                const y = plot3Y + (plot3Height / 4) * i;
+                xcorrCtx.beginPath();
+                xcorrCtx.moveTo(0, y);
+                xcorrCtx.lineTo(width, y);
+                xcorrCtx.stroke();
+            }
+
+            // Auto-scale group delay
+            const gdMin = Math.min(...groupDelay);
+            const gdMax = Math.max(...groupDelay);
+            const gdRange = gdMax - gdMin || 1;
+
+            // Draw group delay
+            xcorrCtx.strokeStyle = '#ffa500';
             xcorrCtx.lineWidth = 1.5;
             xcorrCtx.beginPath();
 
             for (let x = 0; x < width; x++) {
-                const idx = Math.floor((x / width) * unwrappedPhase.length);
-                const phNorm = (unwrappedPhase[idx] - phaseMin) / phaseRange;
-                const y = height / 2 + 5 + (height / 2 - 10) * (1 - phNorm);
+                const idx = Math.floor((x / width) * groupDelay.length);
+                const gd = groupDelay[idx];
+                const gdNorm = (gd - gdMin) / gdRange;
+                const y = plot3Y + plot3Height * (1 - gdNorm);
                 if (x === 0) {
                     xcorrCtx.moveTo(x, y);
                 } else {
@@ -4775,17 +5218,9 @@ const char* html_page = R"HTMLDELIM(
             }
             xcorrCtx.stroke();
 
-            // Labels
-            xcorrCtx.fillStyle = '#0f0';
-            xcorrCtx.font = '11px monospace';
-            xcorrCtx.fillText('Magnitude', 5, 15);
-
-            xcorrCtx.fillStyle = '#fa0';
-            xcorrCtx.fillText('Unwrapped Phase', 5, height / 2 + 15);
-
-            // Zero reference line for phase
-            if (phaseMin < 0 && phaseMax > 0) {
-                const zeroY = height / 2 + 5 + (height / 2 - 10) * (1 - (-phaseMin / phaseRange));
+            // Zero reference line
+            if (gdMin < 0 && gdMax > 0) {
+                const zeroY = plot3Y + plot3Height * (1 - (-gdMin / gdRange));
                 xcorrCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
                 xcorrCtx.setLineDash([5, 5]);
                 xcorrCtx.beginPath();
@@ -4793,7 +5228,24 @@ const char* html_page = R"HTMLDELIM(
                 xcorrCtx.lineTo(width, zeroY);
                 xcorrCtx.stroke();
                 xcorrCtx.setLineDash([]);
+
+                xcorrCtx.fillStyle = '#888';
+                xcorrCtx.font = '8px monospace';
+                xcorrCtx.fillText('0 ns', 3, zeroY - 2);
             }
+
+            // Y-axis labels
+            xcorrCtx.fillStyle = '#888';
+            xcorrCtx.font = '8px monospace';
+            xcorrCtx.textAlign = 'right';
+            xcorrCtx.fillText(gdMax.toFixed(1) + ' ns', width - 3, plot3Y + 10);
+            xcorrCtx.fillText(gdMin.toFixed(1) + ' ns', width - 3, plot3Y + plot3Height - 3);
+
+            // Label
+            xcorrCtx.fillStyle = '#fa0';
+            xcorrCtx.font = '10px monospace';
+            xcorrCtx.textAlign = 'left';
+            xcorrCtx.fillText('Group Delay (dφ/dω)', 5, plot3Y + 12);
         }
 
         // Track bandwidth for display
@@ -5061,11 +5513,21 @@ const char* html_page = R"HTMLDELIM(
         function updateWaterfallIntensity(value) {
             waterfallIntensity = parseFloat(value);
             document.getElementById('intensityValue').textContent = parseFloat(value).toFixed(1) + 'x';
+
+            // Update WaterfallDisplay module
+            if (typeof WaterfallDisplay !== 'undefined') {
+                WaterfallDisplay.setIntensity(waterfallIntensity);
+            }
         }
 
         function updateWaterfallContrast(value) {
             waterfallContrast = parseFloat(value);
             document.getElementById('contrastValue').textContent = parseFloat(value).toFixed(1) + 'x';
+
+            // Update WaterfallDisplay module
+            if (typeof WaterfallDisplay !== 'undefined') {
+                WaterfallDisplay.setContrast(waterfallContrast);
+            }
         }
 
         function updateSpectrumRange() {
@@ -6162,11 +6624,44 @@ H or ? - Show this help
 
             // Redraw spectrum with new range
             if (latestFFTData) {
-                drawSpectrum(latestFFTData);
+                drawSpectrum(latestFFTData, latestFFTData2);
             }
         });
 
         console.log('Spectrum event listeners attached');
+
+        // Add same event handlers for spectrum2
+        spectrumCanvas2.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            if (e.ctrlKey) {
+                const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+                const oldRange = spectrumMaxDb - spectrumMinDb;
+                const newRange = Math.max(20, Math.min(400, oldRange * zoomFactor));
+                const center = (spectrumMinDb + spectrumMaxDb) / 2;
+                spectrumMinDb = Math.max(-50, center - newRange / 2);
+                spectrumMaxDb = Math.min(350, center + newRange / 2);
+            } else {
+                const scrollAmount = e.deltaY * 0.5;
+                const range = spectrumMaxDb - spectrumMinDb;
+                let newMin = spectrumMinDb + scrollAmount;
+                let newMax = spectrumMaxDb + scrollAmount;
+                const minLimit = -50;
+                const maxLimit = 350;
+                if (newMin < minLimit) {
+                    newMin = minLimit;
+                    newMax = minLimit + range;
+                }
+                if (newMax > maxLimit) {
+                    newMax = maxLimit;
+                    newMin = maxLimit - range;
+                }
+                spectrumMinDb = newMin;
+                spectrumMaxDb = newMax;
+            }
+            if (latestFFTData && latestFFTData2) {
+                drawSpectrum(latestFFTData, latestFFTData2);
+            }
+        });
 
         // Double-click to reset spectrum Y-axis to default range
         spectrumCanvas.addEventListener('dblclick', () => {
@@ -6174,7 +6669,15 @@ H or ? - Show this help
             spectrumMaxDb = -10;
             console.log('Spectrum Y-axis reset to default range: -100 to -10 dB');
             if (latestFFTData) {
-                drawSpectrum(latestFFTData);
+                drawSpectrum(latestFFTData, latestFFTData2);
+            }
+        });
+
+        spectrumCanvas2.addEventListener('dblclick', () => {
+            spectrumMinDb = -100;
+            spectrumMaxDb = -10;
+            if (latestFFTData && latestFFTData2) {
+                drawSpectrum(latestFFTData, latestFFTData2);
             }
         });
 
@@ -6213,7 +6716,7 @@ H or ? - Show this help
 
             // Redraw to show points
             if (latestFFTData) {
-                drawSpectrum(latestFFTData);
+                drawSpectrum(latestFFTData, latestFFTData2);
             }
         });
 
@@ -6468,6 +6971,14 @@ H or ? - Show this help
             zoomState.zoomEndBin = FFT_SIZE - 1;
             zoomState.isZoomed = false;
 
+            // Update display modules with new zoom state
+            if (typeof WaterfallDisplay !== 'undefined') {
+                WaterfallDisplay.updateZoomState(zoomState);
+            }
+            if (typeof SpectrumDisplay !== 'undefined') {
+                SpectrumDisplay.updateZoomState(zoomState);
+            }
+
             updateZoomIndicator();
             updateTimeAxis();  // Update frequency labels
         }
@@ -6590,6 +7101,11 @@ H or ? - Show this help
         function changeColorPalette() {
             signalAnalysis.colorPalette = document.getElementById('colorPalette').value;
             console.log('Changed color palette to:', signalAnalysis.colorPalette);
+
+            // Update WaterfallDisplay module
+            if (typeof WaterfallDisplay !== 'undefined') {
+                WaterfallDisplay.setColorPalette(signalAnalysis.colorPalette);
+            }
         }
 
         // ===== PERSISTENCE DISPLAY MODES =====
@@ -9209,21 +9725,64 @@ H or ? - Show this help
             ctx.fillStyle = '#0a0a0a';
             ctx.fillRect(0, 0, width, height);
 
-            // Draw horizontal grid lines (more visible)
-            ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
-            ctx.lineWidth = 1;
+            // Draw enhanced grid with dB labels
+            const dbRange = spectrumMaxDb - spectrumMinDb;
+
+            // Horizontal grid lines with dB scale
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'left';
             for (let i = 0; i <= 10; i++) {
                 const y = (height / 10) * i;
+                const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
+
+                // Emphasize major gridlines (every 20 dB)
+                if (dbValue % 20 === 0) {
+                    ctx.strokeStyle = 'rgba(100, 100, 100, 0.4)';
+                    ctx.lineWidth = 1;
+                    ctx.fillStyle = '#aaa';
+                } else {
+                    ctx.strokeStyle = 'rgba(60, 60, 60, 0.2)';
+                    ctx.lineWidth = 0.5;
+                    ctx.fillStyle = '#666';
+                }
+
                 ctx.beginPath();
                 ctx.moveTo(0, y);
                 ctx.lineTo(width, y);
                 ctx.stroke();
+
+                // Draw dB labels on left side
+                ctx.fillText(dbValue + ' dB', 5, y - 2);
             }
 
-            // Draw vertical grid lines
-            ctx.strokeStyle = 'rgba(80, 80, 80, 0.2)';
+            // Vertical grid lines with frequency markers
+            const sampleRate = 40000000;
+            const centerFreq = parseFloat(document.getElementById('freq').textContent) * 1e6 || 915e6;
+
+            ctx.textAlign = 'center';
+            ctx.font = '9px monospace';
             for (let i = 0; i <= 10; i++) {
                 const x = (width / 10) * i;
+
+                // Calculate frequency at this position
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const fftIdx = zoomState.zoomStartBin + (i / 10) * zoomedBins;
+                const freqOffset = (fftIdx / data.length - 0.5) * sampleRate;
+                const freq = centerFreq + freqOffset;
+
+                // Major gridlines every 2 divisions
+                if (i % 2 === 0) {
+                    ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+                    ctx.lineWidth = 1;
+                    ctx.fillStyle = '#888';
+
+                    // Frequency label at bottom
+                    ctx.fillText((freq / 1e6).toFixed(1) + ' MHz', x, height - 3);
+                } else {
+                    ctx.strokeStyle = 'rgba(50, 50, 50, 0.15)';
+                    ctx.lineWidth = 0.5;
+                }
+
                 ctx.beginPath();
                 ctx.moveTo(x, 0);
                 ctx.lineTo(x, height);
@@ -9234,10 +9793,7 @@ H or ? - Show this help
             ctx.imageSmoothingEnabled = true;
             ctx.imageSmoothingQuality = 'high';
 
-            // Calculate Y-axis mapping
-            const dbRange = spectrumMaxDb - spectrumMinDb;
-
-            // Store path for gradient fill
+            // Store path for gradient fill (dbRange already calculated above)
             ctx.beginPath();
             ctx.moveTo(0, height);
 
@@ -9299,14 +9855,100 @@ H or ? - Show this help
                 ctx.stroke();
             }
 
-            // Draw dB scale labels
-            ctx.fillStyle = '#888';
-            ctx.font = '10px monospace';
-            ctx.textAlign = 'right';
-            for (let i = 0; i <= 10; i++) {
-                const y = (height / 10) * i;
-                const dbValue = Math.floor(spectrumMaxDb - (i / 10) * dbRange);
-                ctx.fillText(dbValue + ' dB', width - 5, y + 3);
+            // Find and mark peaks for signal identification
+            const peaks = [];
+            const minPeakSpacing = width / 40;  // Minimum 40 pixels between peaks
+            const noiseThreshold = 0.3;  // Peaks must be above 30% of range
+
+            for (let i = 5; i < points.length - 5; i++) {
+                const p = points[i];
+
+                // Check if this is a local maximum
+                let isPeak = true;
+                for (let j = -5; j <= 5; j++) {
+                    if (j !== 0 && points[i + j].mag >= p.mag) {
+                        isPeak = false;
+                        break;
+                    }
+                }
+
+                // Check if peak is significant enough
+                if (isPeak && p.mag > noiseThreshold) {
+                    // Check spacing from other peaks
+                    let tooClose = false;
+                    for (const peak of peaks) {
+                        if (Math.abs(peak.x - p.x) < minPeakSpacing) {
+                            // Keep higher peak
+                            if (p.mag > peak.mag) {
+                                peaks.splice(peaks.indexOf(peak), 1);
+                            } else {
+                                tooClose = true;
+                            }
+                            break;
+                        }
+                    }
+
+                    if (!tooClose) {
+                        // Calculate frequency for this peak
+                        const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                        const fftIdx = zoomState.zoomStartBin + Math.floor((p.x / width) * zoomedBins);
+                        const freqOffset = (fftIdx / data.length - 0.5) * sampleRate;
+                        const freq = centerFreq + freqOffset;
+
+                        const magDb = spectrumMinDb + (p.mag * dbRange);
+
+                        peaks.push({ x: p.x, y: p.y, mag: p.mag, freq: freq, power: magDb });
+                    }
+                }
+            }
+
+            // Draw peak markers and labels
+            peaks.slice(0, 10).forEach((peak, idx) => {  // Limit to top 10 peaks
+                // Draw peak marker (vertical line with circle)
+                ctx.strokeStyle = '#ff00ff';
+                ctx.fillStyle = '#ff00ff';
+                ctx.lineWidth = 1;
+
+                // Vertical line
+                ctx.beginPath();
+                ctx.moveTo(peak.x, peak.y);
+                ctx.lineTo(peak.x, peak.y + 15);
+                ctx.stroke();
+
+                // Circle at peak
+                ctx.beginPath();
+                ctx.arc(peak.x, peak.y, 3, 0, 2 * Math.PI);
+                ctx.fill();
+
+                // Label with frequency and power
+                ctx.fillStyle = '#ff00ff';
+                ctx.font = '9px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText((peak.freq / 1e6).toFixed(2) + ' MHz', peak.x, peak.y - 10);
+                ctx.fillText(peak.power.toFixed(1) + ' dB', peak.x, peak.y - 20);
+            });
+
+            // Draw noise floor line if available
+            if (typeof latestNoiseFloor !== 'undefined' && latestNoiseFloor > 0) {
+                const noiseDb = rawToDb(latestNoiseFloor);
+                const noiseY = height - ((noiseDb - spectrumMinDb) / dbRange) * height;
+
+                if (noiseY > 0 && noiseY < height) {
+                    ctx.strokeStyle = 'rgba(255, 100, 100, 0.5)';
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([5, 5]);
+                    ctx.beginPath();
+                    ctx.moveTo(0, noiseY);
+                    ctx.lineTo(width, noiseY);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // Label
+                    ctx.fillStyle = '#ff6666';
+                    ctx.font = '9px monospace';
+                    ctx.textAlign = 'left';
+                    ctx.fillText('Noise Floor: ' + noiseDb.toFixed(1) + ' dB', 60, noiseY - 3);
+                }
             }
 
             // Draw selection region with enhanced visuals
@@ -11330,6 +11972,15 @@ H or ? - Show this help
     <script src="/js/utils.js"></script>
     <script src="/js/settings.js"></script>
 
+    <!-- Colormap utilities -->
+    <script src="/js/utils/colormap.js"></script>
+
+    <!-- Display modules -->
+    <script src="/js/displays/waterfall.js"></script>
+    <script src="/js/displays/spectrum.js"></script>
+    <script src="/js/displays/iq_constellation.js"></script>
+    <script src="/js/displays/cross_correlation.js"></script>
+
     <!-- Feature modules -->
     <script src="/js/scanner_enhanced.js"></script>
     <script src="/js/signal_filters.js"></script>
@@ -11340,6 +11991,47 @@ H or ? - Show this help
 
     <!-- Attach event listeners AFTER modules load -->
     <script>
+        // Initialize display modules
+        (function() {
+            console.log('Initializing display modules...');
+
+            // Get canvas elements
+            const wfCanvas = document.getElementById('waterfall');
+            const wfCanvas2 = document.getElementById('waterfall2');
+            const specCanvas = document.getElementById('spectrum');
+            const specCanvas2 = document.getElementById('spectrum2');
+            const iqCanvas = document.getElementById('iq_canvas');
+            const xcorrCanvas = document.getElementById('xcorr_canvas');
+
+            // Initialize modules with their canvases
+            if (typeof WaterfallDisplay !== 'undefined') {
+                WaterfallDisplay.init(wfCanvas, wfCanvas2, window.zoomState || {
+                    zoomStartBin: 0,
+                    zoomEndBin: 4095,
+                    centerFreq: 915000000,
+                    fullBandwidth: 40000000
+                });
+                console.log('✓ WaterfallDisplay initialized');
+            }
+
+            if (typeof SpectrumDisplay !== 'undefined') {
+                SpectrumDisplay.init(specCanvas, specCanvas2, window.zoomState);
+                console.log('✓ SpectrumDisplay initialized');
+            }
+
+            if (typeof IQConstellation !== 'undefined') {
+                IQConstellation.init(iqCanvas);
+                console.log('✓ IQConstellation initialized');
+            }
+
+            if (typeof CrossCorrelation !== 'undefined') {
+                CrossCorrelation.init(xcorrCanvas);
+                console.log('✓ CrossCorrelation initialized');
+            }
+
+            console.log('Display modules initialization complete');
+        })();
+
         // Draggable panel system
         function makePanelDraggable(panel) {
             const header = panel.querySelector('.panel-header');
@@ -12541,56 +13233,121 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         // Serve JavaScript modules from web_assets/js/
         else if (mg_strcmp(hm->uri, mg_str("/js/rf_measurements.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/rf_measurements.js");
+            std::string js_content = read_js_file("server/web_assets/js/rf_measurements.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/marker_system.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/marker_system.js");
+            std::string js_content = read_js_file("server/web_assets/js/marker_system.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/vsa_analysis.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/vsa_analysis.js");
+            std::string js_content = read_js_file("server/web_assets/js/vsa_analysis.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/statistics.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/statistics.js");
+            std::string js_content = read_js_file("server/web_assets/js/statistics.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/utils.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/utils.js");
+            std::string js_content = read_js_file("server/web_assets/js/utils.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/settings.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/settings.js");
+            std::string js_content = read_js_file("server/web_assets/js/settings.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/scanner_enhanced.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/scanner_enhanced.js");
+            std::string js_content = read_js_file("server/web_assets/js/scanner_enhanced.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/signal_filters.js")) == 0) {
-            std::string js_content = read_js_file("bladerfsensor/server/web_assets/js/signal_filters.js");
+            std::string js_content = read_js_file("server/web_assets/js/signal_filters.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/marker_system.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/marker_system.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/rf_measurements.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/rf_measurements.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/vsa_analysis.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/vsa_analysis.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/signal_classifier.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/signal_classifier.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        // Display modules
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/waterfall.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/waterfall.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/spectrum.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/spectrum.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/iq_constellation.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/iq_constellation.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/cross_correlation.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/cross_correlation.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        // Utility modules
+        else if (mg_strcmp(hm->uri, mg_str("/js/utils/colormap.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/utils/colormap.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",

@@ -75,7 +75,19 @@ std::vector<std::vector<uint8_t>> g_avg_buffer_ch2;  // Channel 2 averaging buff
 uint32_t g_avg_index = 0;                             // Current averaging buffer index
 
 // Last valid DoA result (hold when confidence is too low)
-LastValidDoA g_last_valid_doa = {false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, 0};
+LastValidDoA g_last_valid_doa = {
+    .has_valid = false,
+    .azimuth = 0.0f,
+    .back_azimuth = 0.0f,
+    .phase_diff_deg = 0.0f,
+    .phase_std_deg = 0.0f,
+    .confidence = 0.0f,
+    .snr_db = 0.0f,
+    .coherence = 0.0f,
+    .last_start_bin = 0,
+    .last_end_bin = 0,
+    .kalman = {0.0f, 0.0f, {{0.0f, 0.0f}, {0.0f, 0.0f}}, false, 0}
+};
 
 // Signal handler for graceful shutdown on SIGINT/SIGTERM
 // Stops data acquisition closes recordings and sets global shutdown flag
@@ -188,12 +200,27 @@ int main(int argc, char *argv[]) {
     std::cout << "bladeRF Sensor Server" << std::endl;
     std::cout << "=====================" << std::endl;
 
-    // Initialize FFTW
+    // Initialize FFTW with wisdom for fast startup
     std::cout << "Initializing FFTW..." << std::endl;
+
+    // Try to load wisdom file for optimized plans
+    const char* wisdom_file = "fftw_wisdom.dat";
+    if (fftwf_import_wisdom_from_filename(wisdom_file)) {
+        std::cout << "Loaded FFTW wisdom from " << wisdom_file << std::endl;
+    } else {
+        std::cout << "No FFTW wisdom file found, will create plans from scratch" << std::endl;
+    }
+
+    // Create FFT plans (FFTW_MEASURE will take time on first run, but wisdom speeds it up)
     fft_plan_ch1 = fftwf_plan_dft_1d(FFT_SIZE, fft_in_ch1.data(), fft_out_ch1.data(),
                                      FFTW_FORWARD, FFTW_MEASURE);
     fft_plan_ch2 = fftwf_plan_dft_1d(FFT_SIZE, fft_in_ch2.data(), fft_out_ch2.data(),
                                      FFTW_FORWARD, FFTW_MEASURE);
+
+    // Export wisdom for future runs
+    if (fftwf_export_wisdom_to_filename(wisdom_file)) {
+        std::cout << "Saved FFTW wisdom to " << wisdom_file << std::endl;
+    }
 
     // Initialize window function (default: Hamming)
     std::cout << "Initializing window function..." << std::endl;

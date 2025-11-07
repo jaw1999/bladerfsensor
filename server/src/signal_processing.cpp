@@ -123,7 +123,8 @@ void compute_magnitude_db(fftwf_complex *fft_out, uint8_t *mag_out, size_t size)
         float real = fft_out[i][0];
         float imag = fft_out[i][1];
 
-        float power = real * real + imag * imag;
+        float magnitude = std::hypot(real, imag);
+        float power = magnitude * magnitude;
         float db = DB_SCALE * std::log10(std::max(power, MIN_POWER));
 
         if (db < min_db) min_db = db;
@@ -176,8 +177,7 @@ void compute_cross_correlation(fftwf_complex *fft_ch1, fftwf_complex *fft_ch2,
         const float corr_real = real1 * real2 - imag1 * imag2;
         const float corr_imag = real1 * imag2 + imag1 * real2;
 
-        const float power = corr_real * corr_real + corr_imag * corr_imag;
-        correlation[i] = sqrtf(power);
+        correlation[i] = std::hypot(corr_real, corr_imag);
 
         phase_diff[i] = atan2f(corr_imag, corr_real);
     }
@@ -303,7 +303,7 @@ void update_noise_floor(NoiseFloorState& nf, const uint8_t* ch1_mag, const uint8
 
     // Calculate noise floor for CH1 using percentile method
     // Copy magnitude data to temporary buffer for sorting
-    nf.sorted_buffer.resize(len);
+    // Buffer is pre-allocated in init_noise_floor, no reallocation needed
     std::copy(ch1_mag, ch1_mag + len, nf.sorted_buffer.begin());
 
     // Sort to find percentile

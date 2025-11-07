@@ -4,6 +4,7 @@
 
 #include "web_server.h"
 #include "bladerf_sensor.h"
+#include "recording.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -58,9 +59,14 @@ LinkQuality g_link_quality;                          // Link quality metrics buf
 DoAResult g_doa_result;                              // Direction of Arrival result buffer
 ScannerState g_scanner;                              // Frequency scanner state
 ClassificationBuffer g_classifications;              // Signal classification buffer
+GPSPosition g_gps_position;                          // GPS position data buffer
 static std::atomic<bool> g_web_running{false};       // Web server thread running flag
 static std::thread g_web_thread;                     // Web server worker thread
 static std::atomic<uint64_t> g_http_bytes_sent{0};   // Actual HTTP bytes sent counter
+
+// GPS thread state
+static std::atomic<bool> g_gps_running{false};       // GPS thread running flag
+static std::thread g_gps_thread;                     // GPS worker thread
 
 #ifdef USE_MONGOOSE
 static struct mg_mgr g_mgr;                          // Mongoose event manager
@@ -75,11 +81,11 @@ extern std::atomic<uint32_t> g_gain_rx2;
 extern std::atomic<bool> g_params_changed;
 extern std::mutex g_config_mutex;
 
-// Recording functions from main.cpp
-extern bool start_recording(const std::string& filename);
-extern void stop_recording();
-extern RecordingState g_recording;
-extern std::mutex g_recording_mutex;
+// Direction finding bin range selection
+extern std::atomic<uint32_t> g_df_start_bin;
+extern std::atomic<uint32_t> g_df_end_bin;
+
+// Recording functions now in recording.h
 
 // Perceptually uniform color mapping for waterfall display
 struct RGB {
@@ -276,6 +282,167 @@ uint64_t get_and_reset_http_bytes() {
     return g_http_bytes_sent.exchange(0);
 }
 
+// ============================================================================
+// GPS POSITION MANAGEMENT
+//
+// Functions for managing GPS position data from gpsd or manual entry
+// ============================================================================
+
+// Update GPS position from manual entry
+void set_manual_position(double latitude, double longitude, double altitude_m) {
+    std::lock_guard<std::mutex> lock(g_gps_position.mutex);
+
+    // Stop GPS thread if running
+    if (g_gps_running.load()) {
+        g_gps_running.store(false);
+        if (g_gps_thread.joinable()) {
+            g_gps_thread.join();
+        }
+    }
+
+    g_gps_position.mode = GPSPosition::Mode::MANUAL;
+    g_gps_position.valid = true;
+    g_gps_position.latitude = latitude;
+    g_gps_position.longitude = longitude;
+    g_gps_position.altitude_m = altitude_m;
+    g_gps_position.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    g_gps_position.satellites = 0;
+    g_gps_position.hdop = 0;
+
+    std::cout << "GPS: Manual position set to " << std::fixed << std::setprecision(6)
+              << latitude << ", " << longitude << " @ " << altitude_m << "m" << std::endl;
+}
+
+// GPS client thread - connects to gpsd and updates position
+static void gps_thread_func() {
+    std::cout << "GPS: Client thread started, connecting to gpsd..." << std::endl;
+
+    while (g_gps_running.load()) {
+        // Try to connect to gpsd on localhost:2947
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            std::cerr << "GPS: Failed to create socket" << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            continue;
+        }
+
+        struct sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(2947);
+        inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
+
+        if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            std::cerr << "GPS: Could not connect to gpsd (is it running?)" << std::endl;
+            close(sock);
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            continue;
+        }
+
+        std::cout << "GPS: Connected to gpsd" << std::endl;
+
+        // Send ?WATCH command to start streaming
+        const char* watch_cmd = "?WATCH={\"enable\":true,\"json\":true}\n";
+        send(sock, watch_cmd, strlen(watch_cmd), 0);
+
+        char buffer[4096];
+        while (g_gps_running.load()) {
+            int n = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            if (n <= 0) {
+                std::cerr << "GPS: Connection lost" << std::endl;
+                break;
+            }
+
+            buffer[n] = '\0';
+
+            // Simple JSON parsing for TPV (Time-Position-Velocity) messages
+            // Look for "class":"TPV" messages
+            const char* tpv_start = strstr(buffer, "\"class\":\"TPV\"");
+            if (tpv_start) {
+                double lat = 0, lon = 0, alt = 0;
+                int mode = 0;
+
+                // Extract latitude
+                const char* lat_str = strstr(tpv_start, "\"lat\":");
+                if (lat_str) sscanf(lat_str + 6, "%lf", &lat);
+
+                // Extract longitude
+                const char* lon_str = strstr(tpv_start, "\"lon\":");
+                if (lon_str) sscanf(lon_str + 6, "%lf", &lon);
+
+                // Extract altitude
+                const char* alt_str = strstr(tpv_start, "\"alt\":");
+                if (alt_str) sscanf(alt_str + 6, "%lf", &alt);
+
+                // Extract mode (0=no fix, 2=2D, 3=3D)
+                const char* mode_str = strstr(tpv_start, "\"mode\":");
+                if (mode_str) sscanf(mode_str + 7, "%d", &mode);
+
+                // Update position if we have at least 2D fix
+                if (mode >= 2 && lat != 0 && lon != 0) {
+                    std::lock_guard<std::mutex> lock(g_gps_position.mutex);
+                    g_gps_position.mode = GPSPosition::Mode::GPS_AUTO;
+                    g_gps_position.valid = true;
+                    g_gps_position.latitude = lat;
+                    g_gps_position.longitude = lon;
+                    g_gps_position.altitude_m = alt;
+                    g_gps_position.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+
+                    static int gps_update_counter = 0;
+                    if (++gps_update_counter % 10 == 0) {  // Log every 10 updates
+                        std::cout << "GPS: Position " << std::fixed << std::setprecision(6)
+                                  << lat << ", " << lon << " @ " << alt << "m" << std::endl;
+                    }
+                }
+            }
+
+            // Parse SKY message for satellite info
+            const char* sky_start = strstr(buffer, "\"class\":\"SKY\"");
+            if (sky_start) {
+                int sats = 0;
+                float hdop = 99.9f;
+
+                const char* sats_str = strstr(sky_start, "\"uSat\":");
+                if (sats_str) sscanf(sats_str + 7, "%d", &sats);
+
+                const char* hdop_str = strstr(sky_start, "\"hdop\":");
+                if (hdop_str) sscanf(hdop_str + 7, "%f", &hdop);
+
+                std::lock_guard<std::mutex> lock(g_gps_position.mutex);
+                g_gps_position.satellites = sats;
+                g_gps_position.hdop = hdop;
+            }
+        }
+
+        close(sock);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    std::cout << "GPS: Client thread stopped" << std::endl;
+}
+
+// Enable/disable GPS auto mode
+void set_gps_mode(bool enable) {
+    if (enable) {
+        // Start GPS thread if not already running
+        if (!g_gps_running.load()) {
+            g_gps_running.store(true);
+            g_gps_thread = std::thread(gps_thread_func);
+            std::cout << "GPS: Auto mode enabled" << std::endl;
+        }
+    } else {
+        // Stop GPS thread
+        if (g_gps_running.load()) {
+            g_gps_running.store(false);
+            if (g_gps_thread.joinable()) {
+                g_gps_thread.join();
+            }
+            std::cout << "GPS: Auto mode disabled" << std::endl;
+        }
+    }
+}
+
 // Generate PNG image from waterfall buffer history
 // Converts the circular buffer of FFT magnitudes into a color-mapped PNG image
 // Args
@@ -366,7 +533,7 @@ const char* html_page = R"HTMLDELIM(
         }
         .status-info {
             display: flex;
-            gap: 15px;
+            gap: 12px;
             font-size: 12px;
             color: #888;
         }
@@ -381,22 +548,27 @@ const char* html_page = R"HTMLDELIM(
             justify-content: space-between;
             width: 100%;
         }
+        .header-left-controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
         .workspace-tabs {
             display: flex;
             gap: 0;
         }
         .workspace-tab {
-            padding: 8px 20px;
+            padding: 6px 16px;
             background: rgba(30, 30, 30, 0.5);
             border: 1px solid #333;
             border-bottom: none;
             color: #888;
-            font-size: 13px;
+            font-size: 12px;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.2s;
             user-select: none;
-            border-radius: 6px 6px 0 0;
+            border-radius: 4px 4px 0 0;
             margin-right: -1px;
         }
         .workspace-tab:hover {
@@ -738,15 +910,35 @@ const char* html_page = R"HTMLDELIM(
         }
         .control-group {
             margin-bottom: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
         }
         .control-group label {
-            display: block;
             color: #888;
             font-size: 10px;
-            margin-bottom: 3px;
+            line-height: 1.2;
         }
-        .control-group input {
-            width: calc(100% - 60px);
+        .control-group label.checkbox-label {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            margin: 0;
+        }
+        .control-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 8px;
+            cursor: pointer;
+        }
+        .control-group .input-row {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .control-group input[type="number"],
+        .control-group input[type="text"] {
+            flex: 1;
+            min-width: 0;
             background: rgba(255, 255, 255, 0.1);
             border: 1px solid #444;
             border-radius: 3px;
@@ -754,23 +946,51 @@ const char* html_page = R"HTMLDELIM(
             color: #fff;
             font-size: 11px;
         }
-        .control-group input:focus {
+        .control-group input[type="range"] {
+            flex: 1;
+            min-width: 0;
+            height: 20px;
+        }
+        .control-group select {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid #444;
+            border-radius: 3px;
+            padding: 4px 6px;
+            color: #fff;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .control-group input:focus,
+        .control-group select:focus {
             outline: none;
             border-color: #0ff;
         }
         .control-group button {
-            width: 50px;
-            margin-left: 5px;
+            flex-shrink: 0;
+            min-width: 45px;
             background: rgba(0, 255, 255, 0.2);
             border: 1px solid #0ff;
             border-radius: 3px;
-            padding: 4px;
+            padding: 4px 8px;
             color: #0ff;
             font-size: 10px;
             cursor: pointer;
+            white-space: nowrap;
         }
         .control-group button:hover {
             background: rgba(0, 255, 255, 0.3);
+        }
+        .control-group button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .control-group .range-value {
+            flex-shrink: 0;
+            min-width: 40px;
+            text-align: right;
+            color: #0ff;
+            font-size: 10px;
         }
         .toggle-controls {
             position: fixed;
@@ -999,23 +1219,25 @@ const char* html_page = R"HTMLDELIM(
             <span>RES: <span class="status-value" id="resolution">---</span></span>
             <span id="zoom_indicator" style="display: none;">ZOOM: <span class="status-value" id="zoom_level">1x</span></span>
             <span>GAIN: <span class="status-value" id="gain">---</span></span>
-            <span style="color: #888; margin-left: 10px;">|</span>
             <span>LINK: <span class="status-value" id="link_quality_bar">●●●●●</span></span>
             <span>RTT: <span class="status-value" id="rtt">--</span></span>
             <span>BW: <span class="status-value" id="bandwidth">--</span></span>
-            <span style="color: #888; margin-left: 10px;">|</span>
-            <span class="connection-status connecting" id="connectionStatus">CONNECTING</span>
+            <span id="gps_status_bar">GPS: <span class="status-value" id="gps_mode_bar">OFF</span></span>
         </div>
         <div class="controls">
-            <div class="workspace-tabs">
-                <div class="workspace-tab active" data-tab="live">LIVE</div>
-                <div class="workspace-tab" data-tab="direction">DIRECTION</div>
-                <div class="workspace-tab" data-tab="scanner">SCANNER</div>
+            <div class="header-left-controls">
+                <span class="connection-status connecting" id="connectionStatus">CONNECTING</span>
+                <div class="workspace-tabs">
+                    <div class="workspace-tab active" data-tab="live">LIVE</div>
+                    <div class="workspace-tab" data-tab="direction">DIRECTION</div>
+                    <div class="workspace-tab" data-tab="scanner">SCANNER</div>
+                </div>
             </div>
             <div class="header-right-controls">
                 <button id="spectrum_toggle" class="spectrum-toggle active">Spectrum</button>
                 <button id="cursor_toggle" class="spectrum-toggle">Cursor</button>
                 <button id="recorder_toggle" class="spectrum-toggle" onclick="toggleRecorder()">Record</button>
+                <button id="gps_toggle" class="spectrum-toggle" onclick="toggleGPS()">📍 GPS</button>
                 <select id="channel_select" class="channel-switch">
                     <option value="1">RX1</option>
                     <option value="2">RX2</option>
@@ -1394,8 +1616,8 @@ const char* html_page = R"HTMLDELIM(
                         <span style="font-size: 11px;">Static (Manual Entry)</span>
                     </label>
                     <label style="display: flex; align-items: center; cursor: pointer;">
-                        <input type="radio" name="position_mode" value="dynamic" onchange="togglePositionMode()" style="margin-right: 8px;">
-                        <span style="font-size: 11px;">Dynamic (GPS - TODO)</span>
+                        <input type="radio" name="position_mode" value="gps" onchange="togglePositionMode()" style="margin-right: 8px;">
+                        <span style="font-size: 11px;">GPS (from gpsd)</span>
                     </label>
                 </div>
 
@@ -1438,10 +1660,23 @@ const char* html_page = R"HTMLDELIM(
                     </div>
                 </div>
 
-                <div id="dynamic_position_info" style="display: none;">
-                    <div style="background: #0a0a0a; padding: 10px; border-radius: 3px; border: 1px solid #333;">
-                        <div style="font-size: 10px; color: #ff0; margin-bottom: 5px;">⚠ GPS Integration TODO</div>
-                        <div style="font-size: 9px; color: #888;">Future: Connect to GPSD or serial GPS for dynamic positioning</div>
+                <div id="gps_position_info" style="display: none;">
+                    <div style="background: #0a0a0a; padding: 10px; border-radius: 3px; border: 1px solid #333; font-size: 11px;">
+                        <div style="margin-bottom: 8px;">
+                            <strong style="color: #0ff;">GPS Status:</strong>
+                            <span id="streamout_gps_status" style="color: #f80;">Checking...</span>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <strong style="color: #0ff;">Position:</strong><br>
+                            <span id="streamout_gps_position" style="font-family: monospace; font-size: 10px;">--</span>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <strong style="color: #0ff;">Satellites:</strong>
+                            <span id="streamout_gps_sats">0</span>
+                        </div>
+                        <div style="font-size: 9px; color: #666; margin-top: 8px;">
+                            Position will be pulled from GPS Monitor
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1493,6 +1728,48 @@ const char* html_page = R"HTMLDELIM(
         </div>
     </div>
 
+    <!-- GPS Monitor Panel -->
+    <div id="gps_panel" class="draggable-panel" style="display: none; top: 100px; left: 20px; width: 350px;">
+        <div class="panel-header">
+            <span class="panel-title">📍 GPS Monitor</span>
+            <div>
+                <span class="panel-close" onclick="toggleGPS()">&times;</span>
+            </div>
+        </div>
+        <div style="padding: 12px; font-size: 11px;">
+            <!-- GPS Status Display -->
+            <div style="background: #0a0a0a; padding: 10px; border-radius: 3px; border: 1px solid #333; margin-bottom: 10px;">
+                <div style="margin-bottom: 6px;">
+                    <strong style="color: #0ff;">Status:</strong>
+                    <span id="gps_panel_status" style="color: #888;">Connecting...</span>
+                </div>
+                <div style="margin-bottom: 6px;">
+                    <strong style="color: #0ff;">Position:</strong><br>
+                    <span id="gps_panel_position" style="color: #888; font-family: monospace; font-size: 10px;">--</span>
+                </div>
+                <div style="margin-bottom: 6px;">
+                    <strong style="color: #0ff;">Altitude:</strong>
+                    <span id="gps_panel_altitude" style="color: #888;">-- m</span>
+                </div>
+                <div style="margin-bottom: 6px;">
+                    <strong style="color: #0ff;">Satellites:</strong>
+                    <span id="gps_panel_sats" style="color: #888;">0</span>
+                </div>
+                <div>
+                    <strong style="color: #0ff;">HDOP:</strong>
+                    <span id="gps_panel_hdop" style="color: #888;">--</span>
+                </div>
+            </div>
+
+            <div style="font-size: 9px; color: #666;">
+                Monitoring gpsd on localhost:2947
+            </div>
+            <button onclick="connectGPSD()" style="width: 100%; padding: 6px; margin-top: 8px; background: #0a3a0a; border: 1px solid #0ff; color: #0ff; cursor: pointer; border-radius: 3px; font-size: 10px;">
+                🔄 Reconnect
+            </button>
+        </div>
+    </div>
+
     <!-- Global draggable panels (outside workspaces) -->
     <div id="iq_constellation" class="draggable-panel" style="display: none; top: 100px; right: 20px;">
         <div class="panel-header">
@@ -1507,16 +1784,23 @@ const char* html_page = R"HTMLDELIM(
         </div>
     </div>
 
-    <div id="xcorr_display" class="draggable-panel" style="display: none; bottom: 20px; left: 100px;">
+    <div id="xcorr_display" class="draggable-panel" style="display: none; bottom: 20px; left: 100px; width: 650px;">
         <div class="panel-header">
-            <span class="panel-title">Cross-Correlation</span>
+            <span class="panel-title">Cross-Correlation Analysis</span>
             <div>
                 <span class="panel-detach" onclick="detachPanel('xcorr_display')" title="Detach to floating">&#8599;</span>
                 <span class="panel-close" onclick="toggleXCorr()">&times;</span>
             </div>
         </div>
         <div style="padding: 10px;">
-            <canvas id="xcorr_canvas" width="600" height="200"></canvas>
+            <div style="display: flex; gap: 10px; margin-bottom: 8px; font-size: 11px; color: #888;">
+                <div>Coherence: <span id="xcorr_coherence" style="color: #0ff;">--</span></div>
+                <div>Time Delay: <span id="xcorr_delay" style="color: #0ff;">--</span></div>
+                <div>Phase Diff: <span id="xcorr_phase" style="color: #0ff;">--</span></div>
+            </div>
+            <div id="xcorr_canvas_container" style="width: 100%; height: 220px; position: relative;">
+                <canvas id="xcorr_canvas" style="width: 100%; height: 100%;"></canvas>
+            </div>
         </div>
     </div>
 
@@ -2347,12 +2631,14 @@ const char* html_page = R"HTMLDELIM(
         </div>
         <div class="control-group">
             <label>Frequency (MHz)</label>
-            <input type="number" id="freqInput" step="0.01" min="47" max="6000" value="915.00" title="Center frequency in MHz (47-6000)">
-            <button onclick="applyFrequency()" title="Apply frequency">Set</button>
+            <div class="input-row">
+                <input type="number" id="freqInput" step="0.01" min="47" max="6000" value="915.00" title="Center frequency in MHz (47-6000)">
+                <button onclick="applyFrequency()" title="Apply frequency">Set</button>
+            </div>
         </div>
         <div class="control-group">
             <label>Frequency Presets</label>
-            <select id="freqPresets" onchange="applyFrequencyPreset()" style="width: 100%;" title="Quick access to common frequency bands">
+            <select id="freqPresets" onchange="applyFrequencyPreset()" title="Quick access to common frequency bands">
                 <option value="">-- Select Preset --</option>
                 <optgroup label="ISM Bands">
                     <option value="315.0">315 MHz ISM</option>
@@ -2389,28 +2675,36 @@ const char* html_page = R"HTMLDELIM(
         </div>
         <div class="control-group">
             <label>Sample Rate (MHz)</label>
-            <input type="number" id="srInput" step="0.1" min="0.52" max="61.44" value="40.0">
-            <button onclick="applySampleRate()">Set</button>
+            <div class="input-row">
+                <input type="number" id="srInput" step="0.1" min="0.52" max="61.44" value="40.0">
+                <button onclick="applySampleRate()">Set</button>
+            </div>
         </div>
         <div class="control-group">
             <label>Bandwidth (MHz)</label>
-            <input type="number" id="bwInput" step="0.1" min="0.52" max="61.44" value="40.0">
-            <button onclick="applyBandwidth()">Set</button>
+            <div class="input-row">
+                <input type="number" id="bwInput" step="0.1" min="0.52" max="61.44" value="40.0">
+                <button onclick="applyBandwidth()">Set</button>
+            </div>
         </div>
         <div class="control-group">
             <label>Gain RX1 (dB)</label>
-            <input type="number" id="gain1Input" step="1" min="0" max="60" value="40" title="RF gain for receiver channel 1 (0-60 dB)">
-            <button onclick="applyGain1()" title="Apply gain to RX1">Set</button>
+            <div class="input-row">
+                <input type="number" id="gain1Input" step="1" min="0" max="60" value="40" title="RF gain for receiver channel 1 (0-60 dB)">
+                <button onclick="applyGain1()" title="Apply gain to RX1">Set</button>
+            </div>
         </div>
         <div class="control-group">
             <label>Gain RX2 (dB)</label>
-            <input type="number" id="gain2Input" step="1" min="0" max="60" value="40" title="RF gain for receiver channel 2 (0-60 dB)">
-            <button onclick="applyGain2()" title="Apply gain to RX2">Set</button>
+            <div class="input-row">
+                <input type="number" id="gain2Input" step="1" min="0" max="60" value="40" title="RF gain for receiver channel 2 (0-60 dB)">
+                <button onclick="applyGain2()" title="Apply gain to RX2">Set</button>
+            </div>
         </div>
         <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Display Settings</h3>
         <div class="control-group">
             <label>Quality Profile</label>
-            <select id="qualityProfile" onchange="applyQualityProfile()" style="width: 100%;">
+            <select id="qualityProfile" onchange="applyQualityProfile()">
                 <option value="high">High (Full Quality)</option>
                 <option value="medium">Medium (Balanced)</option>
                 <option value="low">Low (Tactical Link)</option>
@@ -2419,7 +2713,7 @@ const char* html_page = R"HTMLDELIM(
         </div>
         <div class="control-group">
             <label>Color Palette</label>
-            <select id="colorPalette" onchange="changeColorPalette()" style="width: 100%;">
+            <select id="colorPalette" onchange="changeColorPalette()">
                 <option value="viridis">Viridis</option>
                 <option value="plasma">Plasma</option>
                 <option value="inferno">Inferno</option>
@@ -2432,108 +2726,159 @@ const char* html_page = R"HTMLDELIM(
         </div>
         <div class="control-group">
             <label>Waterfall Intensity</label>
-            <input type="range" id="waterfallIntensity" min="0.5" max="2" step="0.1" value="1.0"
-                   oninput="updateWaterfallIntensity(this.value)" style="width: 120px;">
-            <span id="intensityValue" style="color: #0ff; font-size: 11px; margin-left: 5px;">1.0x</span>
+            <div class="input-row">
+                <input type="range" id="waterfallIntensity" min="0.5" max="2" step="0.1" value="1.0" oninput="updateWaterfallIntensity(this.value)">
+                <span id="intensityValue" class="range-value">1.0x</span>
+            </div>
         </div>
         <div class="control-group">
             <label>Waterfall Contrast</label>
-            <input type="range" id="waterfallContrast" min="0.5" max="2" step="0.1" value="1.0"
-                   oninput="updateWaterfallContrast(this.value)" style="width: 120px;">
-            <span id="contrastValue" style="color: #0ff; font-size: 11px; margin-left: 5px;">1.0x</span>
+            <div class="input-row">
+                <input type="range" id="waterfallContrast" min="0.5" max="2" step="0.1" value="1.0" oninput="updateWaterfallContrast(this.value)">
+                <span id="contrastValue" class="range-value">1.0x</span>
+            </div>
         </div>
         <div class="control-group">
             <label>Spectrum Min (dB)</label>
-            <input type="number" id="spectrumMin" step="10" min="-120" max="-20" value="-100">
-            <button onclick="updateSpectrumRange()">Set</button>
+            <div class="input-row">
+                <input type="number" id="spectrumMin" step="10" min="-120" max="-20" value="-100">
+                <button onclick="updateSpectrumRange()">Set</button>
+            </div>
         </div>
         <div class="control-group">
             <label>Spectrum Max (dB)</label>
-            <input type="number" id="spectrumMax" step="10" min="-60" max="20" value="-10">
-            <button onclick="updateSpectrumRange()">Set</button>
+            <div class="input-row">
+                <input type="number" id="spectrumMax" step="10" min="-60" max="20" value="-10">
+                <button onclick="updateSpectrumRange()">Set</button>
+            </div>
         </div>
         <div class="control-group">
-            <label style="display: flex; align-items: center; cursor: pointer;">
-                <input type="checkbox" id="peakHoldCheckbox" onchange="togglePeakHold(this.checked)" style="margin-right: 8px;" title="Hold maximum spectrum values">
-                Peak Hold
+            <div class="input-row">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="peakHoldCheckbox" onchange="togglePeakHold(this.checked)" title="Hold maximum spectrum values">
+                    Peak Hold
+                </label>
+                <button onclick="clearPeakHold()" title="Clear peak hold data">Clear</button>
+            </div>
+        </div>
+        <div class="control-group">
+            <div class="input-row">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="minHoldCheckbox" onchange="toggleMinHold(this.checked)" title="Hold minimum spectrum values">
+                    Min Hold
+                </label>
+                <button onclick="clearMinHold()" title="Clear min hold data">Clear</button>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="checkbox-label">
+                <input type="checkbox" id="refMarkersCheckbox" onchange="toggleRefMarkers(this.checked)" title="Show reference level markers">
+                Reference Markers
             </label>
         </div>
         <div class="control-group">
-            <label style="display: flex; align-items: center; cursor: pointer;">
-                <input type="checkbox" id="persistenceCheckbox" onchange="togglePersistence(this.checked)" style="margin-right: 8px;" title="Show signal trails on waterfall">
+            <div class="input-row">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="bwMeasureCheckbox" onchange="toggleBandwidthMeasure(this.checked)" title="Measure bandwidth between two points">
+                    Bandwidth Measure
+                </label>
+                <span id="bw_measurement" class="range-value">--</span>
+            </div>
+        </div>
+        <div class="control-group">
+            <button onclick="exportSpectrumCSV()" title="Export current spectrum to CSV" style="width: 100%;">
+                Export Spectrum CSV
+            </button>
+        </div>
+        <div class="control-group">
+            <label class="checkbox-label">
+                <input type="checkbox" id="persistenceCheckbox" onchange="togglePersistence(this.checked)" title="Show signal trails on waterfall">
                 Persistence Mode
             </label>
         </div>
         <div class="control-group" id="persistenceControls" style="display: none; padding-left: 20px;">
-            <label style="font-size: 10px;">Decay Rate:</label>
-            <input type="range" id="persistenceDecay" min="0.1" max="0.95" step="0.05" value="0.7" oninput="updatePersistenceDecay(this.value)" style="width: 100%;" title="How fast trails fade">
-            <span id="persistenceDecayValue" style="font-size: 9px; color: #888;">0.7</span>
+            <label>Decay Rate:</label>
+            <div class="input-row">
+                <input type="range" id="persistenceDecay" min="0.1" max="0.95" step="0.05" value="0.7" oninput="updatePersistenceDecay(this.value)" title="How fast trails fade">
+                <span id="persistenceDecayValue" class="range-value">0.7</span>
+            </div>
         </div>
         <div class="control-group">
-            <label style="display: flex; align-items: center; cursor: pointer;">
-                <input type="checkbox" id="signalLogCheckbox" onchange="toggleSignalLog(this.checked)" style="margin-right: 8px;" title="Automatically log strong signals">
+            <label>Waterfall Speed:</label>
+            <div class="input-row">
+                <input type="range" id="waterfallSpeed" min="1" max="20" step="1" value="1" oninput="updateWaterfallSpeed(this.value)" title="Waterfall scroll speed">
+                <span id="waterfallSpeedValue" class="range-value">1x</span>
+            </div>
+        </div>
+        <div class="control-group">
+            <label class="checkbox-label">
+                <input type="checkbox" id="signalLogCheckbox" onchange="toggleSignalLog(this.checked)" title="Automatically log strong signals">
                 Signal Logging
             </label>
         </div>
         <div class="control-group">
-            <button onclick="downloadSignalLog()" id="downloadLogBtn" style="width: 100%; padding: 6px;" title="Download logged signals as CSV" disabled>
+            <button onclick="downloadSignalLog()" id="downloadLogBtn" title="Download logged signals as CSV" disabled style="width: 100%;">
                 Download Signal Log
             </button>
         </div>
 
         <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Advanced Displays</h3>
         <div class="control-group">
-            <label style="display: flex; align-items: center; cursor: pointer;">
-                <input type="checkbox" id="iq_toggle" onchange="toggleIQ()" style="margin-right: 8px;" title="Show IQ constellation diagram">
+            <label class="checkbox-label">
+                <input type="checkbox" id="iq_toggle" onchange="toggleIQ()" title="Show IQ constellation diagram">
                 IQ Constellation
             </label>
         </div>
         <div class="control-group">
-            <label style="display: flex; align-items: center; cursor: pointer;">
-                <input type="checkbox" id="xcorr_toggle" onchange="toggleXCorr()" style="margin-right: 8px;" title="Show cross-correlation plot">
+            <label class="checkbox-label">
+                <input type="checkbox" id="xcorr_toggle" onchange="toggleXCorr()" title="Show cross-correlation plot">
                 Cross-Correlation
             </label>
         </div>
         <div class="control-group">
-            <label style="display: flex; align-items: center; cursor: pointer;">
-                <input type="checkbox" id="filter_mode_toggle" onchange="toggleFilterMode()" style="margin-right: 8px;" title="Enable filter selection mode for IQ/XCorr">
+            <label class="checkbox-label">
+                <input type="checkbox" id="filter_mode_toggle" onchange="toggleFilterMode()" title="Enable filter selection mode for IQ/XCorr">
                 Filter Selection Mode
             </label>
-            <div id="filter_status" style="font-size: 10px; color: #888; margin-left: 24px; min-height: 14px;"></div>
+            <div id="filter_status" style="font-size: 10px; color: #888; padding-left: 24px; min-height: 14px;"></div>
         </div>
 
         <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Configuration Presets</h3>
         <div class="control-group">
             <label>Preset Name</label>
-            <input type="text" id="presetName" placeholder="Enter name" style="width: 120px;">
+            <input type="text" id="presetName" placeholder="Enter name">
         </div>
         <div class="control-group">
             <label>Load Preset</label>
-            <select id="presetSelect" onchange="loadPreset()" style="width: 140px;">
+            <select id="presetSelect" onchange="loadPreset()">
                 <option value="">-- Select --</option>
             </select>
         </div>
-        <div class="control-group" style="margin-top: 8px;">
-            <button onclick="savePreset()" style="padding: 4px 8px; margin-right: 4px;">Save</button>
-            <button onclick="deletePreset()" style="padding: 4px 8px; margin-right: 4px;">Delete</button>
+        <div class="control-group">
+            <div class="input-row">
+                <button onclick="savePreset()">Save</button>
+                <button onclick="deletePreset()">Delete</button>
+            </div>
         </div>
-        <div class="control-group" style="margin-top: 4px;">
-            <button onclick="exportPresets()" style="padding: 4px 8px; margin-right: 4px;">Export</button>
-            <button onclick="importPresets()" style="padding: 4px 8px;">Import</button>
+        <div class="control-group">
+            <div class="input-row">
+                <button onclick="exportPresets()">Export</button>
+                <button onclick="importPresets()">Import</button>
+            </div>
         </div>
         <input type="file" id="presetImportFile" accept=".json" style="display: none;" onchange="handlePresetImport(event)" />
 
         <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Recording</h3>
         <div class="control-group">
-            <button id="recordButton" onclick="toggleRecording()" style="padding: 6px 12px; width: 100%;">Start Recording</button>
-        </div>
-        <div class="control-group" style="margin-top: 5px;">
-            <label style="font-size: 11px;">Duration (sec):</label>
-            <input type="number" id="recordDuration" min="1" max="300" value="10" style="width: 60px;">
+            <button id="recordButton" onclick="toggleRecording()" style="width: 100%;">Start Recording</button>
         </div>
         <div class="control-group">
-            <label style="font-size: 11px;">Mode:</label>
-            <select id="recordMode" onchange="updateRecordMode()" style="width: 100%;">
+            <label>Duration (sec):</label>
+            <input type="number" id="recordDuration" min="1" max="300" value="10">
+        </div>
+        <div class="control-group">
+            <label>Mode:</label>
+            <select id="recordMode" onchange="updateRecordMode()">
                 <option value="full">Full Spectrum</option>
                 <option value="band">Specific Band</option>
             </select>
@@ -2603,6 +2948,56 @@ const char* html_page = R"HTMLDELIM(
         const FFT_SIZE = 4096;
         const IQ_SAMPLES = 256;
         let currentChannel = 1;
+
+        // ===== SETTINGS PERSISTENCE INTEGRATION =====
+        // Note: Settings module is loaded from settings.js
+        // Add convenience functions to load/save display-specific settings
+
+        function loadDisplaySettings() {
+            if (typeof Settings === 'undefined') return;
+
+            console.log('Loading display settings...');
+
+            // Display settings
+            spectrumMinDb = Settings.get('live_spectrum_min_db', -100);
+            spectrumMaxDb = Settings.get('live_spectrum_max_db', -10);
+            waterfallIntensity = Settings.get('live_waterfall_intensity', 1.0);
+            waterfallContrast = Settings.get('live_waterfall_contrast', 1.0);
+
+            // Apply to UI controls
+            const minInput = document.getElementById('spectrumMin');
+            const maxInput = document.getElementById('spectrumMax');
+            const intensityInput = document.getElementById('waterfallIntensity');
+            const contrastInput = document.getElementById('waterfallContrast');
+
+            if (minInput) minInput.value = spectrumMinDb;
+            if (maxInput) maxInput.value = spectrumMaxDb;
+            if (intensityInput) intensityInput.value = waterfallIntensity;
+            if (contrastInput) contrastInput.value = waterfallContrast;
+
+            // Feature toggles
+            const savedPeakHold = Settings.get('live_peak_hold', false);
+            const savedMinHold = Settings.get('live_min_hold', false);
+            const savedRefMarkers = Settings.get('live_ref_markers', false);
+
+            if (savedPeakHold) document.getElementById('peakHoldCheckbox')?.click();
+            if (savedMinHold) document.getElementById('minHoldCheckbox')?.click();
+            if (savedRefMarkers) document.getElementById('refMarkersCheckbox')?.click();
+
+            console.log('✓ Display settings loaded');
+        }
+
+        function saveDisplaySettings() {
+            if (typeof Settings === 'undefined') return;
+
+            Settings.set('live_spectrum_min_db', spectrumMinDb);
+            Settings.set('live_spectrum_max_db', spectrumMaxDb);
+            Settings.set('live_waterfall_intensity', waterfallIntensity);
+            Settings.set('live_waterfall_contrast', waterfallContrast);
+            Settings.set('live_peak_hold', peakHoldEnabled);
+            Settings.set('live_min_hold', minHoldEnabled);
+            Settings.set('live_ref_markers', refMarkersEnabled);
+        }
         let frameCount = 0;
         let lastFpsUpdate = Date.now();
         let measuredFPS = 20;  // Track actual FPS for time axis calculations
@@ -2621,6 +3016,16 @@ const char* html_page = R"HTMLDELIM(
         // Waterfall display controls
         let waterfallIntensity = 1.0;
         let waterfallContrast = 1.0;
+        let waterfallScrollMultiplier = 1;  // Speed multiplier for waterfall scrolling
+
+        // Spectrum hold traces (peakHoldEnabled and peakHoldData declared later with other spectrum state)
+        let minHoldEnabled = false;
+        let minHoldTrace = null;   // Array of min values
+
+        // Reference markers and bandwidth measurement
+        let refMarkersEnabled = false;
+        let bwMeasureEnabled = false;
+        let bwMeasurePoints = [];  // Array of {x, freq, db} for measurement points
 
         // Zoom state (display-only zoom, no hardware reconfiguration)
         let zoomState = {
@@ -3548,6 +3953,77 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
+        function clearPeakHold() {
+            peakHoldData = null;
+            showNotification('Peak hold cleared', 'info', 1000);
+        }
+
+        function toggleMinHold(enabled) {
+            minHoldEnabled = enabled;
+            if (!enabled) {
+                minHoldTrace = null;
+            }
+            saveDisplaySettings();
+        }
+
+        function clearMinHold() {
+            minHoldTrace = null;
+            showNotification('Min hold cleared', 'info', 1000);
+        }
+
+        function toggleRefMarkers(enabled) {
+            refMarkersEnabled = enabled;
+            saveDisplaySettings();
+        }
+
+        function toggleBandwidthMeasure(enabled) {
+            bwMeasureEnabled = enabled;
+            if (!enabled) {
+                bwMeasurePoints = [];
+                document.getElementById('bw_measurement').textContent = '--';
+            } else {
+                showNotification('Click two points on spectrum to measure bandwidth', 'info', 3000);
+            }
+        }
+
+        function exportSpectrumCSV() {
+            if (!latestFFTData || latestFFTData.length === 0) {
+                showNotification('No spectrum data available', 'warning');
+                return;
+            }
+
+            const currentSR = zoomState.fullBandwidth || 40000000;
+            const currentCF = zoomState.centerFreq || 915000000;
+            const binWidth = currentSR / FFT_SIZE;
+            const fullStartFreq = currentCF - currentSR / 2;
+
+            let csv = 'Frequency (Hz),Power (dBFS),Power (dBm)\n';
+
+            for (let i = 0; i < latestFFTData.length; i++) {
+                const freq = fullStartFreq + (i * binWidth);
+                const dbfs = rawToDb(latestFFTData[i]);
+                const dbm = dbfs; // Simplified - adjust based on your calibration
+                csv += `${freq.toFixed(0)},${dbfs.toFixed(2)},${dbm.toFixed(2)}\n`;
+            }
+
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `spectrum_${currentCF}_${Date.now()}.csv`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            showNotification('Spectrum exported to CSV', 'success', 2000);
+        }
+
+        function updateWaterfallSpeed(value) {
+            waterfallScrollMultiplier = parseInt(value);
+            document.getElementById('waterfallSpeedValue').textContent = value + 'x';
+        }
+
         // Signal logging state
         let signalLogEnabled = false;
         let signalLog = [];
@@ -3813,6 +4289,128 @@ const char* html_page = R"HTMLDELIM(
                 spectrumOffscreenCtx.fillText('PEAK HOLD', 5, height - 5);
             }
 
+            // Update and draw min hold trace
+            if (minHoldEnabled) {
+                if (!minHoldTrace || minHoldTrace.length !== data.length) {
+                    minHoldTrace = new Uint8Array(data);
+                } else {
+                    for (let i = 0; i < data.length; i++) {
+                        if (data[i] < minHoldTrace[i]) {
+                            minHoldTrace[i] = data[i];
+                        }
+                    }
+                }
+
+                spectrumOffscreenCtx.strokeStyle = 'rgba(0, 128, 255, 0.6)';
+                spectrumOffscreenCtx.lineWidth = 1;
+                spectrumOffscreenCtx.beginPath();
+
+                for (let x = 0; x < width; x++) {
+                    const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                    const fftIdx = zoomState.zoomStartBin + Math.floor((x / width) * zoomedBins);
+                    const raw = minHoldTrace[fftIdx];
+                    const magDb = rawToDb(raw);
+                    const normalizedMag = Math.max(0, Math.min(1, (magDb - spectrumMinDb) / dbRange));
+                    const y = height - (normalizedMag * height);
+
+                    if (x === 0) {
+                        spectrumOffscreenCtx.moveTo(x, y);
+                    } else {
+                        spectrumOffscreenCtx.lineTo(x, y);
+                    }
+                }
+
+                spectrumOffscreenCtx.stroke();
+
+                spectrumOffscreenCtx.fillStyle = 'rgba(0, 128, 255, 0.8)';
+                spectrumOffscreenCtx.font = 'bold 10px monospace';
+                spectrumOffscreenCtx.textAlign = 'left';
+                spectrumOffscreenCtx.fillText('MIN HOLD', 80, height - 5);
+            }
+
+            // Draw reference level markers
+            if (refMarkersEnabled) {
+                const refLevels = [-100, -80, -60, -40, -20, 0];
+                spectrumOffscreenCtx.strokeStyle = 'rgba(255, 255, 0, 0.3)';
+                spectrumOffscreenCtx.setLineDash([5, 5]);
+                spectrumOffscreenCtx.lineWidth = 1;
+
+                refLevels.forEach(dbLevel => {
+                    if (dbLevel >= spectrumMinDb && dbLevel <= spectrumMaxDb) {
+                        const normalizedPos = (dbLevel - spectrumMinDb) / dbRange;
+                        const y = height - (normalizedPos * height);
+
+                        spectrumOffscreenCtx.beginPath();
+                        spectrumOffscreenCtx.moveTo(0, y);
+                        spectrumOffscreenCtx.lineTo(width, y);
+                        spectrumOffscreenCtx.stroke();
+
+                        spectrumOffscreenCtx.fillStyle = 'rgba(255, 255, 0, 0.7)';
+                        spectrumOffscreenCtx.font = '9px monospace';
+                        spectrumOffscreenCtx.textAlign = 'left';
+                        spectrumOffscreenCtx.fillText(`${dbLevel} dB`, 2, y - 2);
+                    }
+                });
+
+                spectrumOffscreenCtx.setLineDash([]);
+            }
+
+            // Draw bandwidth measurement points and result
+            if (bwMeasureEnabled && bwMeasurePoints.length > 0) {
+                bwMeasurePoints.forEach((point, idx) => {
+                    // Convert normalized position to canvas X coordinate
+                    const canvasX = point.normalizedX * width;
+
+                    // Draw marker
+                    spectrumOffscreenCtx.fillStyle = '#ff00ff';
+                    spectrumOffscreenCtx.beginPath();
+                    spectrumOffscreenCtx.arc(canvasX, height - 20, 5, 0, 2 * Math.PI);
+                    spectrumOffscreenCtx.fill();
+
+                    // Draw vertical line
+                    spectrumOffscreenCtx.strokeStyle = 'rgba(255, 0, 255, 0.5)';
+                    spectrumOffscreenCtx.setLineDash([3, 3]);
+                    spectrumOffscreenCtx.beginPath();
+                    spectrumOffscreenCtx.moveTo(canvasX, 0);
+                    spectrumOffscreenCtx.lineTo(canvasX, height);
+                    spectrumOffscreenCtx.stroke();
+                    spectrumOffscreenCtx.setLineDash([]);
+
+                    // Label
+                    spectrumOffscreenCtx.fillStyle = '#ff00ff';
+                    spectrumOffscreenCtx.font = '10px monospace';
+                    spectrumOffscreenCtx.fillText(`${idx + 1}`, canvasX + 8, height - 15);
+                });
+
+                // Draw measurement result if two points selected
+                if (bwMeasurePoints.length === 2) {
+                    const bw = Math.abs(bwMeasurePoints[1].freq - bwMeasurePoints[0].freq);
+                    const canvasX0 = bwMeasurePoints[0].normalizedX * width;
+                    const canvasX1 = bwMeasurePoints[1].normalizedX * width;
+                    const centerX = (canvasX0 + canvasX1) / 2;
+
+                    // Draw bandwidth span
+                    spectrumOffscreenCtx.strokeStyle = '#ff00ff';
+                    spectrumOffscreenCtx.lineWidth = 2;
+                    spectrumOffscreenCtx.beginPath();
+                    spectrumOffscreenCtx.moveTo(canvasX0, height - 30);
+                    spectrumOffscreenCtx.lineTo(canvasX1, height - 30);
+                    spectrumOffscreenCtx.stroke();
+
+                    // Arrows
+                    [canvasX0, canvasX1].forEach(x => {
+                        spectrumOffscreenCtx.beginPath();
+                        spectrumOffscreenCtx.moveTo(x, height - 30);
+                        spectrumOffscreenCtx.lineTo(x, height - 35);
+                        spectrumOffscreenCtx.stroke();
+                    });
+
+                    // Update display
+                    const bwText = bw >= 1e6 ? (bw / 1e6).toFixed(3) + ' MHz' : (bw / 1e3).toFixed(1) + ' kHz';
+                    document.getElementById('bw_measurement').textContent = bwText;
+                }
+            }
+
             // Draw markers on spectrum (from marker_system.js)
             if (typeof drawMarkersOnSpectrum === 'function') {
                 drawMarkersOnSpectrum(spectrumOffscreenCtx, width, height);
@@ -3873,10 +4471,12 @@ const char* html_page = R"HTMLDELIM(
             if (showXCorr) {
                 panel.style.display = 'block';
                 button.classList.add('active');
-                // Only resize if dimensions changed (setting .width clears canvas!)
-                if (xcorrCanvas.width !== 600 || xcorrCanvas.height !== 200) {
-                    xcorrCanvas.width = 600;
-                    xcorrCanvas.height = 200;
+
+                // Initialize canvas size based on container (auto-resize in drawXCorr will handle it)
+                const container = document.getElementById('xcorr_canvas_container');
+                if (container) {
+                    xcorrCanvas.width = container.clientWidth;
+                    xcorrCanvas.height = container.clientHeight;
                 }
             } else {
                 panel.style.display = 'none';
@@ -4026,14 +4626,98 @@ const char* html_page = R"HTMLDELIM(
             iqCtx.fillRect(60, 23, 10, 2);
         }
 
-        // Draw cross-correlation display
+        // Phase unwrapping helper
+        function unwrapPhase(phase) {
+            const unwrapped = new Float32Array(phase.length);
+            unwrapped[0] = phase[0];
+
+            for (let i = 1; i < phase.length; i++) {
+                let delta = phase[i] - phase[i-1];
+
+                // Detect and correct phase jumps > π
+                while (delta > Math.PI) delta -= 2 * Math.PI;
+                while (delta < -Math.PI) delta += 2 * Math.PI;
+
+                unwrapped[i] = unwrapped[i-1] + delta;
+            }
+
+            return unwrapped;
+        }
+
+        // Calculate coherence metric between channels
+        function calculateCoherence(magnitude) {
+            // Average normalized cross-correlation magnitude
+            // Note: True coherence requires |Gxy|²/(Gxx*Gyy), but we only have |Gxy| here
+            // So we normalize by the maximum value to get a 0-1 range metric
+
+            // Find max magnitude for normalization
+            let max = 0;
+            for (let i = 0; i < magnitude.length; i++) {
+                if (magnitude[i] > max) max = magnitude[i];
+            }
+
+            if (max === 0) return 0;
+
+            // Calculate average normalized magnitude
+            let sum = 0;
+            for (let i = 0; i < magnitude.length; i++) {
+                sum += magnitude[i] / max;
+            }
+            return sum / magnitude.length;
+        }
+
+        // Calculate time delay from phase slope
+        function calculateTimeDelay(phase, sampleRate) {
+            // Time delay from phase slope: τ = dφ/dω / (2π)
+            // Where dφ/dω is the phase slope vs angular frequency
+            const unwrapped = unwrapPhase(phase);
+
+            // Use middle 50% of data to avoid edge effects
+            const startIdx = Math.floor(phase.length * 0.25);
+            const endIdx = Math.floor(phase.length * 0.75);
+
+            const phaseDiff = unwrapped[endIdx] - unwrapped[startIdx];
+            const freqDiff = (endIdx - startIdx) * (sampleRate / FFT_SIZE);
+
+            // delay = phase_slope / (2πΔf)
+            // Positive phase slope = signal arrives later on CH2
+            const delay = phaseDiff / (2 * Math.PI * freqDiff);
+
+            return delay;
+        }
+
+        // Draw cross-correlation display with enhancements
         function drawXCorr(magnitude, phase) {
+            // Auto-resize canvas to match container
+            const container = document.getElementById('xcorr_canvas_container');
+            const containerWidth = container.clientWidth;
+            const containerHeight = container.clientHeight;
+
+            if (xcorrCanvas.width !== containerWidth || xcorrCanvas.height !== containerHeight) {
+                xcorrCanvas.width = containerWidth;
+                xcorrCanvas.height = containerHeight;
+            }
+
             const width = xcorrCanvas.width;
             const height = xcorrCanvas.height;
 
             // Clear canvas
             xcorrCtx.fillStyle = '#0a0a0a';
             xcorrCtx.fillRect(0, 0, width, height);
+
+            // Calculate metrics
+            const coherence = calculateCoherence(magnitude);
+            const sampleRate = zoomState.fullBandwidth || 40000000;
+            const timeDelay = calculateTimeDelay(phase, sampleRate);
+            const avgPhase = phase.reduce((a, b) => a + b, 0) / phase.length;
+
+            // Update display values
+            document.getElementById('xcorr_coherence').textContent = coherence.toFixed(3);
+            document.getElementById('xcorr_delay').textContent = (timeDelay * 1e9).toFixed(2) + ' ns';
+            document.getElementById('xcorr_phase').textContent = (avgPhase * 180 / Math.PI).toFixed(1) + '°';
+
+            // Unwrap phase for better display
+            const unwrappedPhase = unwrapPhase(phase);
 
             // Draw grid
             xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
@@ -4048,14 +4732,18 @@ const char* html_page = R"HTMLDELIM(
                 xcorrCtx.stroke();
             }
 
+            // Downsample for performance (max 2 points per pixel)
+            const downsample = Math.max(1, Math.floor(magnitude.length / (width * 2)));
+
             // Draw magnitude (top half)
             xcorrCtx.strokeStyle = '#00ff00';
             xcorrCtx.lineWidth = 1.5;
             xcorrCtx.beginPath();
+
             for (let x = 0; x < width; x++) {
                 const idx = Math.floor((x / width) * magnitude.length);
                 const mag = Math.min(1.0, magnitude[idx]);
-                const y = (height / 2) * (1 - mag);
+                const y = (height / 2 - 10) * (1 - mag) + 5;
                 if (x === 0) {
                     xcorrCtx.moveTo(x, y);
                 } else {
@@ -4064,14 +4752,19 @@ const char* html_page = R"HTMLDELIM(
             }
             xcorrCtx.stroke();
 
-            // Draw phase (bottom half)
+            // Draw unwrapped phase (bottom half) with auto-scaling
+            const phaseMin = Math.min(...unwrappedPhase);
+            const phaseMax = Math.max(...unwrappedPhase);
+            const phaseRange = phaseMax - phaseMin || 1;
+
             xcorrCtx.strokeStyle = '#ffaa00';
             xcorrCtx.lineWidth = 1.5;
             xcorrCtx.beginPath();
+
             for (let x = 0; x < width; x++) {
-                const idx = Math.floor((x / width) * phase.length);
-                const ph = phase[idx] / Math.PI;  // Normalize to -1 to 1
-                const y = height / 2 + (height / 4) + (ph * height / 4);
+                const idx = Math.floor((x / width) * unwrappedPhase.length);
+                const phNorm = (unwrappedPhase[idx] - phaseMin) / phaseRange;
+                const y = height / 2 + 5 + (height / 2 - 10) * (1 - phNorm);
                 if (x === 0) {
                     xcorrCtx.moveTo(x, y);
                 } else {
@@ -4081,17 +4774,24 @@ const char* html_page = R"HTMLDELIM(
             xcorrCtx.stroke();
 
             // Labels
-            xcorrCtx.fillStyle = '#888';
+            xcorrCtx.fillStyle = '#0f0';
             xcorrCtx.font = '11px monospace';
             xcorrCtx.fillText('Magnitude', 5, 15);
-            xcorrCtx.fillText('Phase (rad)', 5, height / 2 + 15);
 
-            // Center line for phase
-            xcorrCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-            xcorrCtx.beginPath();
-            xcorrCtx.moveTo(0, height * 0.75);
-            xcorrCtx.lineTo(width, height * 0.75);
-            xcorrCtx.stroke();
+            xcorrCtx.fillStyle = '#fa0';
+            xcorrCtx.fillText('Unwrapped Phase', 5, height / 2 + 15);
+
+            // Zero reference line for phase
+            if (phaseMin < 0 && phaseMax > 0) {
+                const zeroY = height / 2 + 5 + (height / 2 - 10) * (1 - (-phaseMin / phaseRange));
+                xcorrCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+                xcorrCtx.setLineDash([5, 5]);
+                xcorrCtx.beginPath();
+                xcorrCtx.moveTo(0, zeroY);
+                xcorrCtx.lineTo(width, zeroY);
+                xcorrCtx.stroke();
+                xcorrCtx.setLineDash([]);
+            }
         }
 
         // Track bandwidth for display
@@ -4786,16 +5486,175 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
+        // ===== KEYBOARD SHORTCUTS =====
+        document.addEventListener('keydown', (e) => {
+            // Ignore if typing in input field
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+            const key = e.key.toLowerCase();
+
+            switch(key) {
+                case 'f': // Toggle filter mode
+                    e.preventDefault();
+                    document.getElementById('filter_mode_toggle')?.click();
+                    break;
+
+                case 'z': // Toggle zoom mode
+                    e.preventDefault();
+                    document.getElementById('zoom_mode_toggle')?.click();
+                    break;
+
+                case 'x': // Clear zoom
+                    e.preventDefault();
+                    if (zoomState.isZoomed) zoomOut();
+                    break;
+
+                case 's': // Toggle spectrum
+                    e.preventDefault();
+                    toggleSpectrum();
+                    break;
+
+                case 'i': // Toggle IQ constellation
+                    e.preventDefault();
+                    toggleIQ();
+                    break;
+
+                case 'c': // Toggle cross-correlation
+                    e.preventDefault();
+                    toggleXCorr();
+                    break;
+
+                case 'p': // Toggle peak hold
+                    e.preventDefault();
+                    const peakCheckbox = document.getElementById('peakHoldCheckbox');
+                    if (peakCheckbox) {
+                        peakCheckbox.checked = !peakCheckbox.checked;
+                        togglePeakHold(peakCheckbox.checked);
+                    }
+                    break;
+
+                case 'm': // Toggle min hold
+                    e.preventDefault();
+                    const minCheckbox = document.getElementById('minHoldCheckbox');
+                    if (minCheckbox) {
+                        minCheckbox.checked = !minCheckbox.checked;
+                        toggleMinHold(minCheckbox.checked);
+                    }
+                    break;
+
+                case 'r': // Toggle reference markers
+                    e.preventDefault();
+                    const refCheckbox = document.getElementById('refMarkersCheckbox');
+                    if (refCheckbox) {
+                        refCheckbox.checked = !refCheckbox.checked;
+                        toggleRefMarkers(refCheckbox.checked);
+                    }
+                    break;
+
+                case 'b': // Toggle bandwidth measure
+                    e.preventDefault();
+                    const bwCheckbox = document.getElementById('bwMeasureCheckbox');
+                    if (bwCheckbox) {
+                        bwCheckbox.checked = !bwCheckbox.checked;
+                        toggleBandwidthMeasure(bwCheckbox.checked);
+                    }
+                    break;
+
+                case 'arrowup': // Increase gain
+                    e.preventDefault();
+                    const gain1Input = document.getElementById('gain1Input');
+                    if (gain1Input) {
+                        gain1Input.value = Math.min(60, parseInt(gain1Input.value) + 3);
+                        applyGain1();
+                    }
+                    break;
+
+                case 'arrowdown': // Decrease gain
+                    e.preventDefault();
+                    const gain1Down = document.getElementById('gain1Input');
+                    if (gain1Down) {
+                        gain1Down.value = Math.max(0, parseInt(gain1Down.value) - 3);
+                        applyGain1();
+                    }
+                    break;
+
+                case 'arrowright': // Fine tune frequency up
+                    if (e.shiftKey) {
+                        e.preventDefault();
+                        const freqInput = document.getElementById('freqInput');
+                        if (freqInput) {
+                            freqInput.value = (parseFloat(freqInput.value) + 0.001).toFixed(3);
+                            applyFrequency();
+                        }
+                    }
+                    break;
+
+                case 'arrowleft': // Fine tune frequency down
+                    if (e.shiftKey) {
+                        e.preventDefault();
+                        const freqDown = document.getElementById('freqInput');
+                        if (freqDown) {
+                            freqDown.value = (parseFloat(freqDown.value) - 0.001).toFixed(3);
+                            applyFrequency();
+                        }
+                    }
+                    break;
+
+                case ' ': // Pause/resume (spacebar)
+                    e.preventDefault();
+                    // Could add pause functionality
+                    showNotification('Pause/resume not yet implemented', 'info', 1500);
+                    break;
+
+                case 'h': // Show help
+                case '?':
+                    e.preventDefault();
+                    showKeyboardHelp();
+                    break;
+            }
+        });
+
+        function showKeyboardHelp() {
+            const helpText = `
+<b>Keyboard Shortcuts:</b>
+
+<b>Display Toggles:</b>
+S - Toggle Spectrum
+I - Toggle IQ Constellation
+C - Toggle Cross-Correlation
+P - Toggle Peak Hold
+M - Toggle Min Hold
+R - Toggle Reference Markers
+B - Toggle Bandwidth Measurement
+
+<b>Modes:</b>
+F - Toggle Filter Mode
+Z - Toggle Zoom Mode
+X - Clear Zoom
+
+<b>Controls:</b>
+↑/↓ - Adjust Gain (±3dB)
+Shift+←/→ - Fine tune frequency (±1kHz)
+
+<b>Help:</b>
+H or ? - Show this help
+`;
+            showNotification(helpText, 'info', 8000);
+        }
+
         // Initialize preset list on page load
         window.addEventListener('load', function() {
             refreshPresetList();
             updateRecordMode();  // Initialize recording UI
             restoreUIState();    // Restore saved UI settings
+            loadDisplaySettings();  // Load persistent display settings
+            console.log('✓ Keyboard shortcuts enabled');
         });
 
         // Save UI state before page unload
         window.addEventListener('beforeunload', function() {
             saveUIState();
+            saveDisplaySettings();  // Save persistent display settings
         });
 
         // ===== Recording Functions =====
@@ -5196,8 +6055,36 @@ const char* html_page = R"HTMLDELIM(
         const intervals = [];
         intervals.push(setInterval(updateStatus, 2000));
         intervals.push(setInterval(updateIQData, 100));
-        intervals.push(setInterval(updateXCorrData, 500));
         intervals.push(setInterval(updateLinkQuality, 1000));
+
+        // XCorr uses requestAnimationFrame with adaptive throttling for better performance
+        let xcorrLastUpdate = 0;
+        let xcorrUpdateInterval = 500; // Start at 500ms, can adapt based on performance
+
+        function xcorrAnimationLoop(timestamp) {
+            if (!showXCorr) {
+                requestAnimationFrame(xcorrAnimationLoop);
+                return;
+            }
+
+            // Throttle updates based on interval
+            if (timestamp - xcorrLastUpdate >= xcorrUpdateInterval) {
+                xcorrLastUpdate = timestamp;
+                updateXCorrData();
+
+                // Adaptive rate: increase interval if updates are slow
+                if (isUpdatingXCorr && xcorrUpdateInterval < 1000) {
+                    xcorrUpdateInterval += 100; // Slow down if falling behind
+                } else if (!isUpdatingXCorr && xcorrUpdateInterval > 200) {
+                    xcorrUpdateInterval -= 50; // Speed up if keeping up
+                }
+            }
+
+            requestAnimationFrame(xcorrAnimationLoop);
+        }
+
+        // Start XCorr animation loop
+        requestAnimationFrame(xcorrAnimationLoop);
 
         // Cleanup function
         function cleanup() {
@@ -5281,9 +6168,48 @@ const char* html_page = R"HTMLDELIM(
 
         // Double-click to reset spectrum Y-axis to default range
         spectrumCanvas.addEventListener('dblclick', () => {
-            spectrumMinDb = 75;
-            spectrumMaxDb = 225;
-            console.log('Spectrum Y-axis reset to default range: 75-225');
+            spectrumMinDb = -100;
+            spectrumMaxDb = -10;
+            console.log('Spectrum Y-axis reset to default range: -100 to -10 dB');
+            if (latestFFTData) {
+                drawSpectrum(latestFFTData);
+            }
+        });
+
+        // Click handler for bandwidth measurement
+        spectrumCanvas.addEventListener('click', (e) => {
+            if (!bwMeasureEnabled) return;
+
+            const rect = spectrumCanvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+
+            // Calculate frequency at click position
+            const currentSR = zoomState.fullBandwidth || 40000000;
+            const currentCF = zoomState.centerFreq || 915000000;
+            const binWidth = currentSR / FFT_SIZE;
+            const fullStartFreq = currentCF - currentSR / 2;
+
+            const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+            const displayedStartFreq = fullStartFreq + (zoomState.zoomStartBin * binWidth);
+            const displayedBandwidth = zoomedBins * binWidth;
+
+            const clickFreq = displayedStartFreq + (x / rect.width) * displayedBandwidth;
+
+            // Store normalized position (0-1) instead of absolute pixels
+            const normalizedX = x / rect.width;
+
+            // Add point (max 2 points)
+            if (bwMeasurePoints.length >= 2) {
+                bwMeasurePoints = [];
+            }
+
+            bwMeasurePoints.push({
+                normalizedX: normalizedX,
+                freq: clickFreq,
+                db: 0 // Could calculate from spectrum data if needed
+            });
+
+            // Redraw to show points
             if (latestFFTData) {
                 drawSpectrum(latestFFTData);
             }
@@ -5420,7 +6346,7 @@ const char* html_page = R"HTMLDELIM(
             const freqInput = document.getElementById('freqInput');
             if (freqInput) {
                 freqInput.value = clickedFreq.toFixed(3);
-                updateConfig();
+                applyFrequency();
             }
 
             // Show notification
@@ -7334,6 +8260,144 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
+        // ===== GPS FUNCTIONS =====
+
+        let gpsUpdateInterval = null;
+
+        function toggleGPS() {
+            const panel = document.getElementById('gps_panel');
+            const isVisible = panel.style.display !== 'none';
+            panel.style.display = isVisible ? 'none' : 'block';
+            document.getElementById('gps_toggle').classList.toggle('active', !isVisible);
+
+            if (!isVisible) {
+                // Start live updates when panel opens
+                updateGPSPanel();
+                gpsUpdateInterval = setInterval(updateGPSPanel, 1000);  // Update every second
+            } else {
+                // Stop updates when panel closes
+                if (gpsUpdateInterval) {
+                    clearInterval(gpsUpdateInterval);
+                    gpsUpdateInterval = null;
+                }
+            }
+        }
+
+        function connectGPSD() {
+            // Enable GPS auto mode to connect to gpsd
+            fetch('/set_gps_mode', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({mode: 'auto'})
+            }).then(response => response.json())
+              .then(data => {
+                  console.log('Connecting to gpsd...');
+                  showNotification('Connecting to gpsd...', 'info', 2000);
+                  setTimeout(updateGPSPanel, 1000);  // Update after connection attempt
+              })
+              .catch(err => {
+                  console.error('Failed to connect to gpsd:', err);
+                  showNotification('Failed to connect to gpsd', 'error');
+              });
+        }
+
+        function updateGPSPanel() {
+            fetch('/gps_position')
+                .then(response => response.json())
+                .then(data => {
+                    // Update GPS panel
+                    const statusElem = document.getElementById('gps_panel_status');
+                    if (data.mode === 'auto') {
+                        if (data.valid) {
+                            statusElem.textContent = 'GPS FIX ✓';
+                            statusElem.style.color = '#0f0';
+                        } else {
+                            statusElem.textContent = 'NO FIX (Searching...)';
+                            statusElem.style.color = '#f80';
+                        }
+                    } else {
+                        statusElem.textContent = 'NOT CONNECTED (Click Reconnect)';
+                        statusElem.style.color = '#888';
+                    }
+
+                    if (data.valid) {
+                        document.getElementById('gps_panel_position').innerHTML =
+                            `${data.latitude.toFixed(6)}°, ${data.longitude.toFixed(6)}°`;
+                        document.getElementById('gps_panel_position').style.color = '#0f0';
+                        document.getElementById('gps_panel_altitude').textContent = data.altitude_m.toFixed(1) + ' m';
+                        document.getElementById('gps_panel_altitude').style.color = '#0f0';
+                    } else {
+                        document.getElementById('gps_panel_position').textContent = '--';
+                        document.getElementById('gps_panel_position').style.color = '#888';
+                        document.getElementById('gps_panel_altitude').textContent = '-- m';
+                        document.getElementById('gps_panel_altitude').style.color = '#888';
+                    }
+
+                    document.getElementById('gps_panel_sats').textContent = data.satellites;
+                    document.getElementById('gps_panel_sats').style.color = data.satellites > 3 ? '#0f0' : '#f80';
+                    document.getElementById('gps_panel_hdop').textContent = data.hdop.toFixed(1);
+
+                    // Update header status bar
+                    updateGPSStatusBar(data);
+
+                    // Update Stream Out modal if open
+                    updateStreamOutGPS(data);
+                })
+                .catch(err => console.error('Failed to update GPS:', err));
+        }
+
+        function updateGPSStatusBar(data) {
+            const statusElem = document.getElementById('gps_mode_bar');
+            if (data.mode === 'auto') {
+                if (data.valid) {
+                    statusElem.textContent = `${data.satellites} sats`;
+                    statusElem.style.color = '#0f0';
+                } else {
+                    statusElem.textContent = 'SEARCHING';
+                    statusElem.style.color = '#f80';
+                }
+            } else {
+                statusElem.textContent = 'OFF';
+                statusElem.style.color = '#888';
+            }
+        }
+
+        function updateStreamOutGPS(data) {
+            const gpsInfo = document.getElementById('gps_position_info');
+            if (!gpsInfo || gpsInfo.style.display === 'none') return;
+
+            const statusElem = document.getElementById('streamout_gps_status');
+            if (data.mode === 'auto') {
+                if (data.valid) {
+                    statusElem.textContent = 'GPS FIX ✓';
+                    statusElem.style.color = '#0f0';
+                    document.getElementById('streamout_gps_position').innerHTML =
+                        `Lat: ${data.latitude.toFixed(6)}°<br>Lon: ${data.longitude.toFixed(6)}°<br>Alt: ${data.altitude_m.toFixed(1)} m`;
+                    document.getElementById('streamout_gps_sats').textContent = data.satellites;
+                } else {
+                    statusElem.textContent = 'NO FIX (Searching...)';
+                    statusElem.style.color = '#f80';
+                    document.getElementById('streamout_gps_position').textContent = '--';
+                    document.getElementById('streamout_gps_sats').textContent = '0';
+                }
+            } else {
+                statusElem.textContent = 'GPS Not Connected';
+                statusElem.style.color = '#888';
+                document.getElementById('streamout_gps_position').innerHTML = 'Open GPS Monitor and click Reconnect';
+                document.getElementById('streamout_gps_sats').textContent = '0';
+            }
+        }
+
+        // Poll GPS status periodically for header
+        setInterval(() => {
+            if (!gpsUpdateInterval) {  // Only update if panel not open
+                fetch('/gps_position')
+                    .then(response => response.json())
+                    .then(data => updateGPSStatusBar(data))
+                    .catch(err => {});
+            }
+        }, 3000);
+
         function updateActivityTimeline(data) {
             if (!data || data.length === 0) return;
 
@@ -8965,8 +10029,15 @@ const char* html_page = R"HTMLDELIM(
             }
 
             try {
+                // Calculate bin range from selection cursors
+                const fftSize = 4096;
+                const startBin = Math.floor((directionFinding.selection.leftCursor / 100) * fftSize);
+                const endBin = Math.floor((directionFinding.selection.rightCursor / 100) * fftSize);
+
                 // Fetch DoA result calculated by backend (C++ phase-based interferometry)
-                const response = await fetchWithTimeout('/doa_result?t=' + Date.now());
+                // Send bin range so backend only processes selected spectrum region
+                const url = `/doa_result?start_bin=${startBin}&end_bin=${endBin}&t=` + Date.now();
+                const response = await fetchWithTimeout(url);
                 const result = await response.json();
 
                 // Validate result data
@@ -9430,14 +10501,19 @@ const char* html_page = R"HTMLDELIM(
         function togglePositionMode() {
             const mode = document.querySelector('input[name="position_mode"]:checked').value;
             const staticInputs = document.getElementById('static_position_inputs');
-            const dynamicInfo = document.getElementById('dynamic_position_info');
+            const gpsInfo = document.getElementById('gps_position_info');
 
             if (mode === 'static') {
                 staticInputs.style.display = 'block';
-                dynamicInfo.style.display = 'none';
-            } else {
+                gpsInfo.style.display = 'none';
+            } else if (mode === 'gps') {
                 staticInputs.style.display = 'none';
-                dynamicInfo.style.display = 'block';
+                gpsInfo.style.display = 'block';
+                // Trigger GPS status update
+                fetch('/gps_position')
+                    .then(response => response.json())
+                    .then(data => updateStreamOutGPS(data))
+                    .catch(err => console.error('Failed to get GPS:', err));
             }
         }
 
@@ -9925,57 +11001,8 @@ const char* html_page = R"HTMLDELIM(
         // document.getElementById('timeline_toggle').addEventListener('click', toggleActivityTimeline);
 
         // ========================================================================
-        // DRAGGABLE PANEL SYSTEM
+        // INITIALIZATION
         // ========================================================================
-
-        function makePanelDraggable(panel) {
-            const header = panel.querySelector('.panel-header');
-            if (!header) return;
-
-            let isDragging = false;
-            let currentX, currentY, initialX, initialY;
-            let xOffset = 0, yOffset = 0;
-
-            header.addEventListener('mousedown', dragStart);
-            document.addEventListener('mousemove', drag);
-            document.addEventListener('mouseup', dragEnd);
-
-            function dragStart(e) {
-                if (e.target.classList.contains('panel-close')) return;
-
-                initialX = e.clientX - xOffset;
-                initialY = e.clientY - yOffset;
-
-                if (e.target === header || e.target.classList.contains('panel-title')) {
-                    isDragging = true;
-                    panel.classList.add('active');
-                }
-            }
-
-            function drag(e) {
-                if (isDragging) {
-                    e.preventDefault();
-                    currentX = e.clientX - initialX;
-                    currentY = e.clientY - initialY;
-
-                    xOffset = currentX;
-                    yOffset = currentY;
-
-                    setTranslate(currentX, currentY, panel);
-                }
-            }
-
-            function dragEnd(e) {
-                initialX = currentX;
-                initialY = currentY;
-                isDragging = false;
-                panel.classList.remove('active');
-            }
-
-            function setTranslate(xPos, yPos, el) {
-                el.style.transform = `translate3d(${xPos}px, ${yPos}px, 0)`;
-            }
-        }
 
         // Initialize bookmarks on load
         updateBookmarkList();
@@ -10311,6 +11338,56 @@ const char* html_page = R"HTMLDELIM(
 
     <!-- Attach event listeners AFTER modules load -->
     <script>
+        // Draggable panel system
+        function makePanelDraggable(panel) {
+            const header = panel.querySelector('.panel-header');
+            if (!header) return;
+
+            let isDragging = false;
+            let currentX, currentY, initialX, initialY;
+            let xOffset = 0, yOffset = 0;
+
+            header.addEventListener('mousedown', dragStart);
+            document.addEventListener('mousemove', drag);
+            document.addEventListener('mouseup', dragEnd);
+
+            function dragStart(e) {
+                if (e.target.classList.contains('panel-close')) return;
+
+                initialX = e.clientX - xOffset;
+                initialY = e.clientY - yOffset;
+
+                if (e.target === header || e.target.classList.contains('panel-title')) {
+                    isDragging = true;
+                    panel.classList.add('active');
+                }
+            }
+
+            function drag(e) {
+                if (isDragging) {
+                    e.preventDefault();
+                    currentX = e.clientX - initialX;
+                    currentY = e.clientY - initialY;
+
+                    xOffset = currentX;
+                    yOffset = currentY;
+
+                    setTranslate(currentX, currentY, panel);
+                }
+            }
+
+            function dragEnd(e) {
+                initialX = currentX;
+                initialY = currentY;
+                isDragging = false;
+                panel.classList.remove('active');
+            }
+
+            function setTranslate(xPos, yPos, el) {
+                el.style.transform = `translate3d(${xPos}px, ${yPos}px, 0)`;
+            }
+        }
+
         // Event listeners for modular panel toggles (now that functions are defined)
         // Note: marker_toggle, vsa_toggle, stats_toggle removed in favor of workspace tabs
         // document.getElementById('marker_toggle').addEventListener('click', toggleMarkerPanel);
@@ -11065,6 +12142,19 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         // Serve Direction of Arrival result as JSON
         else if (mg_strcmp(hm->uri, mg_str("/doa_result")) == 0) {
+            // Parse optional bin range parameters for DF filtering
+            char start_bin_str[32] = "0";
+            char end_bin_str[32] = "0";
+            mg_http_get_var(&hm->query, "start_bin", start_bin_str, sizeof(start_bin_str));
+            mg_http_get_var(&hm->query, "end_bin", end_bin_str, sizeof(end_bin_str));
+
+            const uint32_t start_bin = static_cast<uint32_t>(atoi(start_bin_str));
+            const uint32_t end_bin = static_cast<uint32_t>(atoi(end_bin_str));
+
+            // Update global DF bin range (0, 0 means use entire spectrum)
+            g_df_start_bin.store(start_bin);
+            g_df_end_bin.store(end_bin);
+
             std::lock_guard<std::mutex> lock(g_doa_result.mutex);
 
             // Format DoA result as JSON
@@ -11221,11 +12311,11 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
             }
 
             // Start recording
-            bool success = start_recording(filename_str);
+            bool success = start_recording(filename_str, g_center_freq.load(), g_sample_rate.load(),
+                                          BANDWIDTH, g_gain_rx1.load(), g_gain_rx2.load());
             free(filename_str);
 
             if (success) {
-                std::lock_guard<std::mutex> lock(g_recording_mutex);
                 char json_buf[256];
                 snprintf(json_buf, sizeof(json_buf),
                         "{\"status\":\"ok\",\"recording\":true,\"samples\":0}");
@@ -11243,14 +12333,82 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         // Get Recording Status Endpoint
         else if (mg_strcmp(hm->uri, mg_str("/recording_status")) == 0) {
-            std::lock_guard<std::mutex> lock(g_recording_mutex);
+            uint64_t samples_written = 0;
+            bool active = get_recording_status(samples_written);
             char json_buf[256];
             snprintf(json_buf, sizeof(json_buf),
                     "{\"recording\":%s,\"samples\":%llu,\"duration_sec\":%.1f}",
-                    g_recording.active ? "true" : "false",
-                    (unsigned long long)g_recording.samples_written,
-                    g_recording.samples_written / (float)g_sample_rate.load());
+                    active ? "true" : "false",
+                    (unsigned long long)samples_written,
+                    samples_written / (float)g_sample_rate.load());
             mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", json_buf);
+        }
+        // Get GPS Position Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/gps_position")) == 0) {
+            std::lock_guard<std::mutex> lock(g_gps_position.mutex);
+
+            char json_buf[512];
+            snprintf(json_buf, sizeof(json_buf),
+                    "{\"mode\":\"%s\","
+                    "\"valid\":%s,"
+                    "\"latitude\":%.8f,"
+                    "\"longitude\":%.8f,"
+                    "\"altitude_m\":%.2f,"
+                    "\"satellites\":%u,"
+                    "\"hdop\":%.1f,"
+                    "\"timestamp_ms\":%llu}",
+                    (g_gps_position.mode == GPSPosition::Mode::GPS_AUTO) ? "auto" : "manual",
+                    g_gps_position.valid ? "true" : "false",
+                    g_gps_position.latitude,
+                    g_gps_position.longitude,
+                    g_gps_position.altitude_m,
+                    g_gps_position.satellites,
+                    g_gps_position.hdop,
+                    (unsigned long long)g_gps_position.timestamp_ms);
+
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", json_buf);
+        }
+        // Set GPS Mode Endpoint (auto/manual)
+        else if (mg_strcmp(hm->uri, mg_str("/set_gps_mode")) == 0) {
+            char *mode_str = mg_json_get_str(hm->body, "$.mode");
+            if (!mode_str) {
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Missing mode parameter\"}");
+                return;
+            }
+
+            if (strcmp(mode_str, "auto") == 0) {
+                set_gps_mode(true);
+                mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                             "{\"status\":\"ok\",\"mode\":\"auto\"}");
+            } else if (strcmp(mode_str, "manual") == 0) {
+                set_gps_mode(false);
+                mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                             "{\"status\":\"ok\",\"mode\":\"manual\"}");
+            } else {
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Invalid mode (use 'auto' or 'manual')\"}");
+            }
+            free(mode_str);
+        }
+        // Set Manual Position Endpoint
+        else if (mg_strcmp(hm->uri, mg_str("/set_manual_position")) == 0) {
+            double lat = mg_json_get_num(hm->body, "$.latitude", 0);
+            double lon = mg_json_get_num(hm->body, "$.longitude", 0);
+            double alt = mg_json_get_num(hm->body, "$.altitude_m", 0);
+
+            // Basic validation
+            if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+                mg_http_reply(c, 400, "Content-Type: application/json\r\n",
+                             "{\"error\":\"Invalid coordinates\"}");
+                return;
+            }
+
+            set_manual_position(lat, lon, alt);
+
+            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                         "{\"status\":\"ok\",\"latitude\":%.8f,\"longitude\":%.8f,\"altitude_m\":%.2f}",
+                         lat, lon, alt);
         }
         // Start Scanner Endpoint
         else if (mg_strcmp(hm->uri, mg_str("/start_scanner")) == 0) {
@@ -11474,6 +12632,15 @@ void start_web_server() {
 }
 
 void stop_web_server() {
+    // Stop GPS thread if running
+    if (g_gps_running) {
+        g_gps_running = false;
+        if (g_gps_thread.joinable()) {
+            g_gps_thread.join();
+        }
+    }
+
+    // Stop web server thread
     if (g_web_running) {
         g_web_running = false;
         if (g_web_thread.joinable()) {

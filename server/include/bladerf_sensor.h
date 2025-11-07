@@ -25,13 +25,6 @@ constexpr int AGC_HYSTERESIS = 20;              // Hysteresis zone to prevent os
 constexpr float AGC_ATTACK_RATE = 0.1f;         // Attack rate for gain decrease
 constexpr float AGC_DECAY_RATE = 0.01f;         // Decay rate for gain increase
 
-// Window function types for FFT processing
-constexpr uint32_t WINDOW_RECTANGULAR = 0;
-constexpr uint32_t WINDOW_HAMMING = 1;
-constexpr uint32_t WINDOW_HANNING = 2;
-constexpr uint32_t WINDOW_BLACKMAN = 3;
-constexpr uint32_t WINDOW_KAISER = 4;
-
 // Recording metadata structure
 #pragma pack(push, 1)
 

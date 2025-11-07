@@ -22,6 +22,12 @@ include_directories(
 set(SOURCES
     src/main.cpp
     src/web_server.cpp
+    src/cfar_detector.cpp
+    src/array_calibration.cpp
+    src/signal_processing.cpp
+    src/df_processing.cpp
+    src/recording.cpp
+    src/config_validation.cpp
 )
 
 # Optional: Add mongoose support

@@ -136,6 +136,26 @@ struct ClassifiedSignal {
     uint64_t timestamp_ms;      // Timestamp of classification (milliseconds since epoch)
 };
 
+// GPS position data
+// Stores current position from GPS or manual entry
+// Note: For DF work, we only need position, not heading (use compass for that)
+struct GPSPosition {
+    enum class Mode { MANUAL, GPS_AUTO };
+
+    Mode mode;                  // Position source mode
+    bool valid;                 // Position data is valid
+    double latitude;            // Latitude in decimal degrees
+    double longitude;           // Longitude in decimal degrees
+    double altitude_m;          // Altitude in meters (MSL)
+    uint64_t timestamp_ms;      // Last update timestamp
+    uint8_t satellites;         // Number of satellites (GPS mode only)
+    float hdop;                 // Horizontal dilution of precision (GPS mode only)
+    std::mutex mutex;           // Mutex for thread-safe access
+
+    GPSPosition() : mode(Mode::MANUAL), valid(false), latitude(0), longitude(0),
+                    altitude_m(0), timestamp_ms(0), satellites(0), hdop(99.9f) {}
+};
+
 // Signal classification buffer
 // Stores recent signal classifications for display
 constexpr int MAX_CLASSIFICATIONS = 50;  // Maximum number of classifications to store
@@ -159,6 +179,7 @@ extern LinkQuality g_link_quality;
 extern DoAResult g_doa_result;
 extern ScannerState g_scanner;
 extern ClassificationBuffer g_classifications;
+extern GPSPosition g_gps_position;
 
 // Web server function declarations
 
@@ -219,5 +240,17 @@ void add_classification(uint64_t frequency_hz, float bandwidth_hz, const char* m
 // Get and reset HTTP bytes sent counter
 // Returns the number of bytes sent since last call and resets counter to zero
 uint64_t get_and_reset_http_bytes();
+
+// Update GPS position from manual entry
+// Args:
+//   latitude: Latitude in decimal degrees
+//   longitude: Longitude in decimal degrees
+//   altitude_m: Altitude in meters MSL
+void set_manual_position(double latitude, double longitude, double altitude_m);
+
+// Enable/disable GPS auto mode (gpsd)
+// Args:
+//   enable: true to start GPS auto mode, false to stop
+void set_gps_mode(bool enable);
 
 #endif // WEB_SERVER_H

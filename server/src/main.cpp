@@ -1,5 +1,11 @@
 #include "bladerf_sensor.h"
 #include "web_server.h"
+#include "cfar_detector.h"
+#include "array_calibration.h"
+#include "signal_processing.h"
+#include "df_processing.h"
+#include "recording.h"
+#include "config_validation.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -34,6 +40,10 @@ std::atomic<uint32_t> g_gain_rx2{GAIN_RX2};           // Current RX2 gain (dB)
 std::atomic<bool> g_params_changed{false};            // Configuration change pending flag
 std::mutex g_config_mutex;                            // Mutex for configuration updates
 
+// Direction finding bin range selection (0 = entire spectrum)
+std::atomic<uint32_t> g_df_start_bin{0};              // DF start bin (0 = use entire spectrum)
+std::atomic<uint32_t> g_df_end_bin{0};                // DF end bin (0 = use entire spectrum)
+
 // FFTW plans and buffers for FFT computation
 // These are shared between threads and must be accessed carefully
 fftwf_plan fft_plan_ch1 = nullptr;                    // FFT plan for channel 1
@@ -42,6 +52,13 @@ std::vector<fftwf_complex> fft_in_ch1(FFT_SIZE);      // Channel 1 FFT input buf
 std::vector<fftwf_complex> fft_in_ch2(FFT_SIZE);      // Channel 2 FFT input buffer
 std::vector<fftwf_complex> fft_out_ch1(FFT_SIZE);     // Channel 1 FFT output buffer
 std::vector<fftwf_complex> fft_out_ch2(FFT_SIZE);     // Channel 2 FFT output buffer
+
+// Overlap-add buffers for smoother spectrum (50% overlap)
+std::vector<fftwf_complex> overlap_buf_ch1(FFT_SIZE / 2);
+std::vector<fftwf_complex> overlap_buf_ch2(FFT_SIZE / 2);
+std::vector<uint8_t> prev_magnitude_ch1(FFT_SIZE);
+std::vector<uint8_t> prev_magnitude_ch2(FFT_SIZE);
+bool has_prev_fft = false;
 
 // DC offset correction using exponentially weighted moving average (EWMA)
 // Tracks and removes DC bias from IQ samples for cleaner spectrum display
@@ -52,19 +69,8 @@ float g_dc_q_ch2 = 0.0f;                              // Channel 2 Q component D
 uint64_t g_last_freq_for_dc = 0;                      // Last frequency (for reset detection)
 int g_dc_convergence_counter = 0;                     // Convergence tracking counter
 
-// IQ sample recording state
-RecordingState g_recording = {false, nullptr, 0, 0, 0, {}};
-std::mutex g_recording_mutex;                         // Mutex for recording state access
-
 // Automatic gain control (AGC) state
-struct AGCState {
-    bool enabled;                  // AGC enable flag
-    float current_level;           // Current signal level (0-255)
-    uint32_t current_gain_rx1;     // Current RX1 gain (dB)
-    uint32_t current_gain_rx2;     // Current RX2 gain (dB)
-    int hysteresis_counter;        // Counter to prevent rapid gain changes
-};
-AGCState g_agc = {false, 0.0f, GAIN_RX1, GAIN_RX2, 0};
+AGCState g_agc;
 
 // FFT window function state
 uint32_t g_window_type = WINDOW_HAMMING;              // Current window function type
@@ -76,9 +82,8 @@ std::vector<std::vector<uint8_t>> g_avg_buffer_ch1;  // Channel 1 averaging buff
 std::vector<std::vector<uint8_t>> g_avg_buffer_ch2;  // Channel 2 averaging buffer
 uint32_t g_avg_index = 0;                             // Current averaging buffer index
 
-
-// Forward declarations
-void stop_recording();
+// Last valid DoA result (hold when confidence is too low)
+LastValidDoA g_last_valid_doa = {false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0, 0};
 
 // Signal handler for graceful shutdown on SIGINT/SIGTERM
 // Stops data acquisition closes recordings and sets global shutdown flag
@@ -91,236 +96,6 @@ void signal_handler(int signum) {
 
     // Stop any active recording session
     stop_recording();
-}
-
-// ============================================================================
-// IQ RECORDING SYSTEM
-//
-// Functions for recording raw IQ samples to disk with metadata headers
-// Supports continuous recording with automatic file header updates
-// ============================================================================
-
-bool start_recording(const std::string& filename) {
-    std::lock_guard<std::mutex> lock(g_recording_mutex);
-
-    if (g_recording.active) {
-        std::cerr << "Recording already in progress" << std::endl;
-        return false;
-    }
-
-    g_recording.file = fopen(filename.c_str(), "wb");
-    if (!g_recording.file) {
-        std::cerr << "Failed to open recording file: " << filename << std::endl;
-        return false;
-    }
-
-    const auto now = std::chrono::system_clock::now();
-    const auto duration = now.time_since_epoch();
-    g_recording.metadata.timestamp_start_sec = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
-    g_recording.metadata.timestamp_start_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() % 1000000000;
-    g_recording.metadata.center_freq = g_center_freq;
-    g_recording.metadata.sample_rate = g_sample_rate;
-    g_recording.metadata.bandwidth = BANDWIDTH;
-    g_recording.metadata.gain_rx1 = g_gain_rx1;
-    g_recording.metadata.gain_rx2 = g_gain_rx2;
-    g_recording.metadata.num_samples = 0;
-    strncpy(g_recording.metadata.notes, "bladeRF recording", sizeof(g_recording.metadata.notes) - 1);
-
-    fwrite(&g_recording.metadata, sizeof(RecordingMetadata), 1, g_recording.file);
-
-    g_recording.active = true;
-    g_recording.samples_written = 0;
-    g_recording.start_time_sec = g_recording.metadata.timestamp_start_sec;
-    g_recording.start_time_nsec = g_recording.metadata.timestamp_start_nsec;
-
-    std::cout << "Recording started: " << filename << std::endl;
-    return true;
-}
-
-void stop_recording() {
-    std::lock_guard<std::mutex> lock(g_recording_mutex);
-
-    if (!g_recording.active) {
-        return;
-    }
-
-    g_recording.metadata.num_samples = g_recording.samples_written;
-    fseek(g_recording.file, 0, SEEK_SET);
-    fwrite(&g_recording.metadata, sizeof(RecordingMetadata), 1, g_recording.file);
-
-    fclose(g_recording.file);
-    g_recording.file = nullptr;
-    g_recording.active = false;
-
-    std::cout << "Recording stopped. Samples written: " << g_recording.samples_written << std::endl;
-}
-
-void write_samples_to_file(const int16_t* samples, size_t num_samples) {
-    std::lock_guard<std::mutex> lock(g_recording_mutex);
-
-    if (!g_recording.active || !g_recording.file) {
-        return;
-    }
-
-    size_t written = fwrite(samples, sizeof(int16_t), num_samples * 2, g_recording.file);
-    if (written != num_samples * 2) {
-        std::cerr << "Warning: Incomplete write to recording file" << std::endl;
-    }
-
-    g_recording.samples_written += num_samples;
-
-    if (g_recording.samples_written % (100 * 1024 * 1024 / 4) == 0) {
-        fflush(g_recording.file);
-    }
-}
-
-// ============================================================================
-// AUTOMATIC GAIN CONTROL (AGC)
-//
-// Software-based automatic gain control to maintain optimal signal levels
-// Adjusts RX gain dynamically based on measured spectrum peaks with hysteresis
-// to prevent oscillation
-// ============================================================================
-
-void update_agc(const uint8_t* ch1_mag, const uint8_t* ch2_mag, size_t len) {
-    if (!g_agc.enabled) {
-        return;
-    }
-
-    uint8_t peak = 0;
-    for (size_t i = 0; i < len; i++) {
-        peak = std::max(peak, std::max(ch1_mag[i], ch2_mag[i]));
-    }
-
-    g_agc.current_level = peak;
-
-    if (peak > AGC_TARGET_LEVEL + AGC_HYSTERESIS) {
-        g_agc.hysteresis_counter++;
-        if (g_agc.hysteresis_counter > 5) {
-            if (g_agc.current_gain_rx1 > 0) {
-                g_agc.current_gain_rx1 = std::max(0u, g_agc.current_gain_rx1 - 3);
-                g_agc.current_gain_rx2 = std::max(0u, g_agc.current_gain_rx2 - 3);
-                g_gain_rx1 = g_agc.current_gain_rx1;
-                g_gain_rx2 = g_agc.current_gain_rx2;
-                g_params_changed = true;
-                std::cout << "AGC: Decreasing gain to " << g_agc.current_gain_rx1 << " dB" << std::endl;
-            }
-            g_agc.hysteresis_counter = 0;
-        }
-    } else if (peak < AGC_TARGET_LEVEL - AGC_HYSTERESIS) {
-        g_agc.hysteresis_counter++;
-        if (g_agc.hysteresis_counter > 20) {
-            if (g_agc.current_gain_rx1 < 60) {
-                g_agc.current_gain_rx1 = std::min(60u, g_agc.current_gain_rx1 + 1);
-                g_agc.current_gain_rx2 = std::min(60u, g_agc.current_gain_rx2 + 1);
-                g_gain_rx1 = g_agc.current_gain_rx1;
-                g_gain_rx2 = g_agc.current_gain_rx2;
-                g_params_changed = true;
-                std::cout << "AGC: Increasing gain to " << g_agc.current_gain_rx1 << " dB" << std::endl;
-            }
-            g_agc.hysteresis_counter = 0;
-        }
-    } else {
-        g_agc.hysteresis_counter = 0;
-    }
-}
-
-// ============================================================================
-// WINDOW FUNCTIONS
-//
-// FFT window function generation and application
-// Reduces spectral leakage by tapering the edges of the time-domain signal
-// Supports multiple window types: Rectangular Hamming Hanning Blackman Kaiser
-// ============================================================================
-
-void generate_window(uint32_t window_type, size_t length) {
-    g_window.resize(length);
-
-    switch (window_type) {
-        case WINDOW_RECTANGULAR:
-            std::fill(g_window.begin(), g_window.end(), 1.0f);
-            break;
-
-        case WINDOW_HAMMING:
-            for (size_t i = 0; i < length; i++) {
-                g_window[i] = 0.54f - 0.46f * cosf(2.0f * M_PI * i / (length - 1));
-            }
-            break;
-
-        case WINDOW_HANNING:
-            for (size_t i = 0; i < length; i++) {
-                g_window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (length - 1)));
-            }
-            break;
-
-        case WINDOW_BLACKMAN:
-            for (size_t i = 0; i < length; i++) {
-                g_window[i] = 0.42f - 0.5f * cosf(2.0f * M_PI * i / (length - 1)) +
-                             0.08f * cosf(4.0f * M_PI * i / (length - 1));
-            }
-            break;
-
-        case WINDOW_KAISER:
-            for (size_t i = 0; i < length; i++) {
-                float x = 2.0f * i / (length - 1) - 1.0f;
-                g_window[i] = 0.402f + 0.498f * cosf(M_PI * x) + 0.098f * cosf(2.0f * M_PI * x);
-            }
-            break;
-
-        default:
-            std::fill(g_window.begin(), g_window.end(), 1.0f);
-    }
-}
-
-void apply_window(fftwf_complex* data, size_t length) {
-    if (g_window.size() != length) {
-        generate_window(g_window_type, length);
-    }
-
-    for (size_t i = 0; i < length; i++) {
-        data[i][0] *= g_window[i];
-        data[i][1] *= g_window[i];
-    }
-}
-
-// ============================================================================
-// FFT AVERAGING
-//
-// Temporal averaging of FFT magnitude spectra to reduce noise and variance
-// Maintains a circular buffer of recent FFT frames and computes running average
-// ============================================================================
-
-void init_averaging(uint32_t num_frames, size_t fft_size) {
-    g_averaging_frames = num_frames;
-    g_avg_buffer_ch1.resize(num_frames);
-    g_avg_buffer_ch2.resize(num_frames);
-    for (auto& buf : g_avg_buffer_ch1) {
-        buf.resize(fft_size, 0);
-    }
-    for (auto& buf : g_avg_buffer_ch2) {
-        buf.resize(fft_size, 0);
-    }
-    g_avg_index = 0;
-}
-
-void apply_averaging(uint8_t* ch1_mag, uint8_t* ch2_mag, size_t fft_size) {
-    if (g_averaging_frames <= 1) {
-        return;
-    }
-
-    std::copy(ch1_mag, ch1_mag + fft_size, g_avg_buffer_ch1[g_avg_index].begin());
-    std::copy(ch2_mag, ch2_mag + fft_size, g_avg_buffer_ch2[g_avg_index].begin());
-    g_avg_index = (g_avg_index + 1) % g_averaging_frames;
-
-    for (size_t i = 0; i < fft_size; i++) {
-        uint32_t sum1 = 0, sum2 = 0;
-        for (uint32_t j = 0; j < g_averaging_frames; j++) {
-            sum1 += g_avg_buffer_ch1[j][i];
-            sum2 += g_avg_buffer_ch2[j][i];
-        }
-        ch1_mag[i] = sum1 / g_averaging_frames;
-        ch2_mag[i] = sum2 / g_averaging_frames;
-    }
 }
 
 
@@ -394,128 +169,6 @@ int configure_channel(struct bladerf *dev, bladerf_channel ch, uint64_t freq, ui
     return 0;
 }
 
-void compute_fft(fftwf_complex *in, fftwf_complex *out, fftwf_plan plan) {
-    fftwf_execute_dft(plan, in, out);
-}
-
-void compute_magnitude_db(fftwf_complex *fft_out, uint8_t *mag_out, size_t size) {
-    // Compute absolute magnitude in dB with optimized math
-    // Avoid sqrt by using power directly: 10*log10(mag^2) = 20*log10(mag)
-    // But we compute 10*log10(power) which is equivalent
-
-    static int debug_counter = 0;
-    float min_db = 1000.0f;
-    float max_db = -1000.0f;
-
-    // Constants for fast scaling
-    constexpr float DB_SCALE = 10.0f;
-    constexpr float DB_OFFSET = 100.0f;
-    constexpr float DB_RANGE = 120.0f;
-    constexpr float NORM_SCALE = 255.0f / DB_RANGE;
-    constexpr float MIN_POWER = 1e-20f;
-
-    for (size_t i = 0; i < size; i++) {
-        float real = fft_out[i][0];
-        float imag = fft_out[i][1];
-
-        // Power = I^2 + Q^2 (no sqrt needed!)
-        float power = real * real + imag * imag;
-
-        // Convert to dB: 10*log10(power)
-        float db = DB_SCALE * std::log10(std::max(power, MIN_POWER));
-
-        // Track min/max for debugging
-        if (db < min_db) min_db = db;
-        if (db > max_db) max_db = db;
-
-        // Map -100 dB to +20 dB range to 0-255
-        float normalized = (db + DB_OFFSET) * NORM_SCALE;
-        mag_out[i] = static_cast<uint8_t>(std::clamp(normalized, 0.0f, 255.0f));
-    }
-
-    // Print debug info every 60 frames
-    debug_counter++;
-    if (debug_counter % 60 == 0) {
-        std::cout << "FFT dB range: " << std::fixed << std::setprecision(1)
-                  << min_db << " to " << max_db
-                  << " dB (gain RX1=" << g_gain_rx1.load() << " dB)" << std::endl;
-    }
-}
-
-void remove_dc_offset(uint8_t *magnitude, size_t size) {
-    const size_t dc_bin = size / 2;
-
-    // Robust DC spike removal with bounds checking
-    if (dc_bin < 3 || dc_bin >= size - 3) return;
-
-    // Use 5-point averaging for smoother interpolation
-    // Weights: [1, 2, _, 2, 1] / 6 to emphasize nearby bins
-    const uint32_t weighted_avg = (
-        static_cast<uint32_t>(magnitude[dc_bin - 2]) +
-        2 * static_cast<uint32_t>(magnitude[dc_bin - 1]) +
-        2 * static_cast<uint32_t>(magnitude[dc_bin + 1]) +
-        static_cast<uint32_t>(magnitude[dc_bin + 2])
-    ) / 6;
-
-    magnitude[dc_bin] = static_cast<uint8_t>(weighted_avg);
-
-    // Also smooth adjacent bins slightly to avoid sharp edges
-    for (int offset = -1; offset <= 1; offset += 2) {
-        size_t idx = dc_bin + offset;
-        uint32_t local_avg = (
-            static_cast<uint32_t>(magnitude[idx - 1]) +
-            2 * static_cast<uint32_t>(magnitude[idx]) +
-            static_cast<uint32_t>(magnitude[idx + 1])
-        ) / 4;
-        magnitude[idx] = static_cast<uint8_t>(local_avg);
-    }
-}
-
-void compute_cross_correlation(fftwf_complex *fft_ch1, fftwf_complex *fft_ch2,
-                              float *correlation, float *phase_diff) {
-    // Cross-correlation in frequency domain: conj(FFT1) * FFT2
-    // This provides both magnitude and phase difference between channels
-    // Useful for direction finding and coherence analysis
-
-    for (size_t i = 0; i < FFT_SIZE; i++) {
-        const float real1 = fft_ch1[i][0];
-        const float imag1 = -fft_ch1[i][1];  // Complex conjugate
-        const float real2 = fft_ch2[i][0];
-        const float imag2 = fft_ch2[i][1];
-
-        // Complex multiplication: (a + bi)(c + di) = (ac - bd) + (ad + bc)i
-        const float corr_real = real1 * real2 - imag1 * imag2;
-        const float corr_imag = real1 * imag2 + imag1 * real2;
-
-        // Magnitude: use sqrtf for single precision (faster than sqrt)
-        const float power = corr_real * corr_real + corr_imag * corr_imag;
-        correlation[i] = sqrtf(power);
-
-        // Phase difference: atan2f is faster than atan2 for single precision
-        phase_diff[i] = atan2f(corr_imag, corr_real);
-    }
-}
-
-bool validate_frequency(uint64_t freq) {
-    // bladeRF xA9 frequency range 47 MHz to 6 GHz
-    return freq >= 47000000 && freq <= 6000000000ULL;
-}
-
-bool validate_sample_rate(uint32_t rate) {
-    // Valid range 520 kHz to 61.44 MHz
-    return rate >= 520000 && rate <= 61440000;
-}
-
-bool validate_gain(uint32_t gain) {
-    // Valid gain range 0 to 60 dB
-    return gain <= 60;
-}
-
-bool validate_bandwidth(uint32_t bw) {
-    // Valid range 520 kHz to 61.44 MHz (same as sample rate)
-    return bw >= 520000 && bw <= 61440000;
-}
-
 int main(int argc, char *argv[]) {
     struct bladerf *dev = nullptr;
     int status;
@@ -552,11 +205,15 @@ int main(int argc, char *argv[]) {
 
     // Initialize window function (default: Hamming)
     std::cout << "Initializing window function..." << std::endl;
-    generate_window(g_window_type, FFT_SIZE);
+    generate_window(g_window_type, FFT_SIZE, g_window);
 
     // Initialize averaging (default: no averaging)
     std::cout << "Initializing FFT averaging..." << std::endl;
-    init_averaging(1, FFT_SIZE);
+    init_averaging(1, FFT_SIZE, g_avg_buffer_ch1, g_avg_buffer_ch2);
+
+    // Initialize AGC
+    std::cout << "Initializing AGC..." << std::endl;
+    init_agc(g_agc, GAIN_RX1, GAIN_RX2);
 
     // Initialize bladeRF
     status = initialize_bladerf(&dev);
@@ -703,16 +360,23 @@ int main(int argc, char *argv[]) {
             // Write samples to recording file if active
             write_samples_to_file(thread_rx_buffer.data(), BUFFER_SIZE * 2);
 
-            // Deinterleave and process samples
-            const size_t samples_to_process = std::min(static_cast<size_t>(BUFFER_SIZE / 2), static_cast<size_t>(FFT_SIZE));
+            // ===== OVERLAP-ADD PROCESSING (50% overlap for smoother spectrum) =====
+            constexpr size_t OVERLAP_SIZE = FFT_SIZE / 2;
+            const size_t new_samples = std::min(static_cast<size_t>(BUFFER_SIZE / 2), OVERLAP_SIZE);
             constexpr float scale = 1.0f / 32768.0f;
 
             // Track peak sample for debugging
             static int web_sample_debug_counter = 0;
             int16_t peak_sample = 0;
 
-            for (size_t i = 0; i < samples_to_process; i++) {
+            // Copy previous second half to first half (overlap)
+            std::memcpy(fft_in_ch1.data(), overlap_buf_ch1.data(), OVERLAP_SIZE * sizeof(fftwf_complex));
+            std::memcpy(fft_in_ch2.data(), overlap_buf_ch2.data(), OVERLAP_SIZE * sizeof(fftwf_complex));
+
+            // Deinterleave new samples into second half
+            for (size_t i = 0; i < new_samples; i++) {
                 const size_t idx = i * 4;
+                const size_t buf_idx = OVERLAP_SIZE + i;
 
                 // Track peak ADC values
                 if (std::abs(thread_rx_buffer[idx + 0]) > std::abs(peak_sample))
@@ -720,11 +384,15 @@ int main(int argc, char *argv[]) {
                 if (std::abs(thread_rx_buffer[idx + 1]) > std::abs(peak_sample))
                     peak_sample = thread_rx_buffer[idx + 1];
 
-                fft_in_ch1[i][0] = static_cast<float>(thread_rx_buffer[idx + 0]) * scale;
-                fft_in_ch1[i][1] = static_cast<float>(thread_rx_buffer[idx + 1]) * scale;
-                fft_in_ch2[i][0] = static_cast<float>(thread_rx_buffer[idx + 2]) * scale;
-                fft_in_ch2[i][1] = static_cast<float>(thread_rx_buffer[idx + 3]) * scale;
+                fft_in_ch1[buf_idx][0] = static_cast<float>(thread_rx_buffer[idx + 0]) * scale;
+                fft_in_ch1[buf_idx][1] = static_cast<float>(thread_rx_buffer[idx + 1]) * scale;
+                fft_in_ch2[buf_idx][0] = static_cast<float>(thread_rx_buffer[idx + 2]) * scale;
+                fft_in_ch2[buf_idx][1] = static_cast<float>(thread_rx_buffer[idx + 3]) * scale;
             }
+
+            // Save current second half for next iteration
+            std::memcpy(overlap_buf_ch1.data(), fft_in_ch1.data() + OVERLAP_SIZE, OVERLAP_SIZE * sizeof(fftwf_complex));
+            std::memcpy(overlap_buf_ch2.data(), fft_in_ch2.data() + OVERLAP_SIZE, OVERLAP_SIZE * sizeof(fftwf_complex));
 
             // Debug: Print peak sample every 60 frames
             web_sample_debug_counter++;
@@ -735,9 +403,12 @@ int main(int argc, char *argv[]) {
                           << "% of full scale) [Gain=" << g_gain_rx1.load() << "dB]" << std::endl;
             }
 
-            if (samples_to_process < FFT_SIZE) {
-                std::memset(fft_in_ch1.data() + samples_to_process, 0, (FFT_SIZE - samples_to_process) * sizeof(fftwf_complex));
-                std::memset(fft_in_ch2.data() + samples_to_process, 0, (FFT_SIZE - samples_to_process) * sizeof(fftwf_complex));
+            // Zero-pad if needed (shouldn't happen with proper buffer sizes)
+            if (new_samples < OVERLAP_SIZE) {
+                std::memset(fft_in_ch1.data() + OVERLAP_SIZE + new_samples, 0,
+                           (OVERLAP_SIZE - new_samples) * sizeof(fftwf_complex));
+                std::memset(fft_in_ch2.data() + OVERLAP_SIZE + new_samples, 0,
+                           (OVERLAP_SIZE - new_samples) * sizeof(fftwf_complex));
             }
 
             // Remove DC offset from IQ samples using EWMA
@@ -749,22 +420,24 @@ int main(int argc, char *argv[]) {
                 g_dc_q_ch1 = 0.0f;
                 g_dc_i_ch2 = 0.0f;
                 g_dc_q_ch2 = 0.0f;
+                has_prev_fft = false;  // Reset overlap-add on frequency change
+                g_last_valid_doa.has_valid = false;  // Reset held DoA on frequency change
             }
 
             float dc_i_ch1 = 0.0f, dc_q_ch1 = 0.0f;
             float dc_i_ch2 = 0.0f, dc_q_ch2 = 0.0f;
 
-            for (size_t i = 0; i < samples_to_process; i++) {
+            for (size_t i = 0; i < FFT_SIZE; i++) {
                 dc_i_ch1 += fft_in_ch1[i][0];
                 dc_q_ch1 += fft_in_ch1[i][1];
                 dc_i_ch2 += fft_in_ch2[i][0];
                 dc_q_ch2 += fft_in_ch2[i][1];
             }
 
-            dc_i_ch1 /= samples_to_process;
-            dc_q_ch1 /= samples_to_process;
-            dc_i_ch2 /= samples_to_process;
-            dc_q_ch2 /= samples_to_process;
+            dc_i_ch1 /= FFT_SIZE;
+            dc_q_ch1 /= FFT_SIZE;
+            dc_i_ch2 /= FFT_SIZE;
+            dc_q_ch2 /= FFT_SIZE;
 
             float alpha = (g_dc_convergence_counter < 20) ? 0.5f : 0.1f;
             g_dc_convergence_counter++;
@@ -774,7 +447,7 @@ int main(int argc, char *argv[]) {
             g_dc_i_ch2 = alpha * dc_i_ch2 + (1.0f - alpha) * g_dc_i_ch2;
             g_dc_q_ch2 = alpha * dc_q_ch2 + (1.0f - alpha) * g_dc_q_ch2;
 
-            for (size_t i = 0; i < samples_to_process; i++) {
+            for (size_t i = 0; i < FFT_SIZE; i++) {
                 fft_in_ch1[i][0] -= g_dc_i_ch1;
                 fft_in_ch1[i][1] -= g_dc_q_ch1;
                 fft_in_ch2[i][0] -= g_dc_i_ch2;
@@ -782,8 +455,8 @@ int main(int argc, char *argv[]) {
             }
 
             // Apply window function
-            apply_window(fft_in_ch1.data(), FFT_SIZE);
-            apply_window(fft_in_ch2.data(), FFT_SIZE);
+            apply_window(fft_in_ch1.data(), FFT_SIZE, g_window);
+            apply_window(fft_in_ch2.data(), FFT_SIZE, g_window);
 
             // Compute FFTs
             compute_fft(fft_in_ch1.data(), fft_out_ch1.data(), fft_plan_ch1);
@@ -794,11 +467,32 @@ int main(int argc, char *argv[]) {
             compute_magnitude_db(fft_out_ch1.data(), ch1_mag, FFT_SIZE);
             compute_magnitude_db(fft_out_ch2.data(), ch2_mag, FFT_SIZE);
 
-            // Apply averaging
-            apply_averaging(ch1_mag, ch2_mag, FFT_SIZE);
+            // Apply overlap-add averaging (50% blend with previous FFT)
+            if (has_prev_fft) {
+                for (size_t i = 0; i < FFT_SIZE; i++) {
+                    ch1_mag[i] = (ch1_mag[i] + prev_magnitude_ch1[i]) / 2;
+                    ch2_mag[i] = (ch2_mag[i] + prev_magnitude_ch2[i]) / 2;
+                }
+            }
+            // Store current magnitudes for next iteration
+            std::memcpy(prev_magnitude_ch1.data(), ch1_mag, FFT_SIZE);
+            std::memcpy(prev_magnitude_ch2.data(), ch2_mag, FFT_SIZE);
+            has_prev_fft = true;
+
+            // Apply time-domain averaging
+            apply_averaging(ch1_mag, ch2_mag, FFT_SIZE, g_averaging_frames,
+                           g_avg_buffer_ch1, g_avg_buffer_ch2, g_avg_index);
 
             // Update AGC
-            update_agc(ch1_mag, ch2_mag, FFT_SIZE);
+            uint32_t gain_rx1 = g_gain_rx1.load();
+            uint32_t gain_rx2 = g_gain_rx2.load();
+            bool params_changed = false;
+            update_agc(g_agc, ch1_mag, ch2_mag, FFT_SIZE, gain_rx1, gain_rx2, params_changed);
+            if (params_changed) {
+                g_gain_rx1.store(gain_rx1);
+                g_gain_rx2.store(gain_rx2);
+                g_params_changed.store(true);
+            }
 
             // Remove DC offset spike/dip at center frequency
             remove_dc_offset(ch1_mag, FFT_SIZE);
@@ -824,117 +518,74 @@ int main(int argc, char *argv[]) {
 
             // Compute and update cross-correlation data
             float xcorr_mag[FFT_SIZE], xcorr_phase[FFT_SIZE];
-            for (size_t i = 0; i < FFT_SIZE; i++) {
-                // Compute complex conjugate multiplication: conj(ch1) * ch2
-                // This gives phase difference: phase(ch2) - phase(ch1)
-                const float real1 = fft_out_ch1[i][0];
-                const float imag1 = -fft_out_ch1[i][1];  // Complex conjugate
-                const float real2 = fft_out_ch2[i][0];
-                const float imag2 = fft_out_ch2[i][1];
-
-                const float xcorr_real = real1 * real2 - imag1 * imag2;
-                const float xcorr_imag = real1 * imag2 + imag1 * real2;
-
-                xcorr_mag[i] = std::sqrt(xcorr_real * xcorr_real + xcorr_imag * xcorr_imag);
-                xcorr_phase[i] = std::atan2(xcorr_imag, xcorr_real);
-            }
+            compute_cross_correlation(fft_out_ch1.data(), fft_out_ch2.data(), xcorr_mag, xcorr_phase, FFT_SIZE);
             update_xcorr_data(xcorr_mag, xcorr_phase, FFT_SIZE);
 
             // ===== DIRECTION OF ARRIVAL (DoA) CALCULATION =====
-            // Phase-based 2-channel interferometry using full IQ buffer
+            // Phase-based 2-channel interferometry using FFT output (frequency domain)
             // Theory: Δφ = (2π * d * sin(θ)) / λ
             //
-            // Calculate instantaneous phase difference for each sample
-            float phase_diff_sum = 0.0f;
-            std::vector<float> phase_values;
-            phase_values.reserve(samples_to_process);
+            // FREQUENCY-DOMAIN APPROACH:
+            // - Compute phase difference per frequency bin
+            // - Focus on bins with strong signals (better SNR)
+            // - Can isolate individual signals and reject interference
+            // - Standard method for correlative interferometry
 
-            for (size_t i = 0; i < samples_to_process; i++) {
-                // Convert I/Q to phase for each antenna (after DC removal and windowing)
-                const float phase1 = std::atan2(fft_in_ch1[i][1], fft_in_ch1[i][0]);  // CH1: atan2(Q, I)
-                const float phase2 = std::atan2(fft_in_ch2[i][1], fft_in_ch2[i][0]);  // CH2: atan2(Q, I)
+            // ===== DIRECTION FINDING =====
+            // Determine bin range for DF processing
+            // If g_df_start_bin and g_df_end_bin are both 0, use entire spectrum
+            const uint32_t df_start = g_df_start_bin.load();
+            const uint32_t df_end = g_df_end_bin.load();
+            const size_t bin_start = (df_start == 0 && df_end == 0) ? 0 : std::min(static_cast<size_t>(df_start), static_cast<size_t>(FFT_SIZE - 1));
+            const size_t bin_end = (df_start == 0 && df_end == 0) ? FFT_SIZE - 1 : std::min(static_cast<size_t>(df_end), static_cast<size_t>(FFT_SIZE - 1));
+            const size_t bin_count = bin_end - bin_start + 1;
 
-                // Compute phase difference (CH2 - CH1)
-                // Note: No calibration offset applied here (could be added later via config)
-                float diff = phase2 - phase1;
+            // Perform complete direction finding analysis
+            DFResult df_result = compute_direction_finding(
+                fft_out_ch1.data(), fft_out_ch2.data(),
+                ch1_mag, ch2_mag,
+                FFT_SIZE, bin_start, bin_end,
+                g_center_freq.load(),
+                g_last_valid_doa
+            );
 
-                // Wrap phase difference to [-π, π] to handle 2π ambiguity
-                while (diff > M_PI) diff -= 2.0f * M_PI;
-                while (diff < -M_PI) diff += 2.0f * M_PI;
+            // Debug output every 60 frames
+            static int df_debug_counter = 0;
+            df_debug_counter++;
+            if (df_debug_counter % 60 == 0) {
+                std::cout << "CFAR: " << df_result.num_signals << " signals, "
+                          << df_result.num_bins << " bins";
+                if (bin_start > 0 || bin_end < FFT_SIZE - 1) {
+                    std::cout << " [" << bin_start << "-" << bin_end << "/" << bin_count << "]";
+                }
 
-                phase_diff_sum += diff;
-                phase_values.push_back(diff);
+                // Calculate mean and peak for debug output
+                uint32_t magnitude_sum = 0;
+                uint8_t peak_mag = 0;
+                for (size_t i = bin_start; i <= bin_end; i++) {
+                    const uint8_t avg_mag = (ch1_mag[i] + ch2_mag[i]) / 2;
+                    magnitude_sum += avg_mag;
+                    if (avg_mag > peak_mag) peak_mag = avg_mag;
+                }
+                const uint8_t mean_mag = magnitude_sum / bin_count;
+
+                std::cout << " (mean=" << static_cast<int>(mean_mag)
+                          << ", peak=" << static_cast<int>(peak_mag) << ") | "
+                          << "Phase: " << std::fixed << std::setprecision(1)
+                          << df_result.phase_diff_deg << "° ± " << df_result.phase_std_deg << "° | "
+                          << "Az: " << df_result.azimuth << "°";
+                if (df_result.is_holding) {
+                    std::cout << " [HOLD]";
+                }
+                std::cout << " | SNR: " << df_result.snr_db << " dB | "
+                          << "Conf: " << df_result.confidence << "%" << std::endl;
             }
-
-            // Average phase difference across all samples
-            const float avg_phase_diff_rad = phase_diff_sum / samples_to_process;  // radians
-            const float avg_phase_diff_deg = avg_phase_diff_rad * 180.0f / M_PI;   // degrees
-
-            // Calculate phase standard deviation (measure of signal quality)
-            float variance = 0.0f;
-            for (const float phase_val : phase_values) {
-                const float diff = phase_val - avg_phase_diff_rad;
-                variance += diff * diff;
-            }
-            const float std_dev_rad = std::sqrt(variance / samples_to_process);
-            const float std_dev_deg = std_dev_rad * 180.0f / M_PI;
-
-            // Convert phase difference to angle of arrival
-            // Antenna spacing assumption: 0.5 wavelengths (typical for DF)
-            // For bladeRF at 915 MHz: λ = c/f = 0.328m, so 0.5λ = 0.164m = 164mm
-            constexpr float antenna_spacing_wavelengths = 0.5f;
-            constexpr float lambda = 1.0f;  // Normalized (spacing already in wavelengths)
-
-            // Apply interferometer equation: sin(θ) = (Δφ * λ) / (2π * d)
-            float sin_theta = (avg_phase_diff_rad * lambda) / (2.0f * M_PI * antenna_spacing_wavelengths);
-            sin_theta = std::max(-1.0f, std::min(1.0f, sin_theta));  // Clamp to [-1, 1]
-
-            // Calculate azimuth using atan2 for full [-180°, 180°] range
-            // This provides better angle resolution across all quadrants than asin alone
-            float cos_theta_sq = 1.0f - sin_theta * sin_theta;
-            float cos_theta = std::sqrt(std::max(0.0f, cos_theta_sq));
-
-            // Use atan2(sin, cos) for proper quadrant handling
-            // Note: We compute both positive and negative cos_theta solutions
-            float azimuth_rad_pos = std::atan2(sin_theta, cos_theta);   // [0°, 180°] solution
-            float azimuth_rad_neg = std::atan2(sin_theta, -cos_theta);  // [180°, 360°] solution
-
-            float azimuth_deg_pos = azimuth_rad_pos * 180.0f / M_PI;
-            float azimuth_deg_neg = azimuth_rad_neg * 180.0f / M_PI;
-
-            // For display, we present the solution in [0°, 180°] as primary
-            // and its 180° complement as the ambiguous back azimuth
-            float azimuth_deg = azimuth_deg_pos;
-            float back_azimuth_deg = azimuth_deg_neg;
-
-            // Normalize to [0, 360) for display
-            float azimuth_norm = azimuth_deg < 0 ? azimuth_deg + 360.0f : azimuth_deg;
-            float back_azimuth_norm = back_azimuth_deg < 0 ? back_azimuth_deg + 360.0f : back_azimuth_deg;
-
-            // Ensure both azimuths are in [0, 360)
-            azimuth_norm = std::fmod(azimuth_norm + 360.0f, 360.0f);
-            back_azimuth_norm = std::fmod(back_azimuth_norm + 360.0f, 360.0f);
-
-            // Calculate SNR estimate from IQ power (RMS power)
-            float sum_power = 0.0f;
-            for (size_t i = 0; i < samples_to_process; i++) {
-                const float i_sample = fft_in_ch1[i][0];
-                const float q_sample = fft_in_ch1[i][1];
-                sum_power += i_sample * i_sample + q_sample * q_sample;
-            }
-            const float signal_rms = std::sqrt(sum_power / samples_to_process);
-            const float snr_db = 20.0f * std::log10(signal_rms / 0.01f);  // vs noise baseline
-
-            // Calculate confidence based on phase stability
-            // Lower std_dev = higher confidence, reduced for 180° ambiguity
-            const float confidence = std::max(0.0f, std::min(100.0f, (100.0f - std_dev_deg * 2.0f) * 0.9f));
-
-            // Calculate coherence metric (exponential decay with std_dev)
-            const float coherence = std::exp(-std_dev_deg / 10.0f);
 
             // Update DoA result buffer for web interface
-            update_doa_result(azimuth_norm, back_azimuth_norm, avg_phase_diff_deg,
-                            std_dev_deg, confidence, snr_db, coherence);
+            update_doa_result(df_result.azimuth, df_result.back_azimuth,
+                            df_result.phase_diff_deg, df_result.phase_std_deg,
+                            df_result.confidence, df_result.snr_db, df_result.coherence);
+
 
             // ===== FREQUENCY SCANNER =====
             // Scan across frequency range and detect signals above threshold

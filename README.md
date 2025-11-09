@@ -2,26 +2,6 @@
 
 Advanced RF spectrum monitoring and direction finding system using bladeRF xA9 for coherent dual-channel acquisition
 
-## Recent Updates (January 2025)
-
-**Major UI/UX Quality Improvements:**
-- ✅ Replaced 38 blocking alert() dialogs with professional toast notifications
-- ✅ Added real-time connection status monitoring
-- ✅ Implemented request throttling on all data endpoints
-- ✅ Added keyboard shortcuts for zoom and navigation
-- ✅ UI state persistence between page reloads
-- ✅ Enhanced error handling with specific messages
-- ✅ localStorage safety with quota management
-- ✅ DOM null safety throughout
-- ✅ 5-second fetch timeout protection on all requests
-- ✅ Centralized configuration constants
-
-**Workspace Updates:**
-- Streamlined to 3 core workspaces: LIVE, DIRECTION, SCANNER
-- Removed MEASUREMENTS and DEMOD tabs (experimental features)
-- Enhanced LIVE workspace with improved controls
-- Better preset management with validation
-
 ## Overview
 
 This system provides real-time RF spectrum monitoring, signal analysis, and 2-channel direction finding using a bladeRF xA9 SDR. The server runs on a LattePanda Sigma or similar platform, performs coherent dual-channel sampling at 40 MHz, FFT processing, cross-correlation analysis, and serves an advanced web interface with multiple workspaces over HTTP. Features include TAKX-RF integration for tactical systems, real-time spectrum analysis, and recording capabilities.
@@ -414,8 +394,6 @@ Both bearings are displayed on the polar plot. Requires 3+ channels to resolve a
 
 ### Mathematical Accuracy
 
-All mathematical calculations have been validated and corrected:
-
 **dB Conversion:**
 ```
 dB = (raw / 255.0) × 120.0 - 100.0
@@ -522,25 +500,6 @@ As link quality degrades:
 - **2-Channel DF**: Inherent 180° ambiguity (requires 3+ channels to resolve)
 - **MGRS Conversion**: Uses simplified approximation (errors of 100m-1km depending on location)
 - **Multi-client**: Single client recommended for best performance (connection sharing not optimized)
-
-## Future Enhancements
-
-### Planned Features
-- **Automatic signal classification** using ML
-- **GPS integration** for dynamic platform positioning
-- **Adaptive streaming** based on link quality
-- **Multi-client support** with bandwidth sharing
-- **CUDA/OpenCL FFT** acceleration for higher update rates
-- **Persistent storage** of spectrum recordings
-- **Replay mode** from recorded files
-- **3+ channel support** for DF ambiguity resolution
-- **Advanced demodulation** (AM/FM/PSK/FSK) - currently experimental
-
-### Performance Enhancements
-- Canvas double-buffering for smoother rendering
-- WebAssembly FFT processing in browser
-- WebGL-accelerated waterfall rendering
-- Compressed binary protocol (beyond current 8-bit)
 
 ## References
 

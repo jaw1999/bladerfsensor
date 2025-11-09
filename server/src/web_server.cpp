@@ -1244,6 +1244,8 @@ const char* html_page = R"HTMLDELIM(
                 <div class="workspace-tabs">
                     <div class="workspace-tab active" data-tab="live">LIVE</div>
                     <div class="workspace-tab" data-tab="direction">DIRECTION</div>
+                    <div class="workspace-tab" data-tab="iq">IQ</div>
+                    <div class="workspace-tab" data-tab="xcorr">XCORR</div>
                     <div class="workspace-tab" data-tab="scanner">SCANNER</div>
                 </div>
             </div>
@@ -1577,6 +1579,389 @@ const char* html_page = R"HTMLDELIM(
                 </div>
             </div>
         </div> <!-- End workspace-scanner -->
+
+        <!-- TAB 4: IQ CONSTELLATION -->
+        <div class="workspace-content" id="workspace-iq">
+            <div style="display: flex; height: 100%; gap: 10px; padding: 10px; background: #0a0a0a;">
+
+                <!-- Left: Main Display Area -->
+                <div style="flex: 1; display: flex; flex-direction: column; gap: 10px;">
+                    <!-- Top Row: Split into two panels (50/50) -->
+                    <div style="flex: 0 0 48%; display: flex; gap: 10px;">
+                        <!-- IQ Constellation (Left Half) -->
+                        <div style="flex: 1; display: flex; flex-direction: column; background: #000; border: 2px solid #0ff; border-radius: 5px; overflow: hidden;">
+                            <div style="background: linear-gradient(to bottom, #003333, #001a1a); padding: 8px; border-bottom: 1px solid #0ff; display: flex; justify-content: space-between; align-items: center;">
+                                <span style="color: #0ff; font-weight: bold; font-size: 12px;">IQ CONSTELLATION</span>
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <button id="iq_auto_scale_btn" onclick="iqAutoScale()" style="padding: 3px 6px; font-size: 9px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;" title="Auto-scale to fit data">Auto</button>
+                                    <button id="iq_clear_btn" onclick="iqClearPersistence()" style="padding: 3px 6px; font-size: 9px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;" title="Clear persistence trail">Clear</button>
+                                </div>
+                            </div>
+                            <div id="iq_fullscreen_container" style="flex: 1; position: relative; overflow: hidden;">
+                                <canvas id="iq_fullscreen" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></canvas>
+                            </div>
+                        </div>
+
+                        <!-- Eye Diagram (Right Half) -->
+                        <div style="flex: 1; display: flex; flex-direction: column; background: #000; border: 2px solid #0ff; border-radius: 5px; overflow: hidden;">
+                            <div style="background: linear-gradient(to bottom, #003333, #001a1a); padding: 8px; border-bottom: 1px solid #0ff; display: flex; justify-content: space-between; align-items: center;">
+                                <span style="color: #0ff; font-weight: bold; font-size: 12px;">EYE DIAGRAM</span>
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <label style="font-size: 9px; color: #888;">Symbol Rate:</label>
+                                    <select id="eye_symbol_rate" onchange="eyeUpdateSymbolRate()" style="padding: 2px 4px; background: #0a0a0a; border: 1px solid #0ff; color: #0ff; font-size: 9px; border-radius: 3px;">
+                                        <option value="1000000">1 Msym/s</option>
+                                        <option value="500000">500 ksym/s</option>
+                                        <option value="250000">250 ksym/s</option>
+                                        <option value="100000">100 ksym/s</option>
+                                        <option value="50000">50 ksym/s</option>
+                                    </select>
+                                    <button onclick="eyeClear()" style="padding: 3px 6px; font-size: 9px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">Clear</button>
+                                </div>
+                            </div>
+                            <div style="flex: 1; position: relative; overflow: hidden;">
+                                <canvas id="eye_diagram_canvas" style="width: 100%; height: 100%; display: block;"></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Bottom Row: Split into two panels (50/50) -->
+                    <div style="flex: 1; display: flex; gap: 10px;">
+                        <!-- IQ Waveform Time-Domain (Left Half) -->
+                        <div style="flex: 1; display: flex; flex-direction: column; background: #000; border: 2px solid #0ff; border-radius: 5px; overflow: hidden;">
+                            <div style="background: linear-gradient(to bottom, #003333, #001a1a); padding: 8px; border-bottom: 1px solid #0ff; display: flex; justify-content: space-between; align-items: center;">
+                                <span style="color: #0ff; font-weight: bold; font-size: 12px;">IQ WAVEFORM (TIME DOMAIN)</span>
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <label style="font-size: 9px; color: #888;">View:</label>
+                                    <select id="waveform_view_mode" onchange="waveformUpdateMode()" style="padding: 2px 4px; background: #0a0a0a; border: 1px solid #0ff; color: #0ff; font-size: 9px; border-radius: 3px;">
+                                        <option value="i_and_q">I & Q</option>
+                                        <option value="magnitude">Magnitude</option>
+                                        <option value="phase">Phase</option>
+                                        <option value="i_only">I Only</option>
+                                        <option value="q_only">Q Only</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div style="flex: 1; position: relative; overflow: hidden;">
+                                <canvas id="waveform_canvas" style="width: 100%; height: 100%; display: block;"></canvas>
+                            </div>
+                        </div>
+
+                        <!-- Spectrum Display (Right Half) -->
+                        <div style="flex: 1; display: flex; flex-direction: column; background: #000; border: 2px solid #0ff; border-radius: 5px; overflow: hidden;">
+                            <div style="background: linear-gradient(to bottom, #003333, #001a1a); padding: 8px; border-bottom: 1px solid #0ff; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px;">
+                                <span style="color: #0ff; font-weight: bold; font-size: 12px;">SPECTRUM</span>
+                                <div style="display: flex; gap: 4px; align-items: center; flex-wrap: wrap;">
+                                    <button onclick="tuneDown(1000000)" style="padding: 3px 6px; font-size: 9px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">-1M</button>
+                                    <button onclick="tuneDown(100000)" style="padding: 3px 6px; font-size: 9px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">-100k</button>
+                                    <div style="display: flex; flex-direction: column; align-items: center; gap: 1px;">
+                                        <span id="iq_center_freq" style="color: #0ff; font-size: 10px; font-weight: bold;">915.000 MHz</span>
+                                        <span id="iq_span" style="color: #888; font-size: 8px;">40.00 MHz</span>
+                                    </div>
+                                    <button onclick="tuneUp(100000)" style="padding: 3px 6px; font-size: 9px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">+100k</button>
+                                    <button onclick="tuneUp(1000000)" style="padding: 3px 6px; font-size: 9px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">+1M</button>
+                                </div>
+                            </div>
+                            <div style="flex: 1; position: relative; overflow: hidden;">
+                                <canvas id="iq_spectrum" style="width: 100%; height: 100%; display: block;"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Control Panel -->
+                <div style="width: 280px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto;">
+
+                    <!-- Signal Detection Panel -->
+                    <div style="background: #1a1a1a; border: 1px solid #0ff; border-radius: 5px; padding: 10px;">
+                        <div style="color: #0ff; font-weight: bold; font-size: 11px; margin-bottom: 8px; border-bottom: 1px solid #0ff; padding-bottom: 5px;">SIGNAL DETECTION</div>
+                        <div style="display: flex; flex-direction: column; gap: 6px; font-family: monospace; font-size: 10px;">
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">Status:</span>
+                                <span id="iq_signal_status" style="color: #ff0;">NO SIGNAL</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">SNR:</span>
+                                <span id="iq_snr" style="color: #0ff;">-- dB</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">Peak Power:</span>
+                                <span id="iq_peak_power" style="color: #0ff;">-- dBFS</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">Noise Floor:</span>
+                                <span id="iq_noise_floor" style="color: #888;">-- dBFS</span>
+                            </div>
+                        </div>
+
+                        <!-- Signal Strength Indicator -->
+                        <div style="margin-top: 10px;">
+                            <div style="font-size: 9px; color: #888; margin-bottom: 3px;">Signal Strength</div>
+                            <div style="height: 20px; background: #0a0a0a; border: 1px solid #0ff; border-radius: 3px; overflow: hidden; position: relative;">
+                                <div id="iq_signal_bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, #0a0, #0f0); transition: width 0.3s;"></div>
+                                <div style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; color: #fff; font-weight: bold; text-shadow: 1px 1px 2px #000;">
+                                    <span id="iq_signal_bar_text">0%</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- IQ Statistics Panel -->
+                    <div style="background: #1a1a1a; border: 1px solid #0ff; border-radius: 5px; padding: 10px;">
+                        <div style="color: #0ff; font-weight: bold; font-size: 11px; margin-bottom: 8px; border-bottom: 1px solid #0ff; padding-bottom: 5px;">IQ STATISTICS</div>
+                        <div style="display: flex; flex-direction: column; gap: 6px; font-family: monospace; font-size: 10px;">
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">I Mean:</span>
+                                <span id="iq_i_mean" style="color: #0ff;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">Q Mean:</span>
+                                <span id="iq_q_mean" style="color: #0ff;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">I RMS:</span>
+                                <span id="iq_i_rms" style="color: #0ff;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">Q RMS:</span>
+                                <span id="iq_q_rms" style="color: #0ff;">--</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">EVM:</span>
+                                <span id="iq_evm" style="color: #0ff;">-- %</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between;">
+                                <span style="color: #888;">Phase Noise:</span>
+                                <span id="iq_phase_noise" style="color: #0ff;">-- °</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Fine Tuning Panel -->
+                    <div style="background: #1a1a1a; border: 1px solid #0ff; border-radius: 5px; padding: 10px;">
+                        <div style="color: #0ff; font-weight: bold; font-size: 11px; margin-bottom: 8px; border-bottom: 1px solid #0ff; padding-bottom: 5px;">FINE TUNING</div>
+
+                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                            <!-- Frequency Offset -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Freq Offset (kHz)</label>
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <button onclick="iqFreqOffset(-10)" style="padding: 4px 8px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">-10</button>
+                                    <button onclick="iqFreqOffset(-1)" style="padding: 4px 8px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">-1</button>
+                                    <input type="number" id="iq_freq_offset" value="0" step="1" style="flex: 1; padding: 4px; background: #0a0a0a; border: 1px solid #0ff; color: #0ff; font-size: 10px; text-align: center; border-radius: 3px;">
+                                    <button onclick="iqFreqOffset(1)" style="padding: 4px 8px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">+1</button>
+                                    <button onclick="iqFreqOffset(10)" style="padding: 4px 8px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">+10</button>
+                                </div>
+                                <button onclick="iqApplyOffset()" style="width: 100%; margin-top: 4px; padding: 6px; background: #006666; color: #0ff; border: 1px solid #0ff; font-size: 10px; font-weight: bold; cursor: pointer; border-radius: 3px;">Apply Offset</button>
+                            </div>
+
+                            <!-- Gain Control -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">RX Gain</label>
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <button onclick="iqGainAdjust(-3)" style="padding: 4px 8px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">-3dB</button>
+                                    <span id="iq_current_gain" style="flex: 1; text-align: center; color: #0ff; font-size: 11px; font-weight: bold;">60 dB</span>
+                                    <button onclick="iqGainAdjust(3)" style="padding: 4px 8px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">+3dB</button>
+                                </div>
+                            </div>
+
+                            <!-- Bandwidth Control -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">IF Bandwidth (MHz)</label>
+                                <select id="iq_bandwidth_select" onchange="iqBandwidthChange()" style="width: 100%; padding: 5px; background: #0a0a0a; border: 1px solid #0ff; color: #0ff; font-size: 10px; border-radius: 3px;">
+                                    <option value="1.5">1.5 MHz</option>
+                                    <option value="1.75">1.75 MHz</option>
+                                    <option value="2.5">2.5 MHz</option>
+                                    <option value="2.75">2.75 MHz</option>
+                                    <option value="3">3 MHz</option>
+                                    <option value="5">5 MHz</option>
+                                    <option value="10">10 MHz</option>
+                                    <option value="20">20 MHz</option>
+                                    <option value="28" selected>28 MHz</option>
+                                    <option value="40">40 MHz (Full)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Display Settings Panel -->
+                    <div style="background: #1a1a1a; border: 1px solid #0ff; border-radius: 5px; padding: 10px;">
+                        <div style="color: #0ff; font-weight: bold; font-size: 11px; margin-bottom: 8px; border-bottom: 1px solid #0ff; padding-bottom: 5px;">DISPLAY SETTINGS</div>
+
+                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                            <!-- Modulation Type -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Modulation Type</label>
+                                <select id="iq_modulation_type" onchange="iqModulationTypeChange(this.value)" style="width: 100%; padding: 4px; font-size: 10px; background: #000; color: #0ff; border: 1px solid #0ff;">
+                                    <option value="none">None (Raw IQ)</option>
+                                    <option value="bpsk">BPSK</option>
+                                    <option value="qpsk">QPSK</option>
+                                    <option value="8psk">8-PSK</option>
+                                    <option value="16qam">16-QAM</option>
+                                    <option value="64qam">64-QAM</option>
+                                    <option value="256qam">256-QAM</option>
+                                    <option value="ask2">2-ASK (OOK)</option>
+                                    <option value="ask4">4-ASK</option>
+                                    <option value="fm">FM (Analog)</option>
+                                    <option value="am">AM (Analog)</option>
+                                    <option value="fsk2">2-FSK</option>
+                                    <option value="fsk4">4-FSK</option>
+                                </select>
+                            </div>
+
+                            <!-- Persistence -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Persistence (0-100%)</label>
+                                <input type="range" id="iq_persistence" min="0" max="100" value="95" oninput="iqPersistenceChange(this.value)" style="width: 100%;">
+                                <div style="text-align: center; font-size: 9px; color: #0ff; margin-top: 2px;">
+                                    <span id="iq_persistence_value">95%</span>
+                                </div>
+                            </div>
+
+                            <!-- Point Size -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Point Size</label>
+                                <input type="range" id="iq_point_size" min="1" max="5" value="2" oninput="iqPointSizeChange(this.value)" style="width: 100%;">
+                                <div style="text-align: center; font-size: 9px; color: #0ff; margin-top: 2px;">
+                                    <span id="iq_point_size_value">2px</span>
+                                </div>
+                            </div>
+
+                            <!-- Zoom Level -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Zoom Level</label>
+                                <div style="display: flex; gap: 4px;">
+                                    <button onclick="iqZoom(0.5)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">0.5x</button>
+                                    <button onclick="iqZoom(1.0)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">1x</button>
+                                    <button onclick="iqZoom(2.0)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">2x</button>
+                                    <button onclick="iqZoom(4.0)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">4x</button>
+                                </div>
+                            </div>
+
+                            <!-- Toggle Options -->
+                            <div style="display: flex; flex-direction: column; gap: 4px; margin-top: 4px;">
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888; cursor: pointer;">
+                                    <input type="checkbox" id="iq_show_grid" checked onchange="iqToggleGrid()" style="cursor: pointer;">
+                                    Show Grid
+                                </label>
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888; cursor: pointer;">
+                                    <input type="checkbox" id="iq_show_stats" checked onchange="iqToggleStats()" style="cursor: pointer;">
+                                    Show Statistics Overlay
+                                </label>
+                                <label style="display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888; cursor: pointer;">
+                                    <input type="checkbox" id="iq_density_mode" checked onchange="iqToggleDensity()" style="cursor: pointer;">
+                                    Density Heatmap Mode
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Waveform/Eye Diagram Controls -->
+                    <div style="background: #1a1a1a; border: 1px solid #0ff; border-radius: 5px; padding: 10px; margin-top: 10px;">
+                        <div style="color: #0ff; font-weight: bold; font-size: 11px; margin-bottom: 8px; border-bottom: 1px solid #0ff; padding-bottom: 5px;">WAVEFORM & EYE CONTROLS</div>
+
+                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                            <!-- Waveform View Mode -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Waveform View</label>
+                                <select id="waveform_view_mode" onchange="waveformViewModeChange(this.value)" style="width: 100%; padding: 4px; font-size: 10px; background: #000; color: #0ff; border: 1px solid #0ff;">
+                                    <option value="i_and_q">I & Q</option>
+                                    <option value="magnitude">Magnitude</option>
+                                    <option value="phase">Phase</option>
+                                    <option value="i_only">I Only</option>
+                                    <option value="q_only">Q Only</option>
+                                </select>
+                            </div>
+
+                            <!-- Eye Diagram Symbol Rate -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Eye Symbol Rate</label>
+                                <select id="eye_symbol_rate" onchange="eyeSymbolRateChange(this.value)" style="width: 100%; padding: 4px; font-size: 10px; background: #000; color: #0ff; border: 1px solid #0ff;">
+                                    <option value="50000">50 kSym/s</option>
+                                    <option value="100000">100 kSym/s</option>
+                                    <option value="250000">250 kSym/s</option>
+                                    <option value="500000">500 kSym/s</option>
+                                    <option value="1000000" selected>1 MSym/s</option>
+                                    <option value="2000000">2 MSym/s</option>
+                                    <option value="5000000">5 MSym/s</option>
+                                </select>
+                            </div>
+
+                            <!-- Zoom Controls -->
+                            <div>
+                                <label style="font-size: 10px; color: #888; display: block; margin-bottom: 3px;">Zoom (Mouse Wheel)</label>
+                                <div style="display: flex; gap: 4px;">
+                                    <button onclick="waveformEyeZoom(1.0)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">1x</button>
+                                    <button onclick="waveformEyeZoom(2.0)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">2x</button>
+                                    <button onclick="waveformEyeZoom(5.0)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">5x</button>
+                                    <button onclick="waveformEyeZoom(10.0)" style="flex: 1; padding: 4px; font-size: 10px; background: #004444; color: #0ff; border: 1px solid #0ff; cursor: pointer; border-radius: 3px;">10x</button>
+                                </div>
+                            </div>
+
+                            <!-- Reset View -->
+                            <div>
+                                <button onclick="waveformEyeResetView()" style="width: 100%; padding: 6px; font-size: 10px; background: #440000; color: #ff0; border: 1px solid #ff0; cursor: pointer; border-radius: 3px; font-weight: bold;">Reset View (Double Click)</button>
+                            </div>
+
+                            <!-- Instructions -->
+                            <div style="font-size: 9px; color: #666; margin-top: 4px; padding: 6px; background: #0a0a0a; border-radius: 3px;">
+                                <strong style="color: #888;">Controls:</strong><br>
+                                • Mouse Wheel: Zoom in/out<br>
+                                • Click & Drag: Pan view<br>
+                                • Double Click: Reset zoom/pan
+                            </div>
+                        </div>
+                    </div>
+
+                </div> <!-- End Right Control Panel -->
+
+            </div>
+        </div> <!-- End workspace-iq -->
+
+        <!-- TAB 5: CROSS-CORRELATION -->
+        <div class="workspace-content" id="workspace-xcorr">
+            <div style="display: flex; flex-direction: column; height: 100%; gap: 10px; padding: 10px; background: #0a0a0a;">
+
+                <!-- Top: Spectrum Display (30%) -->
+                <div style="flex: 0 0 30%; display: flex; flex-direction: column; background: #000; border: 2px solid #ff00ff; border-radius: 5px; overflow: hidden;">
+                    <div style="background: linear-gradient(to bottom, #330033, #1a001a); padding: 8px; border-bottom: 1px solid #ff00ff; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                        <span style="color: #ff00ff; font-weight: bold; font-size: 12px;">SPECTRUM ANALYZER</span>
+                        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                            <!-- Tuning Controls -->
+                            <button onclick="tuneDown(10000000)" style="padding: 4px 8px; font-size: 10px; background: #440044; color: #ff00ff; border: 1px solid #ff00ff; cursor: pointer; border-radius: 3px;" title="Tune down 10 MHz">-10M</button>
+                            <button onclick="tuneDown(1000000)" style="padding: 4px 8px; font-size: 10px; background: #440044; color: #ff00ff; border: 1px solid #ff00ff; cursor: pointer; border-radius: 3px;" title="Tune down 1 MHz">-1M</button>
+                            <button onclick="tuneDown(100000)" style="padding: 4px 8px; font-size: 10px; background: #440044; color: #ff00ff; border: 1px solid #ff00ff; cursor: pointer; border-radius: 3px;" title="Tune down 100 kHz">-100k</button>
+                            <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <span style="color: #888; font-size: 10px;">Center:</span>
+                                    <span id="xcorr_center_freq" style="color: #ff00ff; font-size: 11px; font-weight: bold;">915.000 MHz</span>
+                                </div>
+                                <div style="display: flex; gap: 4px; align-items: center;">
+                                    <span style="color: #888; font-size: 10px;">Span:</span>
+                                    <span id="xcorr_span" style="color: #ff00ff; font-size: 11px; font-weight: bold;">40.00 MHz</span>
+                                </div>
+                            </div>
+                            <button onclick="tuneUp(100000)" style="padding: 4px 8px; font-size: 10px; background: #440044; color: #ff00ff; border: 1px solid #ff00ff; cursor: pointer; border-radius: 3px;" title="Tune up 100 kHz">+100k</button>
+                            <button onclick="tuneUp(1000000)" style="padding: 4px 8px; font-size: 10px; background: #440044; color: #ff00ff; border: 1px solid #ff00ff; cursor: pointer; border-radius: 3px;" title="Tune up 1 MHz">+1M</button>
+                            <button onclick="tuneUp(10000000)" style="padding: 4px 8px; font-size: 10px; background: #440044; color: #ff00ff; border: 1px solid #ff00ff; cursor: pointer; border-radius: 3px;" title="Tune up 10 MHz">+10M</button>
+                        </div>
+                    </div>
+                    <div style="flex: 1; position: relative; overflow: hidden;">
+                        <canvas id="xcorr_spectrum" style="width: 100%; height: 100%; display: block;"></canvas>
+                    </div>
+                </div>
+
+                <!-- Bottom: Cross-Correlation Display (70%) -->
+                <div style="flex: 1; display: flex; flex-direction: column; background: #000; border: 2px solid #ff00ff; border-radius: 5px; overflow: hidden;">
+                    <div style="background: linear-gradient(to bottom, #330033, #1a001a); padding: 8px; border-bottom: 1px solid #ff00ff;">
+                        <span style="color: #ff00ff; font-weight: bold; font-size: 12px;">CROSS-CORRELATION ANALYSIS</span>
+                    </div>
+                    <div id="xcorr_fullscreen_container" style="flex: 1; position: relative; overflow: hidden;">
+                        <canvas id="xcorr_fullscreen" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></canvas>
+                    </div>
+                </div>
+
+            </div>
+        </div> <!-- End workspace-xcorr -->
 
     </div> <!-- End workspace-container -->
 
@@ -2839,27 +3224,6 @@ const char* html_page = R"HTMLDELIM(
             </button>
         </div>
 
-        <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Advanced Displays</h3>
-        <div class="control-group">
-            <label class="checkbox-label">
-                <input type="checkbox" id="iq_toggle" onchange="toggleIQ()" title="Show IQ constellation diagram">
-                IQ Constellation
-            </label>
-        </div>
-        <div class="control-group">
-            <label class="checkbox-label">
-                <input type="checkbox" id="xcorr_toggle" onchange="toggleXCorr()" title="Show cross-correlation plot">
-                Cross-Correlation
-            </label>
-        </div>
-        <div class="control-group">
-            <label class="checkbox-label">
-                <input type="checkbox" id="filter_mode_toggle" onchange="toggleFilterMode()" title="Enable filter selection mode for IQ/XCorr">
-                Filter Selection Mode
-            </label>
-            <div id="filter_status" style="font-size: 10px; color: #888; padding-left: 24px; min-height: 14px;"></div>
-        </div>
-
         <h3 style="margin-top: 15px; border-top: 1px solid #333; padding-top: 15px;">Configuration Presets</h3>
         <div class="control-group">
             <label>Preset Name</label>
@@ -3032,6 +3396,21 @@ const char* html_page = R"HTMLDELIM(
         let showSpectrum = false;
         let showIQ = false;
         let showXCorr = false;
+
+        // Spectrum selection state for IQ and XCORR workspaces
+        const iqSelection = {
+            active: false,
+            leftPercent: 40,
+            rightPercent: 60,
+            dragging: null  // null, 'left', 'right', or 'selecting'
+        };
+
+        const xcorrSelection = {
+            active: false,
+            leftPercent: 40,
+            rightPercent: 60,
+            dragging: null
+        };
         let latestFFTData = null;  // Store latest FFT data for spectrum display
         let latestFFTData2 = null;  // Store CH2 FFT data for dual display
 
@@ -3561,6 +3940,16 @@ const char* html_page = R"HTMLDELIM(
             }
 
             updateTimeAxis();
+
+            // Resize Eye Diagram and Waveform Display if in IQ workspace
+            if (document.getElementById('workspace-iq') && document.getElementById('workspace-iq').classList.contains('active')) {
+                if (typeof EyeDiagram !== 'undefined' && EyeDiagram.resize) {
+                    EyeDiagram.resize();
+                }
+                if (typeof WaveformDisplay !== 'undefined' && WaveformDisplay.resize) {
+                    WaveformDisplay.resize();
+                }
+            }
         }
 
         // Fetch and display IQ constellation data
@@ -3591,8 +3980,9 @@ const char* html_page = R"HTMLDELIM(
                     console.warn('IQ data appears to be all zeros');
                 }
 
-                // Use IQ Constellation module
-                if (typeof IQConstellation !== 'undefined') {
+                // Use IQ Constellation Enhanced module
+                if (typeof IQConstellationEnhanced !== 'undefined') {
+                    console.log('[Main] Using IQConstellationEnhanced module');
                     // Normalize int16 to float [-1, 1]
                     const normalize = (arr) => {
                         const result = new Float32Array(arr.length);
@@ -3601,9 +3991,32 @@ const char* html_page = R"HTMLDELIM(
                         }
                         return result;
                     };
-                    IQConstellation.draw(normalize(ch1_i), normalize(ch1_q), normalize(ch2_i), normalize(ch2_q));
+                    IQConstellationEnhanced.draw(normalize(ch1_i), normalize(ch1_q), normalize(ch2_i), normalize(ch2_q));
                 } else {
-                    drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q);
+                    console.error('[Main] IQConstellationEnhanced module not loaded! Cannot display IQ constellation.');
+                }
+
+                // Update IQ statistics panel if in IQ workspace
+                const iqWorkspace = document.getElementById('workspace-iq');
+                if (iqWorkspace && iqWorkspace.classList.contains('active')) {
+                    // Combine both channels for statistics
+                    const combinedIQ = new Float32Array(IQ_SAMPLES * 2);
+                    for (let i = 0; i < IQ_SAMPLES; i++) {
+                        combinedIQ[i * 2] = (ch1_i[i] + ch2_i[i]) / 2.0 / 2048.0;  // Normalize and average
+                        combinedIQ[i * 2 + 1] = (ch1_q[i] + ch2_q[i]) / 2.0 / 2048.0;
+                    }
+                    updateIQStatistics(combinedIQ);
+
+                    // Update signal detection metrics using raw IQ data
+                    updateIQSignalMetrics(ch1_i, ch1_q, ch2_i, ch2_q);
+
+                    // Update eye diagram and waveform displays
+                    if (typeof EyeDiagram !== 'undefined') {
+                        EyeDiagram.update(ch1_i, ch1_q, ch2_i, ch2_q);
+                    }
+                    if (typeof WaveformDisplay !== 'undefined') {
+                        WaveformDisplay.update(ch1_i, ch1_q, ch2_i, ch2_q);
+                    }
                 }
             } catch (err) {
                 console.error('IQ data fetch error:', err);
@@ -3642,7 +4055,12 @@ const char* html_page = R"HTMLDELIM(
                     console.log('XCorr data range - mag:', maxMag.toFixed(2), 'phase:', maxPhase.toFixed(2));
                 }
 
-                drawXCorr(magnitude, phase);
+                // Draw cross-correlation using the enhanced module or fallback
+                if (typeof CrossCorrelationEnhanced !== 'undefined' && CrossCorrelationEnhanced.draw) {
+                    CrossCorrelationEnhanced.draw(magnitude, phase);
+                } else {
+                    drawXCorr(magnitude, phase);
+                }
             } catch (err) {
                 console.error('XCorr data fetch error:', err);
             } finally {
@@ -3965,6 +4383,23 @@ const char* html_page = R"HTMLDELIM(
                     drawSpectrum(latestFFTData, latestFFTData2);
                 }
 
+                // Update IQ signal metrics if in IQ workspace - need to convert uint8 magnitude to FFT format
+                const iqWorkspace = document.getElementById('workspace-iq');
+                if (iqWorkspace && iqWorkspace.classList.contains('active') && latestFFTData && latestFFTData2) {
+                    // Convert magnitude spectrum to fake FFT format for signal detection
+                    // (Real part = magnitude, Imaginary part = 0)
+                    const ch1_fft = new Float32Array(FFT_SIZE * 2);
+                    const ch2_fft = new Float32Array(FFT_SIZE * 2);
+                    for (let i = 0; i < FFT_SIZE; i++) {
+                        ch1_fft[i * 2] = latestFFTData[i] / 255.0;  // Real
+                        ch1_fft[i * 2 + 1] = 0;  // Imaginary
+                        ch2_fft[i * 2] = latestFFTData2[i] / 255.0;  // Real
+                        ch2_fft[i * 2 + 1] = 0;  // Imaginary
+                    }
+                    updateIQSignalMetrics(ch1_fft, ch2_fft);
+                    updateIQWorkspaceFreqDisplay();
+                }
+
                 isUpdating = false;
             } catch (err) {
                 console.error('Dual-channel waterfall error:', err);
@@ -4214,6 +4649,75 @@ const char* html_page = R"HTMLDELIM(
             }
         }
 
+        // Simple spectrum drawer for IQ and XCORR workspace canvases
+        function drawSimpleSpectrum(data, ctx, width, height, selection) {
+            if (!data || !ctx) return;
+
+            // Clear
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0, 0, width, height);
+
+            // Draw grid
+            ctx.strokeStyle = 'rgba(80, 80, 80, 0.3)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 10; i++) {
+                const y = (height / 10) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            // Draw spectrum line
+            const dbRange = spectrumMaxDb - spectrumMinDb;
+            ctx.strokeStyle = '#00ffff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+
+            for (let x = 0; x < width; x++) {
+                const zoomedBins = zoomState.zoomEndBin - zoomState.zoomStartBin + 1;
+                const fftIdx = zoomState.zoomStartBin + Math.floor((x / width) * zoomedBins);
+                const raw = data[fftIdx];
+                const magDb = rawToDb(raw);
+                const normalizedMag = Math.max(0, Math.min(1, (magDb - spectrumMinDb) / dbRange));
+                const y = height - (normalizedMag * height);
+
+                if (x === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+
+            ctx.stroke();
+
+            // Add gradient fill
+            ctx.lineTo(width, height);
+            ctx.lineTo(0, height);
+            ctx.closePath();
+            const gradient = ctx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(0, 255, 255, 0.3)');
+            gradient.addColorStop(1, 'rgba(0, 255, 255, 0.05)');
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Draw selection highlight AFTER spectrum (so it's on top)
+            if (selection && selection.active) {
+                const leftX = (selection.leftPercent / 100) * width;
+                const rightX = (selection.rightPercent / 100) * width;
+
+                // Draw highlighted background with yellow tint for contrast
+                ctx.fillStyle = 'rgba(255, 255, 0, 0.2)';
+                ctx.fillRect(leftX, 0, rightX - leftX, height);
+
+                // Draw bright yellow edge lines for clear boundaries
+                ctx.strokeStyle = '#ffff00';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(leftX, 0);
+                ctx.lineTo(leftX, height);
+                ctx.moveTo(rightX, 0);
+                ctx.lineTo(rightX, height);
+                ctx.stroke();
+            }
+        }
 
         // Draw FFT spectrum (SDR++/sigdigger style) with double buffering
         function drawSpectrum(data, data2) {
@@ -4225,6 +4729,28 @@ const char* html_page = R"HTMLDELIM(
             // Use SpectrumDisplay module if available
             if (typeof SpectrumDisplay !== 'undefined') {
                 SpectrumDisplay.draw(data, data2);
+
+                // Also draw to IQ and XCORR workspace spectrum canvases if active
+                const iqWorkspace = document.getElementById('workspace-iq');
+                const xcorrWorkspace = document.getElementById('workspace-xcorr');
+
+                if (iqWorkspace && iqWorkspace.classList.contains('active')) {
+                    const iqSpecCanvas = document.getElementById('iq_spectrum');
+                    if (iqSpecCanvas && iqSpecCanvas.width > 0) {
+                        const ctx = iqSpecCanvas.getContext('2d');
+                        const rect = iqSpecCanvas.getBoundingClientRect();
+                        drawSimpleSpectrum(data, ctx, rect.width, rect.height, iqSelection);
+                    }
+                }
+
+                if (xcorrWorkspace && xcorrWorkspace.classList.contains('active')) {
+                    const xcorrSpecCanvas = document.getElementById('xcorr_spectrum');
+                    if (xcorrSpecCanvas && xcorrSpecCanvas.width > 0) {
+                        const ctx = xcorrSpecCanvas.getContext('2d');
+                        const rect = xcorrSpecCanvas.getBoundingClientRect();
+                        drawSimpleSpectrum(data, ctx, rect.width, rect.height, xcorrSelection);
+                    }
+                }
             } else {
                 // Fallback to inline rendering
                 // Update peak hold data (only once for channel 1)
@@ -4577,11 +5103,7 @@ const char* html_page = R"HTMLDELIM(
             if (showIQ) {
                 panel.style.display = 'block';
                 button.classList.add('active');
-                // Only resize if dimensions changed (setting .width clears canvas!)
-                if (iqCanvas.width !== 320 || iqCanvas.height !== 300) {
-                    iqCanvas.width = 320;
-                    iqCanvas.height = 300;
-                }
+                // Canvas size is handled by CSS - don't manually resize (it clears the canvas!)
             } else {
                 panel.style.display = 'none';
                 button.classList.remove('active');
@@ -4693,241 +5215,6 @@ const char* html_page = R"HTMLDELIM(
             statusDiv.style.color = '#fa0';
         }
 
-        // Enhanced IQ constellation with density heatmap, EVM, and statistics
-        function drawIQConstellation(ch1_i, ch1_q, ch2_i, ch2_q) {
-            const width = iqCanvas.width;
-            const height = iqCanvas.height;
-            const centerX = width / 2;
-            const centerY = height / 2;
-            const plotRadius = Math.min(width, height) / 2 - 40;
-
-            // Clear canvas
-            iqCtx.fillStyle = '#0a0a0a';
-            iqCtx.fillRect(0, 0, width, height);
-
-            // Enhanced grid with polar coordinates
-            iqCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
-            iqCtx.lineWidth = 0.5;
-
-            // Radial circles with dB labels
-            const radii = [0.25, 0.5, 0.75, 1.0];
-            iqCtx.font = '9px monospace';
-            iqCtx.fillStyle = '#666';
-            iqCtx.textAlign = 'center';
-
-            for (let i = 0; i < radii.length; i++) {
-                const r = radii[i];
-                const radius = r * plotRadius;
-
-                // Draw circle
-                iqCtx.beginPath();
-                iqCtx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
-                iqCtx.stroke();
-
-                // Label with relative power (dB)
-                const powerDb = 20 * Math.log10(r);
-                iqCtx.fillText(powerDb.toFixed(0) + ' dB', centerX + radius / Math.sqrt(2) + 5, centerY - radius / Math.sqrt(2) - 5);
-            }
-
-            // Angular grid lines (every 30°)
-            iqCtx.strokeStyle = 'rgba(80, 80, 80, 0.15)';
-            for (let angle = 0; angle < 360; angle += 30) {
-                const rad = angle * Math.PI / 180;
-                iqCtx.beginPath();
-                iqCtx.moveTo(centerX, centerY);
-                iqCtx.lineTo(centerX + plotRadius * Math.cos(rad), centerY + plotRadius * Math.sin(rad));
-                iqCtx.stroke();
-            }
-
-            // Crosshairs (emphasized)
-            iqCtx.strokeStyle = 'rgba(100, 100, 100, 0.5)';
-            iqCtx.lineWidth = 1;
-            iqCtx.beginPath();
-            iqCtx.moveTo(centerX, centerY - plotRadius);
-            iqCtx.lineTo(centerX, centerY + plotRadius);
-            iqCtx.moveTo(centerX - plotRadius, centerY);
-            iqCtx.lineTo(centerX + plotRadius, centerY);
-            iqCtx.stroke();
-
-            // Axis labels
-            iqCtx.fillStyle = '#888';
-            iqCtx.font = '10px monospace';
-            iqCtx.textAlign = 'center';
-            iqCtx.fillText('I', centerX + plotRadius + 15, centerY + 4);
-            iqCtx.fillText('-I', centerX - plotRadius - 15, centerY + 4);
-            iqCtx.fillText('Q', centerX, centerY - plotRadius - 10);
-            iqCtx.fillText('-Q', centerX, centerY + plotRadius + 18);
-
-            // Calculate scaling and statistics for both channels
-            function calcStats(i_data, q_data) {
-                // Find maximum amplitude for auto-scaling
-                let maxAmp = 0;
-                let sumI = 0, sumQ = 0, sumPower = 0;
-
-                for (let i = 0; i < i_data.length; i++) {
-                    const amp = Math.sqrt(i_data[i] * i_data[i] + q_data[i] * q_data[i]);
-                    if (amp > maxAmp) maxAmp = amp;
-                    sumI += i_data[i];
-                    sumQ += q_data[i];
-                    sumPower += amp;
-                }
-
-                const meanI = sumI / i_data.length;
-                const meanQ = sumQ / i_data.length;
-                const meanPower = sumPower / i_data.length;
-
-                // Calculate standard deviations
-                let varI = 0, varQ = 0, evmSum = 0;
-                for (let i = 0; i < i_data.length; i++) {
-                    varI += (i_data[i] - meanI) ** 2;
-                    varQ += (q_data[i] - meanQ) ** 2;
-
-                    // EVM: error vector magnitude relative to average power
-                    const errI = i_data[i] - meanI;
-                    const errQ = q_data[i] - meanQ;
-                    evmSum += Math.sqrt(errI * errI + errQ * errQ);
-                }
-
-                const stdI = Math.sqrt(varI / i_data.length);
-                const stdQ = Math.sqrt(varQ / i_data.length);
-                const evm = (evmSum / i_data.length) / Math.max(meanPower, 1) * 100;
-
-                return { maxAmp, meanI, meanQ, meanPower, stdI, stdQ, evm };
-            }
-
-            const stats1 = calcStats(ch1_i, ch1_q);
-            const stats2 = calcStats(ch2_i, ch2_q);
-
-            // Auto-scale to fill plot area with 90% of max amplitude
-            const scale = plotRadius * 0.9 / Math.max(stats1.maxAmp, stats2.maxAmp, 1);
-
-            // Create density heatmap for Channel 1
-            const gridSize = 64;
-            const density1 = new Uint32Array(gridSize * gridSize);
-
-            for (let i = 0; i < IQ_SAMPLES; i++) {
-                const x = Math.floor((ch1_i[i] * scale + plotRadius) / (2 * plotRadius) * gridSize);
-                const y = Math.floor((plotRadius - ch1_q[i] * scale) / (2 * plotRadius) * gridSize);
-
-                if (x >= 0 && x < gridSize && y >= 0 && y < gridSize) {
-                    density1[y * gridSize + x]++;
-                }
-            }
-
-            // Find max density for normalization
-            let maxDensity = 0;
-            for (let i = 0; i < density1.length; i++) {
-                if (density1[i] > maxDensity) maxDensity = density1[i];
-            }
-
-            // Draw density heatmap (Channel 1)
-            const cellSize = (2 * plotRadius) / gridSize;
-            for (let gy = 0; gy < gridSize; gy++) {
-                for (let gx = 0; gx < gridSize; gx++) {
-                    const d = density1[gy * gridSize + gx];
-                    if (d > 0) {
-                        const intensity = Math.log1p(d) / Math.log1p(maxDensity);
-                        const alpha = intensity * 0.8;
-
-                        // Heat colormap: blue -> cyan -> green -> yellow -> red
-                        let r, g, b;
-                        if (intensity < 0.25) {
-                            r = 0;
-                            g = intensity * 4 * 255;
-                            b = 255;
-                        } else if (intensity < 0.5) {
-                            r = 0;
-                            g = 255;
-                            b = (0.5 - intensity) * 4 * 255;
-                        } else if (intensity < 0.75) {
-                            r = (intensity - 0.5) * 4 * 255;
-                            g = 255;
-                            b = 0;
-                        } else {
-                            r = 255;
-                            g = (1 - intensity) * 4 * 255;
-                            b = 0;
-                        }
-
-                        iqCtx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-                        const px = centerX - plotRadius + gx * cellSize;
-                        const py = centerY - plotRadius + gy * cellSize;
-                        iqCtx.fillRect(px, py, cellSize, cellSize);
-                    }
-                }
-            }
-
-            // Draw individual points for Channel 2 (overlay)
-            iqCtx.fillStyle = 'rgba(255, 165, 0, 0.4)';
-            for (let i = 0; i < IQ_SAMPLES; i++) {
-                const x = centerX + ch2_i[i] * scale;
-                const y = centerY - ch2_q[i] * scale;
-                iqCtx.fillRect(x - 0.5, y - 0.5, 1, 1);
-            }
-
-            // Draw mean vectors
-            const mean1X = centerX + stats1.meanI * scale;
-            const mean1Y = centerY - stats1.meanQ * scale;
-            const mean2X = centerX + stats2.meanI * scale;
-            const mean2Y = centerY - stats2.meanQ * scale;
-
-            // CH1 mean vector (cyan arrow)
-            iqCtx.strokeStyle = '#0ff';
-            iqCtx.lineWidth = 2;
-            iqCtx.beginPath();
-            iqCtx.moveTo(centerX, centerY);
-            iqCtx.lineTo(mean1X, mean1Y);
-            iqCtx.stroke();
-
-            // CH2 mean vector (orange arrow)
-            iqCtx.strokeStyle = '#ffa500';
-            iqCtx.lineWidth = 2;
-            iqCtx.beginPath();
-            iqCtx.moveTo(centerX, centerY);
-            iqCtx.lineTo(mean2X, mean2Y);
-            iqCtx.stroke();
-
-            // Statistics panel (bottom)
-            iqCtx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-            iqCtx.fillRect(0, height - 60, width, 60);
-
-            iqCtx.font = '9px monospace';
-            iqCtx.textAlign = 'left';
-
-            // CH1 stats
-            iqCtx.fillStyle = '#0ff';
-            iqCtx.fillText('CH1:', 5, height - 48);
-            iqCtx.fillStyle = '#aaa';
-            iqCtx.fillText(`Mean: ${stats1.meanI.toFixed(0)}, ${stats1.meanQ.toFixed(0)}`, 35, height - 48);
-            iqCtx.fillText(`Std: ${stats1.stdI.toFixed(0)}, ${stats1.stdQ.toFixed(0)}`, 35, height - 38);
-            iqCtx.fillText(`EVM: ${stats1.evm.toFixed(2)}%`, 35, height - 28);
-            iqCtx.fillText(`Pwr: ${stats1.meanPower.toFixed(0)}`, 35, height - 18);
-
-            // CH2 stats
-            iqCtx.fillStyle = '#ffa500';
-            iqCtx.fillText('CH2:', width / 2 + 5, height - 48);
-            iqCtx.fillStyle = '#aaa';
-            iqCtx.fillText(`Mean: ${stats2.meanI.toFixed(0)}, ${stats2.meanQ.toFixed(0)}`, width / 2 + 35, height - 48);
-            iqCtx.fillText(`Std: ${stats2.stdI.toFixed(0)}, ${stats2.stdQ.toFixed(0)}`, width / 2 + 35, height - 38);
-            iqCtx.fillText(`EVM: ${stats2.evm.toFixed(2)}%`, width / 2 + 35, height - 28);
-            iqCtx.fillText(`Pwr: ${stats2.meanPower.toFixed(0)}`, width / 2 + 35, height - 18);
-
-            // Title
-            iqCtx.fillStyle = '#888';
-            iqCtx.font = '11px monospace';
-            iqCtx.textAlign = 'left';
-            iqCtx.fillText('IQ Constellation (Density + Overlay)', 5, 15);
-
-            // Legend (top right)
-            iqCtx.fillStyle = '#0ff';
-            iqCtx.fillText('█', width - 60, 15);
-            iqCtx.fillStyle = '#888';
-            iqCtx.fillText('RX1 (heat)', width - 50, 15);
-            iqCtx.fillStyle = '#ffa500';
-            iqCtx.fillText('●', width - 60, 27);
-            iqCtx.fillStyle = '#888';
-            iqCtx.fillText('RX2 (pts)', width - 50, 27);
-        }
 
         // Phase unwrapping helper
         function unwrapPhase(phase) {
@@ -4991,23 +5278,47 @@ const char* html_page = R"HTMLDELIM(
 
         // Enhanced cross-correlation with frequency-domain coherence and group delay
         function drawXCorr(magnitude, phase) {
-            // Auto-resize canvas to match container
-            const container = document.getElementById('xcorr_canvas_container');
-            const containerWidth = container.clientWidth;
-            const containerHeight = container.clientHeight;
+            // Determine which canvas to render to (prioritize fullscreen if available)
+            const xcorrWorkspace = document.getElementById('workspace-xcorr');
+            const xcorrFullCanvas = document.getElementById('xcorr_fullscreen');
 
-            if (xcorrCanvas.width !== containerWidth || xcorrCanvas.height !== containerHeight) {
-                xcorrCanvas.width = containerWidth;
-                xcorrCanvas.height = containerHeight;
+            let targetCanvas, targetCtx, width, height;
+
+            if (xcorrWorkspace && xcorrWorkspace.classList.contains('active') &&
+                xcorrFullCanvas && xcorrFullCanvas.width > 0) {
+                // Render to fullscreen canvas in XCORR workspace
+                targetCanvas = xcorrFullCanvas;
+                targetCtx = xcorrFullCanvas.getContext('2d');
+                const rect = xcorrFullCanvas.getBoundingClientRect();
+                width = rect.width;
+                height = rect.height;
+                console.log(`[drawXCorr] Rendering to fullscreen canvas: ${width}x${height}`);
+            } else {
+                // Render to small panel canvas
+                const container = document.getElementById('xcorr_canvas_container');
+                if (!container) {
+                    console.warn('[drawXCorr] No container found');
+                    return;
+                }
+                const containerWidth = container.clientWidth;
+                const containerHeight = container.clientHeight;
+
+                if (xcorrCanvas.width !== containerWidth || xcorrCanvas.height !== containerHeight) {
+                    xcorrCanvas.width = containerWidth;
+                    xcorrCanvas.height = containerHeight;
+                }
+
+                targetCanvas = xcorrCanvas;
+                targetCtx = xcorrCtx;
+                width = xcorrCanvas.width;
+                height = xcorrCanvas.height;
+                console.log(`[drawXCorr] Rendering to small canvas: ${width}x${height}`);
             }
-
-            const width = xcorrCanvas.width;
-            const height = xcorrCanvas.height;
             const plotHeight = height / 3 - 5;  // Three plots vertically
 
             // Clear canvas
-            xcorrCtx.fillStyle = '#0a0a0a';
-            xcorrCtx.fillRect(0, 0, width, height);
+            targetCtx.fillStyle = '#0a0a0a';
+            targetCtx.fillRect(0, 0, width, height);
 
             // Calculate metrics
             const coherence = calculateCoherence(magnitude);
@@ -5042,40 +5353,40 @@ const char* html_page = R"HTMLDELIM(
             const plot1Height = plotHeight;
 
             // Grid
-            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
-            xcorrCtx.lineWidth = 0.5;
+            targetCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
+            targetCtx.lineWidth = 0.5;
             for (let i = 0; i <= 4; i++) {
                 const y = plot1Y + (plot1Height / 4) * i;
-                xcorrCtx.beginPath();
-                xcorrCtx.moveTo(0, y);
-                xcorrCtx.lineTo(width, y);
-                xcorrCtx.stroke();
+                targetCtx.beginPath();
+                targetCtx.moveTo(0, y);
+                targetCtx.lineTo(width, y);
+                targetCtx.stroke();
             }
 
             // Vertical grid
             for (let i = 0; i <= 10; i++) {
                 const x = (width / 10) * i;
-                xcorrCtx.beginPath();
-                xcorrCtx.moveTo(x, plot1Y);
-                xcorrCtx.lineTo(x, plot1Y + plot1Height);
-                xcorrCtx.stroke();
+                targetCtx.beginPath();
+                targetCtx.moveTo(x, plot1Y);
+                targetCtx.lineTo(x, plot1Y + plot1Height);
+                targetCtx.stroke();
             }
 
             // Fill area under coherence curve
-            xcorrCtx.fillStyle = 'rgba(0, 255, 100, 0.15)';
-            xcorrCtx.beginPath();
-            xcorrCtx.moveTo(0, plot1Y + plot1Height);
+            targetCtx.fillStyle = 'rgba(0, 255, 100, 0.15)';
+            targetCtx.beginPath();
+            targetCtx.moveTo(0, plot1Y + plot1Height);
 
             for (let x = 0; x < width; x++) {
                 const idx = Math.floor((x / width) * coherenceSpectrum.length);
                 const coh = Math.min(1.0, coherenceSpectrum[idx]);
                 const y = plot1Y + plot1Height * (1 - coh);
-                xcorrCtx.lineTo(x, y);
+                targetCtx.lineTo(x, y);
             }
 
-            xcorrCtx.lineTo(width, plot1Y + plot1Height);
-            xcorrCtx.closePath();
-            xcorrCtx.fill();
+            targetCtx.lineTo(width, plot1Y + plot1Height);
+            targetCtx.closePath();
+            targetCtx.fill();
 
             // Draw coherence line with gradient color
             for (let x = 0; x < width - 1; x++) {
@@ -5095,104 +5406,104 @@ const char* html_page = R"HTMLDELIM(
                     b = 0;
                 }
 
-                xcorrCtx.strokeStyle = `rgb(${r},${g},${b})`;
-                xcorrCtx.lineWidth = 1.5;
-                xcorrCtx.beginPath();
-                xcorrCtx.moveTo(x, y);
-                xcorrCtx.lineTo(x + 1, y);
-                xcorrCtx.stroke();
+                targetCtx.strokeStyle = `rgb(${r},${g},${b})`;
+                targetCtx.lineWidth = 1.5;
+                targetCtx.beginPath();
+                targetCtx.moveTo(x, y);
+                targetCtx.lineTo(x + 1, y);
+                targetCtx.stroke();
             }
 
             // Threshold lines
-            xcorrCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-            xcorrCtx.setLineDash([5, 5]);
-            xcorrCtx.lineWidth = 1;
+            targetCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            targetCtx.setLineDash([5, 5]);
+            targetCtx.lineWidth = 1;
 
             // 0.7 threshold (good coherence)
             let y07 = plot1Y + plot1Height * (1 - 0.7);
-            xcorrCtx.beginPath();
-            xcorrCtx.moveTo(0, y07);
-            xcorrCtx.lineTo(width, y07);
-            xcorrCtx.stroke();
+            targetCtx.beginPath();
+            targetCtx.moveTo(0, y07);
+            targetCtx.lineTo(width, y07);
+            targetCtx.stroke();
 
-            xcorrCtx.fillStyle = '#888';
-            xcorrCtx.font = '8px monospace';
-            xcorrCtx.fillText('0.7', 3, y07 - 2);
+            targetCtx.fillStyle = '#888';
+            targetCtx.font = '8px monospace';
+            targetCtx.fillText('0.7', 3, y07 - 2);
 
-            xcorrCtx.setLineDash([]);
+            targetCtx.setLineDash([]);
 
             // Label
-            xcorrCtx.fillStyle = '#0f0';
-            xcorrCtx.font = '10px monospace';
-            xcorrCtx.textAlign = 'left';
-            xcorrCtx.fillText('Coherence (freq domain)', 5, plot1Y + 12);
+            targetCtx.fillStyle = '#0f0';
+            targetCtx.font = '10px monospace';
+            targetCtx.textAlign = 'left';
+            targetCtx.fillText('Coherence (freq domain)', 5, plot1Y + 12);
 
             // ===== PLOT 2: Magnitude (middle third) =====
             const plot2Y = plot1Height + 10;
             const plot2Height = plotHeight;
 
             // Grid
-            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
-            xcorrCtx.lineWidth = 0.5;
+            targetCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
+            targetCtx.lineWidth = 0.5;
             for (let i = 0; i <= 4; i++) {
                 const y = plot2Y + (plot2Height / 4) * i;
-                xcorrCtx.beginPath();
-                xcorrCtx.moveTo(0, y);
-                xcorrCtx.lineTo(width, y);
-                xcorrCtx.stroke();
+                targetCtx.beginPath();
+                targetCtx.moveTo(0, y);
+                targetCtx.lineTo(width, y);
+                targetCtx.stroke();
             }
 
             // Draw magnitude with peak highlighting
             const peakIdx = magnitude.indexOf(Math.max(...magnitude));
             const peakX = (peakIdx / magnitude.length) * width;
 
-            xcorrCtx.strokeStyle = '#00ffff';
-            xcorrCtx.lineWidth = 1.5;
-            xcorrCtx.beginPath();
+            targetCtx.strokeStyle = '#00ffff';
+            targetCtx.lineWidth = 1.5;
+            targetCtx.beginPath();
 
             for (let x = 0; x < width; x++) {
                 const idx = Math.floor((x / width) * magnitude.length);
                 const mag = Math.min(1.0, magnitude[idx]);
                 const y = plot2Y + plot2Height * (1 - mag);
                 if (x === 0) {
-                    xcorrCtx.moveTo(x, y);
+                    targetCtx.moveTo(x, y);
                 } else {
-                    xcorrCtx.lineTo(x, y);
+                    targetCtx.lineTo(x, y);
                 }
             }
-            xcorrCtx.stroke();
+            targetCtx.stroke();
 
             // Mark peak
-            xcorrCtx.strokeStyle = '#ff0';
-            xcorrCtx.fillStyle = '#ff0';
-            xcorrCtx.lineWidth = 2;
+            targetCtx.strokeStyle = '#ff0';
+            targetCtx.fillStyle = '#ff0';
+            targetCtx.lineWidth = 2;
             const peakY = plot2Y + plot2Height * (1 - magnitude[peakIdx] / Math.max(maxMag, 1e-10));
-            xcorrCtx.beginPath();
-            xcorrCtx.arc(peakX, peakY, 3, 0, 2 * Math.PI);
-            xcorrCtx.fill();
+            targetCtx.beginPath();
+            targetCtx.arc(peakX, peakY, 3, 0, 2 * Math.PI);
+            targetCtx.fill();
 
             // Peak label
-            xcorrCtx.font = '8px monospace';
-            xcorrCtx.fillText(`Peak: ${magnitude[peakIdx].toFixed(3)}`, peakX + 5, peakY - 5);
+            targetCtx.font = '8px monospace';
+            targetCtx.fillText(`Peak: ${magnitude[peakIdx].toFixed(3)}`, peakX + 5, peakY - 5);
 
             // Label
-            xcorrCtx.fillStyle = '#0ff';
-            xcorrCtx.font = '10px monospace';
-            xcorrCtx.fillText('Cross-Correlation Magnitude', 5, plot2Y + 12);
+            targetCtx.fillStyle = '#0ff';
+            targetCtx.font = '10px monospace';
+            targetCtx.fillText('Cross-Correlation Magnitude', 5, plot2Y + 12);
 
             // ===== PLOT 3: Group Delay (bottom third) =====
             const plot3Y = (plot1Height + plot2Height) + 20;
             const plot3Height = plotHeight;
 
             // Grid
-            xcorrCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
-            xcorrCtx.lineWidth = 0.5;
+            targetCtx.strokeStyle = 'rgba(80, 80, 80, 0.25)';
+            targetCtx.lineWidth = 0.5;
             for (let i = 0; i <= 4; i++) {
                 const y = plot3Y + (plot3Height / 4) * i;
-                xcorrCtx.beginPath();
-                xcorrCtx.moveTo(0, y);
-                xcorrCtx.lineTo(width, y);
-                xcorrCtx.stroke();
+                targetCtx.beginPath();
+                targetCtx.moveTo(0, y);
+                targetCtx.lineTo(width, y);
+                targetCtx.stroke();
             }
 
             // Auto-scale group delay
@@ -5201,9 +5512,9 @@ const char* html_page = R"HTMLDELIM(
             const gdRange = gdMax - gdMin || 1;
 
             // Draw group delay
-            xcorrCtx.strokeStyle = '#ffa500';
-            xcorrCtx.lineWidth = 1.5;
-            xcorrCtx.beginPath();
+            targetCtx.strokeStyle = '#ffa500';
+            targetCtx.lineWidth = 1.5;
+            targetCtx.beginPath();
 
             for (let x = 0; x < width; x++) {
                 const idx = Math.floor((x / width) * groupDelay.length);
@@ -5211,41 +5522,41 @@ const char* html_page = R"HTMLDELIM(
                 const gdNorm = (gd - gdMin) / gdRange;
                 const y = plot3Y + plot3Height * (1 - gdNorm);
                 if (x === 0) {
-                    xcorrCtx.moveTo(x, y);
+                    targetCtx.moveTo(x, y);
                 } else {
-                    xcorrCtx.lineTo(x, y);
+                    targetCtx.lineTo(x, y);
                 }
             }
-            xcorrCtx.stroke();
+            targetCtx.stroke();
 
             // Zero reference line
             if (gdMin < 0 && gdMax > 0) {
                 const zeroY = plot3Y + plot3Height * (1 - (-gdMin / gdRange));
-                xcorrCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-                xcorrCtx.setLineDash([5, 5]);
-                xcorrCtx.beginPath();
-                xcorrCtx.moveTo(0, zeroY);
-                xcorrCtx.lineTo(width, zeroY);
-                xcorrCtx.stroke();
-                xcorrCtx.setLineDash([]);
+                targetCtx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+                targetCtx.setLineDash([5, 5]);
+                targetCtx.beginPath();
+                targetCtx.moveTo(0, zeroY);
+                targetCtx.lineTo(width, zeroY);
+                targetCtx.stroke();
+                targetCtx.setLineDash([]);
 
-                xcorrCtx.fillStyle = '#888';
-                xcorrCtx.font = '8px monospace';
-                xcorrCtx.fillText('0 ns', 3, zeroY - 2);
+                targetCtx.fillStyle = '#888';
+                targetCtx.font = '8px monospace';
+                targetCtx.fillText('0 ns', 3, zeroY - 2);
             }
 
             // Y-axis labels
-            xcorrCtx.fillStyle = '#888';
-            xcorrCtx.font = '8px monospace';
-            xcorrCtx.textAlign = 'right';
-            xcorrCtx.fillText(gdMax.toFixed(1) + ' ns', width - 3, plot3Y + 10);
-            xcorrCtx.fillText(gdMin.toFixed(1) + ' ns', width - 3, plot3Y + plot3Height - 3);
+            targetCtx.fillStyle = '#888';
+            targetCtx.font = '8px monospace';
+            targetCtx.textAlign = 'right';
+            targetCtx.fillText(gdMax.toFixed(1) + ' ns', width - 3, plot3Y + 10);
+            targetCtx.fillText(gdMin.toFixed(1) + ' ns', width - 3, plot3Y + plot3Height - 3);
 
             // Label
-            xcorrCtx.fillStyle = '#fa0';
-            xcorrCtx.font = '10px monospace';
-            xcorrCtx.textAlign = 'left';
-            xcorrCtx.fillText('Group Delay (dφ/dω)', 5, plot3Y + 12);
+            targetCtx.fillStyle = '#fa0';
+            targetCtx.font = '10px monospace';
+            targetCtx.textAlign = 'left';
+            targetCtx.fillText('Group Delay (dφ/dω)', 5, plot3Y + 12);
         }
 
         // Track bandwidth for display
@@ -5325,6 +5636,17 @@ const char* html_page = R"HTMLDELIM(
                 document.getElementById('freq').textContent = (data.freq / 1e6).toFixed(2) + ' MHz';
                 document.getElementById('sr').textContent = (data.sr / 1e6).toFixed(1) + ' MHz';
                 document.getElementById('gain').textContent = (ch === '1' ? data.g1 : data.g2) + ' dB';
+
+                // Update IQ and XCORR workspace frequency displays
+                const iqCenterFreq = document.getElementById('iq_center_freq');
+                const xcorrCenterFreq = document.getElementById('xcorr_center_freq');
+                const iqSpan = document.getElementById('iq_span');
+                const xcorrSpan = document.getElementById('xcorr_span');
+
+                if (iqCenterFreq) iqCenterFreq.textContent = (data.freq / 1e6).toFixed(3) + ' MHz';
+                if (xcorrCenterFreq) xcorrCenterFreq.textContent = (data.freq / 1e6).toFixed(3) + ' MHz';
+                if (iqSpan) iqSpan.textContent = (data.sr / 1e6).toFixed(2) + ' MHz';
+                if (xcorrSpan) xcorrSpan.textContent = (data.sr / 1e6).toFixed(2) + ' MHz';
 
                 // Update control panel inputs with current values (only if not focused)
                 const freqInput = document.getElementById('freqInput');
@@ -5634,6 +5956,543 @@ const char* html_page = R"HTMLDELIM(
                 config.gain2 || null
             );
         }
+
+        // Tune up by a given amount in Hz
+        async function tuneUp(deltaHz) {
+            const freqInput = document.getElementById('freqInput');
+            if (!freqInput) return;
+
+            const currentFreq = parseFloat(freqInput.value) * 1e6; // Convert MHz to Hz
+            const newFreq = currentFreq + deltaHz;
+
+            freqInput.value = (newFreq / 1e6).toFixed(3);
+            await sendControlUpdate(newFreq, null, null, null, null, null);
+
+            // Reset IQ constellation when tuning
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.reset) {
+                IQConstellationEnhanced.reset();
+            }
+
+            console.log(`Tuned UP by ${(deltaHz/1e6).toFixed(3)} MHz to ${(newFreq/1e6).toFixed(3)} MHz`);
+        }
+
+        // Tune down by a given amount in Hz
+        async function tuneDown(deltaHz) {
+            const freqInput = document.getElementById('freqInput');
+            if (!freqInput) return;
+
+            const currentFreq = parseFloat(freqInput.value) * 1e6; // Convert MHz to Hz
+            const newFreq = currentFreq - deltaHz;
+
+            freqInput.value = (newFreq / 1e6).toFixed(3);
+            await sendControlUpdate(newFreq, null, null, null, null, null);
+
+            // Reset IQ constellation when tuning
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.reset) {
+                IQConstellationEnhanced.reset();
+            }
+
+            console.log(`Tuned DOWN by ${(deltaHz/1e6).toFixed(3)} MHz to ${(newFreq/1e6).toFixed(3)} MHz`);
+        }
+
+        // Tune to a selected spectrum region
+        // Make this a global function so it can be called from event handlers in other script blocks
+        // Filter analysis to selected spectrum portion (bandpass filter)
+        window.filterToSelection = function(selection) {
+            console.log('[Filter to Selection] Function entry, selection:', selection);
+
+            // Calculate bin indices from selection percentages
+            const startBin = Math.floor((selection.leftPercent / 100) * FFT_SIZE);
+            const endBin = Math.floor((selection.rightPercent / 100) * FFT_SIZE);
+
+            console.log(`[Filter to Selection] Filtering to bins ${startBin} - ${endBin} (${selection.leftPercent.toFixed(1)}% - ${selection.rightPercent.toFixed(1)}%)`);
+
+            // Update filter state to pass to /iq_data and /xcorr_data endpoints
+            filterState.isFiltered = true;
+            filterState.filterStartBin = startBin;
+            filterState.filterEndBin = endBin;
+            filterState.leftPercent = selection.leftPercent;
+            filterState.rightPercent = selection.rightPercent;
+
+            // Calculate center frequency of selection for display
+            const freqInput = document.getElementById('freqInput');
+            const sampleRateInput = document.getElementById('srInput');
+
+            if (freqInput && sampleRateInput) {
+                const currentCenterFreq = parseFloat(freqInput.value) * 1e6;
+                const sampleRate = parseFloat(sampleRateInput.value) * 1e6;
+                const displayBandwidth = sampleRate;
+                const startFreq = currentCenterFreq - (displayBandwidth / 2);
+                const endFreq = currentCenterFreq + (displayBandwidth / 2);
+
+                const selectedStartFreq = startFreq + (selection.leftPercent / 100) * displayBandwidth;
+                const selectedEndFreq = startFreq + (selection.rightPercent / 100) * displayBandwidth;
+                const selectedCenterFreq = (selectedStartFreq + selectedEndFreq) / 2;
+                const selectedBandwidth = selectedEndFreq - selectedStartFreq;
+
+                console.log(`[Filter] Selected freq range: ${(selectedStartFreq/1e6).toFixed(3)} - ${(selectedEndFreq/1e6).toFixed(3)} MHz`);
+                console.log(`[Filter] Center: ${(selectedCenterFreq/1e6).toFixed(3)} MHz, BW: ${(selectedBandwidth/1e3).toFixed(1)} kHz`);
+
+                filterState.selectedCenterFreq = selectedCenterFreq;
+                filterState.selectedBandwidth = selectedBandwidth;
+            }
+
+            // Reset analysis displays to show filtered data
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.reset) {
+                IQConstellationEnhanced.reset();
+            }
+            if (typeof EyeDiagram !== 'undefined' && EyeDiagram.clear) {
+                EyeDiagram.clear();
+            }
+
+            // Show notification
+            const bwKHz = filterState.selectedBandwidth ? (filterState.selectedBandwidth / 1e3).toFixed(1) : '?';
+            showNotification(`Analysis filtered to ${bwKHz} kHz bandwidth`, 'success', 2000);
+
+            console.log(`✓ Filtered analysis to bins ${startBin}-${endBin}`);
+        };
+
+        // Clear spectrum filter (analyze full bandwidth)
+        window.clearFilter = function() {
+            console.log('[Clear Filter] Removing bandpass filter');
+
+            filterState.isFiltered = false;
+            filterState.filterStartBin = 0;
+            filterState.filterEndBin = FFT_SIZE - 1;
+
+            // Reset analysis displays
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.reset) {
+                IQConstellationEnhanced.reset();
+            }
+            if (typeof EyeDiagram !== 'undefined' && EyeDiagram.clear) {
+                EyeDiagram.clear();
+            }
+
+            showNotification('Filter cleared - analyzing full bandwidth', 'info', 2000);
+            console.log('✓ Filter cleared');
+        };
+
+        // === IQ WORKSPACE TAB CONTROL FUNCTIONS ===
+
+        // IQ Auto-scale to fit current data
+        function iqAutoScale() {
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.autoScale) {
+                IQConstellationEnhanced.autoScale();
+                console.log('[IQ] Auto-scaled to fit data');
+            }
+        }
+
+        // Reset IQ view to default zoom/position
+        function iqResetView() {
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.resetView) {
+                IQConstellationEnhanced.resetView();
+                console.log('[IQ] Reset view to default');
+            }
+        }
+
+        // Clear IQ persistence trail
+        function iqClearPersistence() {
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.reset) {
+                IQConstellationEnhanced.reset();
+                console.log('[IQ] Cleared persistence trail');
+            }
+        }
+
+        // Apply frequency offset
+        async function iqApplyOffset() {
+            const offsetInput = document.getElementById('iq_freq_offset');
+            const freqInput = document.getElementById('freqInput');
+            if (!offsetInput || !freqInput) return;
+
+            const offsetKHz = parseFloat(offsetInput.value);
+            const currentFreqMHz = parseFloat(freqInput.value);
+            const newFreqMHz = currentFreqMHz + (offsetKHz / 1000);
+
+            freqInput.value = newFreqMHz.toFixed(3);
+            await sendControlUpdate(newFreqMHz * 1e6, null, null, null, null, null);
+
+            // Reset offset input
+            offsetInput.value = '0';
+
+            // Reset IQ constellation
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.reset) {
+                IQConstellationEnhanced.reset();
+            }
+
+            console.log(`[IQ] Applied offset: ${offsetKHz} kHz, new freq: ${newFreqMHz.toFixed(3)} MHz`);
+        }
+
+        // Adjust frequency offset
+        function iqFreqOffset(deltaKHz) {
+            const offsetInput = document.getElementById('iq_freq_offset');
+            if (!offsetInput) return;
+
+            const currentOffset = parseFloat(offsetInput.value) || 0;
+            offsetInput.value = (currentOffset + deltaKHz).toFixed(0);
+        }
+
+        // Adjust gain
+        async function iqGainAdjust(deltaDb) {
+            const gainInput = document.getElementById('gainInput');
+            const currentGainDisplay = document.getElementById('iq_current_gain');
+            if (!gainInput) return;
+
+            const currentGain = parseFloat(gainInput.value);
+            const newGain = Math.max(0, Math.min(66, currentGain + deltaDb)); // Clamp to bladeRF range
+
+            gainInput.value = newGain.toFixed(0);
+            if (currentGainDisplay) {
+                currentGainDisplay.textContent = `${newGain.toFixed(0)} dB`;
+            }
+
+            await sendControlUpdate(null, null, newGain, null, null, null);
+
+            console.log(`[IQ] Adjusted gain by ${deltaDb} dB to ${newGain} dB`);
+        }
+
+        // Change IF bandwidth
+        async function iqBandwidthChange() {
+            const bwSelect = document.getElementById('iq_bandwidth_select');
+            const bwInput = document.getElementById('bwInput');
+            if (!bwSelect) {
+                console.warn('[IQ] Bandwidth select not found');
+                return;
+            }
+
+            const newBwMHz = parseFloat(bwSelect.value);
+
+            // Update main bandwidth input if it exists
+            if (bwInput) {
+                bwInput.value = newBwMHz.toFixed(2);
+            }
+
+            // Validate bandwidth range (bladeRF supports 0.52 - 61.44 MHz)
+            if (newBwMHz < 0.52 || newBwMHz > 61.44) {
+                console.error(`[IQ] Bandwidth ${newBwMHz} MHz out of valid range (0.52-61.44 MHz)`);
+                return;
+            }
+
+            console.log(`[IQ] Changing bandwidth to ${newBwMHz} MHz (${newBwMHz * 1e6} Hz)`);
+
+            try {
+                await sendControlUpdate(null, null, null, newBwMHz * 1e6, null, null);
+                console.log(`[IQ] Bandwidth changed successfully to ${newBwMHz} MHz`);
+            } catch (err) {
+                console.error(`[IQ] Failed to change bandwidth:`, err);
+            }
+        }
+
+        // Change persistence
+        function iqPersistenceChange(value) {
+            const displayEl = document.getElementById('iq_persistence_value');
+            if (displayEl) {
+                displayEl.textContent = `${value}%`;
+            }
+
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.setPersistence) {
+                IQConstellationEnhanced.setPersistence(parseFloat(value) / 100);
+            }
+        }
+
+        // Change point size
+        function iqPointSizeChange(value) {
+            const displayEl = document.getElementById('iq_point_size_value');
+            if (displayEl) {
+                displayEl.textContent = `${value}px`;
+            }
+
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.setPointSize) {
+                IQConstellationEnhanced.setPointSize(parseFloat(value));
+            }
+        }
+
+        // Set zoom level
+        function iqZoom(scale) {
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.setZoom) {
+                IQConstellationEnhanced.setZoom(scale);
+                console.log(`[IQ] Zoom set to ${scale}x`);
+            }
+        }
+
+        // Toggle grid display
+        function iqToggleGrid() {
+            const checkbox = document.getElementById('iq_show_grid');
+            if (!checkbox) return;
+
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.setShowGrid) {
+                IQConstellationEnhanced.setShowGrid(checkbox.checked);
+            }
+        }
+
+        // Toggle statistics overlay
+        function iqToggleStats() {
+            const checkbox = document.getElementById('iq_show_stats');
+            if (!checkbox) return;
+
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.setShowStats) {
+                IQConstellationEnhanced.setShowStats(checkbox.checked);
+            }
+        }
+
+        // Toggle density heatmap mode
+        function iqToggleDensity() {
+            const checkbox = document.getElementById('iq_density_mode');
+            if (!checkbox) return;
+
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.setDensityMode) {
+                IQConstellationEnhanced.setDensityMode(checkbox.checked);
+            }
+        }
+
+        // Change modulation type
+        function iqModulationTypeChange(modType) {
+            if (typeof IQConstellationEnhanced !== 'undefined' && IQConstellationEnhanced.setModulationType) {
+                IQConstellationEnhanced.setModulationType(modType);
+                console.log(`[IQ] Modulation type: ${modType}`);
+            }
+        }
+
+        // ===================== WAVEFORM & EYE DIAGRAM ZOOM/PAN CONTROLS =====================
+
+        // Change waveform view mode
+        function waveformViewModeChange(mode) {
+            if (typeof WaveformDisplay !== 'undefined' && WaveformDisplay.setViewMode) {
+                WaveformDisplay.setViewMode(mode);
+                console.log(`[Waveform] View mode: ${mode}`);
+            }
+        }
+
+        // Change eye diagram symbol rate
+        function eyeSymbolRateChange(rate) {
+            const symbolRate = parseFloat(rate);
+            if (typeof EyeDiagram !== 'undefined' && EyeDiagram.setSymbolRate) {
+                EyeDiagram.setSymbolRate(symbolRate);
+                console.log(`[Eye Diagram] Symbol rate: ${(symbolRate / 1e6).toFixed(3)} Msym/s`);
+            }
+        }
+
+        // Set zoom level for both waveform and eye diagram
+        function waveformEyeZoom(zoom) {
+            if (typeof WaveformDisplay !== 'undefined' && WaveformDisplay.setZoom) {
+                WaveformDisplay.setZoom(zoom);
+                console.log(`[Waveform] Zoom: ${zoom}x`);
+            }
+            if (typeof EyeDiagram !== 'undefined' && EyeDiagram.setZoom) {
+                EyeDiagram.setZoom(zoom);
+                console.log(`[Eye Diagram] Zoom: ${zoom}x`);
+            }
+        }
+
+        // Reset view for both waveform and eye diagram
+        function waveformEyeResetView() {
+            if (typeof WaveformDisplay !== 'undefined' && WaveformDisplay.resetView) {
+                WaveformDisplay.resetView();
+                console.log('[Waveform] View reset');
+            }
+            if (typeof EyeDiagram !== 'undefined' && EyeDiagram.resetView) {
+                EyeDiagram.resetView();
+                console.log('[Eye Diagram] View reset');
+            }
+        }
+
+        // ===================== EYE DIAGRAM CONTROLS =====================
+
+        // Update eye diagram symbol rate
+        function eyeUpdateSymbolRate() {
+            const select = document.getElementById('eye_symbol_rate');
+            if (!select) return;
+
+            const symbolRate = parseFloat(select.value);
+            if (typeof EyeDiagram !== 'undefined' && EyeDiagram.setSymbolRate) {
+                EyeDiagram.setSymbolRate(symbolRate);
+                console.log(`[Eye Diagram] Symbol rate: ${(symbolRate / 1e6).toFixed(3)} Msym/s`);
+            }
+        }
+
+        // Clear eye diagram persistence
+        function eyeClear() {
+            if (typeof EyeDiagram !== 'undefined' && EyeDiagram.clear) {
+                EyeDiagram.clear();
+                console.log('[Eye Diagram] Cleared');
+            }
+        }
+
+        // ===================== WAVEFORM DISPLAY CONTROLS =====================
+
+        // Update waveform view mode
+        function waveformUpdateMode() {
+            const select = document.getElementById('waveform_view_mode');
+            if (!select) return;
+
+            const mode = select.value;
+            if (typeof WaveformDisplay !== 'undefined' && WaveformDisplay.setViewMode) {
+                WaveformDisplay.setViewMode(mode);
+                console.log(`[Waveform] View mode: ${mode}`);
+            }
+        }
+
+        // Update IQ workspace frequency/span displays
+        function updateIQWorkspaceFreqDisplay() {
+            const freqInput = document.getElementById('freqInput');
+            const srInput = document.getElementById('srInput');
+            const iqCenterFreq = document.getElementById('iq_center_freq');
+            const iqSpan = document.getElementById('iq_span');
+
+            if (freqInput && iqCenterFreq) {
+                iqCenterFreq.textContent = parseFloat(freqInput.value).toFixed(3) + ' MHz';
+            }
+
+            if (srInput && iqSpan) {
+                iqSpan.textContent = parseFloat(srInput.value).toFixed(2) + ' MHz';
+            }
+        }
+
+        // Update IQ signal detection metrics using raw IQ samples
+        function updateIQSignalMetrics(ch1_i, ch1_q, ch2_i, ch2_q) {
+            if (!ch1_i || !ch1_q || !ch2_i || !ch2_q) return;
+
+            const numSamples = Math.min(ch1_i.length, ch1_q.length, ch2_i.length, ch2_q.length);
+
+            // Calculate instantaneous power for each sample (I^2 + Q^2)
+            let maxPower = 0;
+            let avgPower = 0;
+            let minPower = Infinity;
+
+            for (let i = 0; i < numSamples; i++) {
+                // Average both channels, normalize int16 to float
+                const iVal = (ch1_i[i] + ch2_i[i]) / 2.0 / 2048.0;
+                const qVal = (ch1_q[i] + ch2_q[i]) / 2.0 / 2048.0;
+
+                // Power = I^2 + Q^2
+                const power = iVal * iVal + qVal * qVal;
+
+                maxPower = Math.max(maxPower, power);
+                minPower = Math.min(minPower, power);
+                avgPower += power;
+            }
+            avgPower /= numSamples;
+
+            // Noise floor estimate: use minimum power or average of lowest 25% of samples
+            const powerSamples = [];
+            for (let i = 0; i < numSamples; i++) {
+                const iVal = (ch1_i[i] + ch2_i[i]) / 2.0 / 2048.0;
+                const qVal = (ch1_q[i] + ch2_q[i]) / 2.0 / 2048.0;
+                powerSamples.push(iVal * iVal + qVal * qVal);
+            }
+            powerSamples.sort((a, b) => a - b);
+            const noiseFloorPower = powerSamples[Math.floor(numSamples * 0.25)]; // 25th percentile
+
+            // Convert to dBFS (reference = 1.0 for full scale)
+            const peakPowerDb = 10 * Math.log10(maxPower + 1e-10);
+            const avgPowerDb = 10 * Math.log10(avgPower + 1e-10);
+            const noiseFloorDb = 10 * Math.log10(noiseFloorPower + 1e-10);
+            const snrDb = peakPowerDb - noiseFloorDb;
+
+            console.log(`[IQ Signal Metrics] Peak: ${peakPowerDb.toFixed(1)} dBFS, Avg: ${avgPowerDb.toFixed(1)} dBFS, Noise: ${noiseFloorDb.toFixed(1)} dBFS, SNR: ${snrDb.toFixed(1)} dB`);
+
+            // Update displays
+            const statusEl = document.getElementById('iq_signal_status');
+            const snrEl = document.getElementById('iq_snr');
+            const peakPowerEl = document.getElementById('iq_peak_power');
+            const noiseFloorEl = document.getElementById('iq_noise_floor');
+            const signalBarEl = document.getElementById('iq_signal_bar');
+            const signalBarTextEl = document.getElementById('iq_signal_bar_text');
+
+            if (snrDb > 10) {
+                if (statusEl) {
+                    statusEl.textContent = 'SIGNAL DETECTED';
+                    statusEl.style.color = '#0f0';
+                }
+            } else if (snrDb > 3) {
+                if (statusEl) {
+                    statusEl.textContent = 'WEAK SIGNAL';
+                    statusEl.style.color = '#ff0';
+                }
+            } else {
+                if (statusEl) {
+                    statusEl.textContent = 'NO SIGNAL';
+                    statusEl.style.color = '#888';
+                }
+            }
+
+            if (snrEl) snrEl.textContent = snrDb.toFixed(1) + ' dB';
+            if (peakPowerEl) peakPowerEl.textContent = peakPowerDb.toFixed(1) + ' dBFS';
+            if (noiseFloorEl) noiseFloorEl.textContent = noiseFloorDb.toFixed(1) + ' dBFS';
+
+            // Update signal strength bar (scale SNR to 0-100%, 20dB = 100%)
+            const signalStrength = Math.max(0, Math.min(100, snrDb * 5));
+            if (signalBarEl) {
+                signalBarEl.style.width = signalStrength.toFixed(0) + '%';
+            }
+            if (signalBarTextEl) {
+                signalBarTextEl.textContent = signalStrength.toFixed(0) + '%';
+            }
+        }
+
+        // Update IQ statistics panel
+        function updateIQStatistics(iq_data) {
+            if (!iq_data || iq_data.length < 4) return;
+
+            let sumI = 0, sumQ = 0;
+            let sumI2 = 0, sumQ2 = 0;
+            const numSamples = iq_data.length / 2;
+
+            for (let i = 0; i < iq_data.length; i += 2) {
+                const I = iq_data[i];
+                const Q = iq_data[i + 1];
+                sumI += I;
+                sumQ += Q;
+                sumI2 += I * I;
+                sumQ2 += Q * Q;
+            }
+
+            const meanI = sumI / numSamples;
+            const meanQ = sumQ / numSamples;
+            const rmsI = Math.sqrt(sumI2 / numSamples);
+            const rmsQ = Math.sqrt(sumQ2 / numSamples);
+
+            // Calculate EVM (Error Vector Magnitude)
+            let evmSum = 0;
+            let refPowerSum = 0;
+            for (let i = 0; i < iq_data.length; i += 2) {
+                const I = iq_data[i];
+                const Q = iq_data[i + 1];
+                const errorI = I - meanI;
+                const errorQ = Q - meanQ;
+                evmSum += errorI * errorI + errorQ * errorQ;
+                refPowerSum += I * I + Q * Q;
+            }
+            const evmPercent = Math.sqrt(evmSum / refPowerSum) * 100;
+
+            // Calculate phase noise (std dev of phase)
+            let phaseSum = 0;
+            let phaseSquareSum = 0;
+            for (let i = 0; i < iq_data.length; i += 2) {
+                const phase = Math.atan2(iq_data[i + 1], iq_data[i]) * (180 / Math.PI);
+                phaseSum += phase;
+                phaseSquareSum += phase * phase;
+            }
+            const meanPhase = phaseSum / numSamples;
+            const phaseVariance = (phaseSquareSum / numSamples) - (meanPhase * meanPhase);
+            const phaseNoiseStdDev = Math.sqrt(Math.max(0, phaseVariance));
+
+            // Update display
+            const iMeanEl = document.getElementById('iq_i_mean');
+            const qMeanEl = document.getElementById('iq_q_mean');
+            const iRmsEl = document.getElementById('iq_i_rms');
+            const qRmsEl = document.getElementById('iq_q_rms');
+            const evmEl = document.getElementById('iq_evm');
+            const phaseNoiseEl = document.getElementById('iq_phase_noise');
+
+            if (iMeanEl) iMeanEl.textContent = meanI.toFixed(4);
+            if (qMeanEl) qMeanEl.textContent = meanQ.toFixed(4);
+            if (iRmsEl) iRmsEl.textContent = rmsI.toFixed(4);
+            if (qRmsEl) qRmsEl.textContent = rmsQ.toFixed(4);
+            if (evmEl) evmEl.textContent = evmPercent.toFixed(2) + ' %';
+            if (phaseNoiseEl) phaseNoiseEl.textContent = phaseNoiseStdDev.toFixed(2) + ' °';
+        }
+
+        // === END IQ WORKSPACE TAB CONTROL FUNCTIONS ===
 
         // Save current configuration as a preset
         function savePreset() {
@@ -6437,6 +7296,16 @@ H or ? - Show this help
                     // Clear canvas for fresh data
                     ctx.fillStyle = '#000';
                     ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    // Update sample rate in eye diagram and waveform display modules
+                    if (sr !== null) {
+                        if (typeof EyeDiagram !== 'undefined' && EyeDiagram.setSampleRate) {
+                            EyeDiagram.setSampleRate(sr);
+                        }
+                        if (typeof WaveformDisplay !== 'undefined' && WaveformDisplay.setSampleRate) {
+                            WaveformDisplay.setSampleRate(sr);
+                        }
+                    }
                 } else {
                     console.error('Control update failed:', result);
                     showNotification(`Error: ${result.error || 'Unknown error'}`, 'error');
@@ -11978,8 +12847,10 @@ H or ? - Show this help
     <!-- Display modules -->
     <script src="/js/displays/waterfall.js"></script>
     <script src="/js/displays/spectrum.js"></script>
-    <script src="/js/displays/iq_constellation.js"></script>
-    <script src="/js/displays/cross_correlation.js"></script>
+    <script src="/js/displays/iq_constellation_enhanced.js"></script>
+    <script src="/js/displays/cross_correlation_enhanced.js"></script>
+    <script src="/js/displays/eye_diagram.js"></script>
+    <script src="/js/displays/waveform_display.js"></script>
 
     <!-- Feature modules -->
     <script src="/js/scanner_enhanced.js"></script>
@@ -12002,6 +12873,8 @@ H or ? - Show this help
             const specCanvas2 = document.getElementById('spectrum2');
             const iqCanvas = document.getElementById('iq_canvas');
             const xcorrCanvas = document.getElementById('xcorr_canvas');
+            const iqFullscreenCanvas = document.getElementById('iq_fullscreen');
+            const xcorrFullscreenCanvas = document.getElementById('xcorr_fullscreen');
 
             // Initialize modules with their canvases
             if (typeof WaterfallDisplay !== 'undefined') {
@@ -12019,15 +12892,18 @@ H or ? - Show this help
                 console.log('✓ SpectrumDisplay initialized');
             }
 
-            if (typeof IQConstellation !== 'undefined') {
-                IQConstellation.init(iqCanvas);
-                console.log('✓ IQConstellation initialized');
+            if (typeof IQConstellationEnhanced !== 'undefined') {
+                IQConstellationEnhanced.init(iqCanvas, iqFullscreenCanvas);
+                console.log('✓ IQConstellationEnhanced initialized');
             }
 
-            if (typeof CrossCorrelation !== 'undefined') {
-                CrossCorrelation.init(xcorrCanvas);
-                console.log('✓ CrossCorrelation initialized');
+            if (typeof CrossCorrelationEnhanced !== 'undefined') {
+                CrossCorrelationEnhanced.init(xcorrCanvas, xcorrFullscreenCanvas);
+                console.log('✓ CrossCorrelationEnhanced initialized');
             }
+
+            // Note: Eye Diagram and Waveform Display will be initialized when IQ workspace is activated
+            // (deferred initialization to ensure canvas dimensions are computed)
 
             console.log('Display modules initialization complete');
         })();
@@ -12311,6 +13187,230 @@ H or ? - Show this help
                     initDoAPolarMain();
                     initDoATimeline();
                     showDoAInstructions();
+                }, 100);
+            } else if (tabName === 'iq') {
+                // IQ Constellation fullscreen workspace
+                document.getElementById('signal_analysis').style.display = 'none';
+                document.getElementById('marker_panel').style.display = 'none';
+                document.getElementById('stats_panel').style.display = 'none';
+                document.getElementById('activity_timeline').style.display = 'none';
+                document.getElementById('iq_constellation').style.display = 'none';
+                document.getElementById('xcorr_display').style.display = 'none';
+                document.getElementById('vsa_panel').style.display = 'none';
+                document.getElementById('demod_panel').style.display = 'none';
+
+                // Enable IQ updates for fullscreen canvas
+                showIQ = true;
+                showXCorr = false;
+
+                // Initialize IQ workspace canvases with proper DPI scaling
+                setTimeout(() => {
+                    const iqFullscreenCanvas = document.getElementById('iq_fullscreen');
+                    const iqSpectrumCanvas = document.getElementById('iq_spectrum');
+                    const dpr = window.devicePixelRatio || 1;
+
+                    if (iqFullscreenCanvas) {
+                        const container = document.getElementById('iq_fullscreen_container');
+                        const rect = container.getBoundingClientRect();
+
+                        // Set canvas resolution based on display size and device pixel ratio
+                        iqFullscreenCanvas.width = rect.width * dpr;
+                        iqFullscreenCanvas.height = rect.height * dpr;
+
+                        // Scale context to match device pixel ratio for crisp rendering
+                        const ctx = iqFullscreenCanvas.getContext('2d');
+                        ctx.scale(dpr, dpr);
+
+                        console.log(`IQ fullscreen canvas: display=${rect.width}x${rect.height}, resolution=${iqFullscreenCanvas.width}x${iqFullscreenCanvas.height}, dpr=${dpr}`);
+
+                        // Initialize IQ constellation module with both canvases
+                        if (typeof IQConstellationEnhanced !== 'undefined') {
+                            const smallCanvas = document.getElementById('iq_canvas');
+                            IQConstellationEnhanced.init(smallCanvas, iqFullscreenCanvas);
+                        }
+                    }
+
+                    if (iqSpectrumCanvas) {
+                        const container = iqSpectrumCanvas.parentElement;
+                        const rect = container.getBoundingClientRect();
+
+                        iqSpectrumCanvas.width = rect.width * dpr;
+                        iqSpectrumCanvas.height = rect.height * dpr;
+
+                        const ctx = iqSpectrumCanvas.getContext('2d');
+                        ctx.scale(dpr, dpr);
+
+                        console.log(`IQ spectrum canvas: display=${rect.width}x${rect.height}, resolution=${iqSpectrumCanvas.width}x${iqSpectrumCanvas.height}`);
+
+                        // Add mouse handlers for spectrum selection
+                        iqSpectrumCanvas.style.cursor = 'crosshair';
+
+                        iqSpectrumCanvas.addEventListener('mousedown', (e) => {
+                            const rect = iqSpectrumCanvas.getBoundingClientRect();
+                            const x = e.clientX - rect.left;
+                            const pct = (x / rect.width) * 100;
+
+                            iqSelection.dragging = 'selecting';
+                            iqSelection.leftPercent = pct;
+                            iqSelection.rightPercent = pct;
+                            iqSelection.active = true;
+                        });
+
+                        iqSpectrumCanvas.addEventListener('mousemove', (e) => {
+                            if (iqSelection.dragging !== 'selecting') return;
+
+                            const rect = iqSpectrumCanvas.getBoundingClientRect();
+                            const x = e.clientX - rect.left;
+                            const pct = Math.max(0, Math.min(100, (x / rect.width) * 100));
+
+                            if (pct < iqSelection.leftPercent) {
+                                iqSelection.rightPercent = iqSelection.leftPercent;
+                                iqSelection.leftPercent = pct;
+                            } else {
+                                iqSelection.rightPercent = pct;
+                            }
+                        });
+
+                        iqSpectrumCanvas.addEventListener('mouseup', async (e) => {
+                            if (iqSelection.dragging === 'selecting') {
+                                iqSelection.dragging = null;
+                                console.log(`IQ spectrum selection: ${iqSelection.leftPercent.toFixed(1)}% - ${iqSelection.rightPercent.toFixed(1)}%`);
+
+                                // Tune to the selected region
+                                console.log(`[Debug] window.tuneToSelection type: ${typeof window.tuneToSelection}`);
+                                if (typeof window.filterToSelection === 'function') {
+                                    console.log('[Debug] Calling window.filterToSelection...');
+                                    window.filterToSelection(iqSelection);
+                                    console.log('[Debug] filterToSelection completed successfully');
+                                } else {
+                                    console.warn('[Debug] window.filterToSelection is not a function!');
+                                }
+                            }
+                        });
+                    }
+
+                    // Initialize Eye Diagram and Waveform Display (deferred until canvases are sized)
+                    // Only initialize once to avoid re-initialization on tab switches
+                    if (typeof EyeDiagram !== 'undefined' && !window.eyeDiagramInitialized) {
+                        EyeDiagram.init('eye_diagram_canvas');
+                        window.eyeDiagramInitialized = true;
+                        console.log('✓ EyeDiagram initialized (deferred)');
+                    }
+
+                    if (typeof WaveformDisplay !== 'undefined' && !window.waveformDisplayInitialized) {
+                        WaveformDisplay.init('waveform_canvas');
+                        window.waveformDisplayInitialized = true;
+                        console.log('✓ WaveformDisplay initialized (deferred)');
+                    }
+
+                    // Trigger resize to ensure proper canvas dimensions
+                    if (typeof EyeDiagram !== 'undefined' && EyeDiagram.resize) {
+                        EyeDiagram.resize();
+                    }
+                    if (typeof WaveformDisplay !== 'undefined' && WaveformDisplay.resize) {
+                        WaveformDisplay.resize();
+                    }
+                }, 100);
+            } else if (tabName === 'xcorr') {
+                // Cross-Correlation fullscreen workspace
+                document.getElementById('signal_analysis').style.display = 'none';
+                document.getElementById('marker_panel').style.display = 'none';
+                document.getElementById('stats_panel').style.display = 'none';
+                document.getElementById('activity_timeline').style.display = 'none';
+                document.getElementById('iq_constellation').style.display = 'none';
+                document.getElementById('xcorr_display').style.display = 'none';
+                document.getElementById('vsa_panel').style.display = 'none';
+                document.getElementById('demod_panel').style.display = 'none';
+
+                // Enable cross-correlation updates for fullscreen canvas
+                showIQ = false;
+                showXCorr = true;
+
+                // Initialize XCORR workspace canvases with proper DPI scaling
+                setTimeout(() => {
+                    const xcorrFullscreenCanvas = document.getElementById('xcorr_fullscreen');
+                    const xcorrSpectrumCanvas = document.getElementById('xcorr_spectrum');
+                    const dpr = window.devicePixelRatio || 1;
+
+                    if (xcorrFullscreenCanvas) {
+                        const container = document.getElementById('xcorr_fullscreen_container');
+                        const rect = container.getBoundingClientRect();
+
+                        // Set canvas resolution based on display size and device pixel ratio
+                        xcorrFullscreenCanvas.width = rect.width * dpr;
+                        xcorrFullscreenCanvas.height = rect.height * dpr;
+
+                        // Scale context to match device pixel ratio for crisp rendering
+                        const ctx = xcorrFullscreenCanvas.getContext('2d');
+                        ctx.scale(dpr, dpr);
+
+                        console.log(`XCORR fullscreen canvas: display=${rect.width}x${rect.height}, resolution=${xcorrFullscreenCanvas.width}x${xcorrFullscreenCanvas.height}, dpr=${dpr}`);
+
+                        // Initialize cross-correlation module with both canvases
+                        if (typeof CrossCorrelationEnhanced !== 'undefined') {
+                            const smallCanvas = document.getElementById('xcorr_canvas');
+                            CrossCorrelationEnhanced.init(smallCanvas, xcorrFullscreenCanvas);
+                        }
+                    }
+
+                    if (xcorrSpectrumCanvas) {
+                        const container = xcorrSpectrumCanvas.parentElement;
+                        const rect = container.getBoundingClientRect();
+
+                        xcorrSpectrumCanvas.width = rect.width * dpr;
+                        xcorrSpectrumCanvas.height = rect.height * dpr;
+
+                        const ctx = xcorrSpectrumCanvas.getContext('2d');
+                        ctx.scale(dpr, dpr);
+
+                        console.log(`XCORR spectrum canvas: display=${rect.width}x${rect.height}, resolution=${xcorrSpectrumCanvas.width}x${xcorrSpectrumCanvas.height}`);
+
+                        // Add mouse handlers for spectrum selection
+                        xcorrSpectrumCanvas.style.cursor = 'crosshair';
+
+                        xcorrSpectrumCanvas.addEventListener('mousedown', (e) => {
+                            const rect = xcorrSpectrumCanvas.getBoundingClientRect();
+                            const x = e.clientX - rect.left;
+                            const pct = (x / rect.width) * 100;
+
+                            xcorrSelection.dragging = 'selecting';
+                            xcorrSelection.leftPercent = pct;
+                            xcorrSelection.rightPercent = pct;
+                            xcorrSelection.active = true;
+                        });
+
+                        xcorrSpectrumCanvas.addEventListener('mousemove', (e) => {
+                            if (xcorrSelection.dragging !== 'selecting') return;
+
+                            const rect = xcorrSpectrumCanvas.getBoundingClientRect();
+                            const x = e.clientX - rect.left;
+                            const pct = Math.max(0, Math.min(100, (x / rect.width) * 100));
+
+                            if (pct < xcorrSelection.leftPercent) {
+                                xcorrSelection.rightPercent = xcorrSelection.leftPercent;
+                                xcorrSelection.leftPercent = pct;
+                            } else {
+                                xcorrSelection.rightPercent = pct;
+                            }
+                        });
+
+                        xcorrSpectrumCanvas.addEventListener('mouseup', async (e) => {
+                            if (xcorrSelection.dragging === 'selecting') {
+                                xcorrSelection.dragging = null;
+                                console.log(`XCORR spectrum selection: ${xcorrSelection.leftPercent.toFixed(1)}% - ${xcorrSelection.rightPercent.toFixed(1)}%`);
+
+                                // Tune to the selected region
+                                console.log(`[Debug] window.tuneToSelection type: ${typeof window.tuneToSelection}`);
+                                if (typeof window.filterToSelection === 'function') {
+                                    console.log('[Debug] Calling window.filterToSelection...');
+                                    window.filterToSelection(xcorrSelection);
+                                    console.log('[Debug] filterToSelection completed successfully');
+                                } else {
+                                    console.warn('[Debug] window.filterToSelection is not a function!');
+                                }
+                            }
+                        });
+                    }
                 }, 100);
             }
 
@@ -13331,15 +14431,29 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
-        else if (mg_strcmp(hm->uri, mg_str("/js/displays/iq_constellation.js")) == 0) {
-            std::string js_content = read_js_file("server/web_assets/js/displays/iq_constellation.js");
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/iq_constellation_enhanced.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/iq_constellation_enhanced.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",
                 "%s", js_content.c_str());
         }
-        else if (mg_strcmp(hm->uri, mg_str("/js/displays/cross_correlation.js")) == 0) {
-            std::string js_content = read_js_file("server/web_assets/js/displays/cross_correlation.js");
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/cross_correlation_enhanced.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/cross_correlation_enhanced.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/eye_diagram.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/eye_diagram.js");
+            mg_http_reply(c, 200,
+                "Content-Type: text/javascript; charset=utf-8\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", js_content.c_str());
+        }
+        else if (mg_strcmp(hm->uri, mg_str("/js/displays/waveform_display.js")) == 0) {
+            std::string js_content = read_js_file("server/web_assets/js/displays/waveform_display.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",

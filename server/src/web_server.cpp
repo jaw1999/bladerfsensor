@@ -6,6 +6,7 @@
 #include "bladerf_sensor.h"
 #include "signal_processing.h"
 #include "recording.h"
+#include "telemetry.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -58,7 +59,6 @@ IQBuffer g_iq_data;                                  // IQ constellation data bu
 XCorrBuffer g_xcorr_data;                            // Cross-correlation data buffer
 LinkQuality g_link_quality;                          // Link quality metrics buffer
 DoAResult g_doa_result;                              // Direction of Arrival result buffer
-ScannerState g_scanner;                              // Frequency scanner state
 ClassificationBuffer g_classifications;              // Signal classification buffer
 GPSPosition g_gps_position;                          // GPS position data buffer
 static std::atomic<bool> g_web_running{false};       // Web server thread running flag
@@ -1246,7 +1246,6 @@ const char* html_page = R"HTMLDELIM(
                     <div class="workspace-tab" data-tab="direction">DIRECTION</div>
                     <div class="workspace-tab" data-tab="iq">IQ</div>
                     <div class="workspace-tab" data-tab="xcorr">XCORR</div>
-                    <div class="workspace-tab" data-tab="scanner">SCANNER</div>
                 </div>
             </div>
             <div class="header-right-controls">
@@ -1506,81 +1505,7 @@ const char* html_page = R"HTMLDELIM(
             </div>
         </div> <!-- End workspace-direction -->
 
-        <!-- TAB 3: SCANNER -->
-        <div class="workspace-content" id="workspace-scanner">
-            <div style="display: grid; grid-template-columns: 350px 1fr; gap: 15px; height: 100%; padding: 15px;">
-                <!-- Left Panel: Scanner Controls -->
-                <div style="display: flex; flex-direction: column; gap: 15px;">
-                    <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333;">
-                        <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">SCAN PARAMETERS</div>
-                        <div style="display: flex; flex-direction: column; gap: 8px;">
-                            <div>
-                                <label style="font-size: 11px; color: #888;">Start Freq (MHz):</label>
-                                <input type="number" id="scan_start" value="400" min="47" max="6000" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
-                            </div>
-                            <div>
-                                <label style="font-size: 11px; color: #888;">Stop Freq (MHz):</label>
-                                <input type="number" id="scan_stop" value="6000" min="47" max="6000" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
-                            </div>
-                            <div>
-                                <label style="font-size: 11px; color: #888;">Step (MHz):</label>
-                                <input type="number" id="scan_step" value="40" min="1" max="100" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;" title="Frequency step size between scan points">
-                            </div>
-                            <div>
-                                <label style="font-size: 11px; color: #888;">Threshold (dBm):</label>
-                                <input type="number" id="scan_threshold" value="-80" min="-120" max="0" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;" title="Minimum power level to detect signals">
-                            </div>
-                            <div>
-                                <label style="font-size: 11px; color: #888;">Dwell (ms):</label>
-                                <input type="number" id="scan_dwell" value="100" min="10" max="5000" style="width: 100%; padding: 6px; background: #0a0a0a; border: 1px solid #444; color: #fff; border-radius: 3px;">
-                            </div>
-                        </div>
-                    </div>
-
-                    <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333;">
-                        <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">CONTROL</div>
-                        <div style="display: flex; flex-direction: column; gap: 8px;">
-                            <button id="scan_start_btn" onclick="startScanner()" style="padding: 10px; background: #0a0; border: none; color: #fff; font-weight: bold; border-radius: 3px; cursor: pointer;">▶ START SCAN</button>
-                            <button id="scan_stop_btn" onclick="stopScanner()" style="padding: 10px; background: #a00; border: none; color: #fff; font-weight: bold; border-radius: 3px; cursor: pointer; display: none;">⏹ STOP SCAN</button>
-                            <button onclick="clearScanner()" style="padding: 8px; background: #444; border: none; color: #fff; border-radius: 3px; cursor: pointer;">🗑 Clear Results</button>
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px;">
-                                <button id="scan_export_btn" onclick="Scanner.exportResults()" style="padding: 6px; background: #046; border: none; color: #fff; font-size: 11px; border-radius: 3px; cursor: pointer;">📁 Export</button>
-                                <button id="scan_filter_btn" onclick="Scanner.showFilterDialog()" style="padding: 6px; background: #046; border: none; color: #fff; font-size: 11px; border-radius: 3px; cursor: pointer;">🔍 Filter</button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333;">
-                        <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">STATUS</div>
-                        <div style="font-family: monospace; font-size: 11px;">
-                            <div>Status: <span id="scan_status" style="color: #888;">Idle</span></div>
-                            <div>Current: <span id="scan_current_freq" style="color: #0f0;">--</span> MHz</div>
-                            <div>Scans: <span id="scan_count" style="color: #ff0;">0</span></div>
-                            <div>Signals: <span id="scan_signal_count" style="color: #0ff;">0</span></div>
-                            <div style="margin-top: 10px;">
-                                <div style="font-size: 10px; color: #888; margin-bottom: 3px;">Progress:</div>
-                                <div style="width: 100%; height: 16px; background: #0a0a0a; border: 1px solid #333; border-radius: 3px; overflow: hidden;">
-                                    <div id="scan_progress_bar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #0a0, #0f0); transition: width 0.3s;"></div>
-                                </div>
-                                <div style="font-size: 10px; color: #888; margin-top: 3px;">
-                                    <span id="scan_progress_pct">0%</span> | ETA: <span id="scan_eta">--</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Right Panel: Signal List -->
-                <div style="background: #1a1a1a; padding: 12px; border-radius: 5px; border: 1px solid #333; display: flex; flex-direction: column;">
-                    <div style="color: #0ff; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">DETECTED SIGNALS</div>
-                    <div id="scanner_signal_list" style="flex: 1; overflow-y: auto; font-family: monospace; font-size: 11px;">
-                        <div style="color: #888; text-align: center; padding: 20px;">No signals detected</div>
-                    </div>
-                </div>
-            </div>
-        </div> <!-- End workspace-scanner -->
-
-        <!-- TAB 4: IQ CONSTELLATION -->
+        <!-- TAB 3: IQ CONSTELLATION -->
         <div class="workspace-content" id="workspace-iq">
             <div style="display: flex; height: 100%; gap: 10px; padding: 10px; background: #0a0a0a;">
 
@@ -12853,7 +12778,6 @@ H or ? - Show this help
     <script src="/js/displays/waveform_display.js"></script>
 
     <!-- Feature modules -->
-    <script src="/js/scanner_enhanced.js"></script>
     <script src="/js/signal_filters.js"></script>
     <script src="/js/rf_measurements.js"></script>
     <script src="/js/marker_system.js"></script>
@@ -13476,11 +13400,6 @@ H or ? - Show this help
 
         // ===== INITIALIZE ENHANCED MODULES =====
         setTimeout(() => {
-            // Initialize Scanner module
-            if (typeof Scanner !== 'undefined') {
-                Scanner.init();
-            }
-
             // Restore last workspace
             const lastWorkspace = Settings.get('last_workspace', 'live');
             if (lastWorkspace && lastWorkspace !== 'live') {
@@ -13489,228 +13408,6 @@ H or ? - Show this help
 
             console.log('✓ Enhanced modules initialized');
         }, 500);
-
-        // ===== FREQUENCY SCANNER FUNCTIONS =====
-        let scannerUpdateInterval = null;
-        let scannerState = {
-            startFreq: 0,
-            stopFreq: 0,
-            step: 0,
-            dwellMs: 0,
-            totalSteps: 0,
-            startTime: 0
-        };
-
-        async function startScanner() {
-            const params = {
-                start_freq: parseInt(document.getElementById('scan_start').value),
-                stop_freq: parseInt(document.getElementById('scan_stop').value),
-                step: parseInt(document.getElementById('scan_step').value),
-                threshold: parseInt(document.getElementById('scan_threshold').value),
-                dwell_ms: parseInt(document.getElementById('scan_dwell').value)
-            };
-
-            // Validate parameters
-            if (isNaN(params.start_freq) || isNaN(params.stop_freq) || isNaN(params.step) || isNaN(params.threshold) || isNaN(params.dwell_ms)) {
-                showNotification('Invalid scanner parameters. Please check all fields.', 'error');
-                return;
-            }
-
-            if (params.start_freq >= params.stop_freq) {
-                showNotification('Start frequency must be less than stop frequency', 'error');
-                return;
-            }
-
-            if (params.step <= 0 || params.step > (params.stop_freq - params.start_freq)) {
-                showNotification('Invalid step size. Must be positive and less than scan range.', 'error');
-                return;
-            }
-
-            if (params.dwell_ms < 10) {
-                showNotification('Dwell time too short. Minimum is 10ms.', 'error');
-                return;
-            }
-
-            // Store scanner parameters for progress calculation
-            scannerState.startFreq = params.start_freq;
-            scannerState.stopFreq = params.stop_freq;
-            scannerState.step = params.step;
-            scannerState.dwellMs = params.dwell_ms;
-            scannerState.totalSteps = Math.ceil((params.stop_freq - params.start_freq) / params.step);
-            scannerState.startTime = Date.now();
-
-            try {
-                const response = await fetchWithTimeout('/start_scanner', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(params)
-                });
-                const data = await response.json();
-
-                if (data.status === 'ok') {
-                    document.getElementById('scan_start_btn').style.display = 'none';
-                    document.getElementById('scan_stop_btn').style.display = 'block';
-                    document.getElementById('scan_status').textContent = 'Scanning...';
-                    document.getElementById('scan_status').style.color = '#0f0';
-
-                    // Start polling for updates
-                    scannerUpdateInterval = setInterval(updateScannerStatus, 500);
-                    showNotification('Scanner started successfully', 'success', 2000);
-                } else {
-                    showNotification(`Failed to start scanner: ${data.error || 'Unknown error'}`, 'error');
-                }
-            } catch (err) {
-                console.error('Scanner start error:', err);
-                showNotification(`Failed to start scanner: ${err.message}`, 'error');
-            }
-        }
-
-        async function stopScanner() {
-            try {
-                const response = await fetchWithTimeout('/stop_scanner', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'}
-                });
-                const data = await response.json();
-
-                document.getElementById('scan_start_btn').style.display = 'block';
-                document.getElementById('scan_stop_btn').style.display = 'none';
-                document.getElementById('scan_status').textContent = 'Stopped';
-                document.getElementById('scan_status').style.color = '#888';
-
-                // Stop polling
-                if (scannerUpdateInterval) {
-                    clearInterval(scannerUpdateInterval);
-                    scannerUpdateInterval = null;
-                }
-
-                showNotification('Scanner stopped', 'info', 2000);
-            } catch (err) {
-                console.error('Scanner stop error:', err);
-                showNotification(`Failed to stop scanner: ${err.message}`, 'error');
-
-                // Try to stop polling anyway
-                if (scannerUpdateInterval) {
-                    clearInterval(scannerUpdateInterval);
-                    scannerUpdateInterval = null;
-                }
-            }
-        }
-
-        async function clearScanner() {
-            try {
-                const response = await fetchWithTimeout('/clear_scanner', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'}
-                });
-                const data = await response.json();
-
-                document.getElementById('scanner_signal_list').innerHTML = '<div style="color: #888; text-align: center; padding: 20px;">No signals detected</div>';
-                document.getElementById('scan_count').textContent = '0';
-                document.getElementById('scan_signal_count').textContent = '0';
-
-                // Reset progress indicators
-                document.getElementById('scan_progress_bar').style.width = '0%';
-                document.getElementById('scan_progress_pct').textContent = '0%';
-                document.getElementById('scan_eta').textContent = '--';
-
-                showNotification('Scanner cleared', 'info', 2000);
-            } catch (err) {
-                console.error('Scanner clear error:', err);
-                showNotification(`Failed to clear scanner: ${err.message}`, 'error');
-            }
-        }
-
-        async function updateScannerStatus() {
-            try {
-                const response = await fetchWithTimeout('/scanner_status');
-                const data = await response.json();
-
-                // Update status
-                document.getElementById('scan_current_freq').textContent = data.current_freq.toFixed(1);
-                document.getElementById('scan_count').textContent = data.scan_count;
-                document.getElementById('scan_signal_count').textContent = data.signals.length;
-
-                // Calculate and update progress
-                if (data.scanning && scannerState.totalSteps > 0) {
-                    const currentStep = Math.floor((data.current_freq - scannerState.startFreq) / scannerState.step);
-                    const progressPct = Math.min(100, Math.max(0, (currentStep / scannerState.totalSteps) * 100));
-
-                    document.getElementById('scan_progress_bar').style.width = progressPct.toFixed(1) + '%';
-                    document.getElementById('scan_progress_pct').textContent = progressPct.toFixed(0) + '%';
-
-                    // Calculate ETA
-                    const elapsedMs = Date.now() - scannerState.startTime;
-                    if (progressPct > 5) { // Wait for at least 5% to get reasonable estimate
-                        const totalEstimatedMs = (elapsedMs / progressPct) * 100;
-                        const remainingMs = totalEstimatedMs - elapsedMs;
-
-                        if (remainingMs > 0) {
-                            const remainingSec = Math.ceil(remainingMs / 1000);
-                            if (remainingSec < 60) {
-                                document.getElementById('scan_eta').textContent = remainingSec + 's';
-                            } else {
-                                const mins = Math.floor(remainingSec / 60);
-                                const secs = remainingSec % 60;
-                                document.getElementById('scan_eta').textContent = mins + 'm ' + secs + 's';
-                            }
-                        } else {
-                            document.getElementById('scan_eta').textContent = 'Soon';
-                        }
-                    } else {
-                        document.getElementById('scan_eta').textContent = 'Calculating...';
-                    }
-                } else {
-                    // Reset progress when not scanning
-                    document.getElementById('scan_progress_bar').style.width = '0%';
-                    document.getElementById('scan_progress_pct').textContent = '0%';
-                    document.getElementById('scan_eta').textContent = '--';
-                }
-
-                // Update signal list
-                const listDiv = document.getElementById('scanner_signal_list');
-                if (data.signals.length === 0) {
-                    listDiv.innerHTML = '<div style="color: #888; text-align: center; padding: 20px;">No signals detected</div>';
-                } else {
-                    // Sort by power (strongest first)
-                    const sorted = data.signals.sort((a, b) => b.power - a.power);
-                    let html = '<div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; padding-bottom: 5px; border-bottom: 1px solid #333; font-weight: bold; color: #0ff;">';
-                    html += '<div>Frequency</div><div>Power</div><div>BW</div><div>Hits</div></div>';
-
-                    sorted.forEach(sig => {
-                        html += '<div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; padding: 5px; border-bottom: 1px solid #222;">';
-                        html += '<div style="color: #0ff;">' + sig.freq.toFixed(3) + ' MHz</div>';
-                        html += '<div style="color: ' + (sig.power > -60 ? '#0f0' : sig.power > -80 ? '#ff0' : '#888') + ';">' + sig.power.toFixed(1) + ' dBm</div>';
-                        html += '<div style="color: #888;">' + (sig.bw / 1000).toFixed(1) + ' kHz</div>';
-                        html += '<div style="color: #888;">' + sig.hits + '</div>';
-                        html += '</div>';
-                    });
-                    listDiv.innerHTML = html;
-                }
-
-                // If stopped, stop updating
-                if (!data.scanning && scannerUpdateInterval) {
-                    clearInterval(scannerUpdateInterval);
-                    scannerUpdateInterval = null;
-                    document.getElementById('scan_status').textContent = 'Stopped';
-                    document.getElementById('scan_status').style.color = '#888';
-
-                    // Show completion notification if scan completed (not manually stopped)
-                    const currentFreq = data.current_freq;
-                    if (scannerState.stopFreq > 0 && Math.abs(currentFreq - scannerState.stopFreq) < scannerState.step * 2) {
-                        showNotification(`Scan complete! Found ${data.signals.length} signals.`, 'success', 4000);
-                    }
-
-                    // Reset progress indicators
-                    document.getElementById('scan_progress_bar').style.width = '0%';
-                    document.getElementById('scan_progress_pct').textContent = '0%';
-                    document.getElementById('scan_eta').textContent = '--';
-                }
-            } catch (err) {
-                console.error('Scanner status update error:', err);
-                // Don't show notification since this runs frequently
-            }
-        }
 
     </script>
 
@@ -13785,6 +13482,16 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
             mg_http_reply(c, 200,
                 "Content-Type: application/json\r\n",
                 "%s", json);
+            g_telemetry.http_requests.fetch_add(1);
+        }
+        // Serve telemetry/stats JSON
+        else if (mg_strcmp(hm->uri, mg_str("/stats")) == 0) {
+            std::string telemetry_json = get_telemetry_json();
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n"
+                "Cache-Control: no-cache\r\n",
+                "%s", telemetry_json.c_str());
+            g_telemetry.http_requests.fetch_add(1);
         }
         // Serve IQ constellation data
         else if (mg_strcmp(hm->uri, mg_str("/iq_data")) == 0) {
@@ -14211,67 +13918,6 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
                          "{\"status\":\"ok\",\"latitude\":%.8f,\"longitude\":%.8f,\"altitude_m\":%.2f}",
                          lat, lon, alt);
         }
-        // Start Scanner Endpoint
-        else if (mg_strcmp(hm->uri, mg_str("/start_scanner")) == 0) {
-            // Parse scan parameters
-            double start_freq_mhz = mg_json_get_long(hm->body, "$.start_freq", 400);
-            double stop_freq_mhz = mg_json_get_long(hm->body, "$.stop_freq", 6000);
-            double step_mhz = mg_json_get_long(hm->body, "$.step", 40);
-            double threshold = mg_json_get_long(hm->body, "$.threshold", -80);
-            long dwell = mg_json_get_long(hm->body, "$.dwell_ms", 100);
-
-            std::lock_guard<std::mutex> lock(g_scanner.mutex);
-            g_scanner.start_freq = (uint64_t)(start_freq_mhz * 1e6);
-            g_scanner.stop_freq = (uint64_t)(stop_freq_mhz * 1e6);
-            g_scanner.step_size = (uint64_t)(step_mhz * 1e6);
-            g_scanner.threshold_dbm = (float)threshold;
-            g_scanner.dwell_ms = (uint32_t)dwell;
-            g_scanner.current_freq = g_scanner.start_freq;
-            g_scanner.signals.clear();
-            g_scanner.scan_count = 0;
-            g_scanner.active = true;
-
-            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
-                         "{\"status\":\"ok\",\"scanning\":true}");
-        }
-        // Stop Scanner Endpoint
-        else if (mg_strcmp(hm->uri, mg_str("/stop_scanner")) == 0) {
-            std::lock_guard<std::mutex> lock(g_scanner.mutex);
-            g_scanner.active = false;
-            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
-                         "{\"status\":\"ok\",\"scanning\":false}");
-        }
-        // Get Scanner Status and Results
-        else if (mg_strcmp(hm->uri, mg_str("/scanner_status")) == 0) {
-            std::lock_guard<std::mutex> lock(g_scanner.mutex);
-
-            // Build JSON with signal list
-            std::string json = "{\"scanning\":";
-            json += g_scanner.active ? "true" : "false";
-            json += ",\"current_freq\":" + std::to_string(g_scanner.current_freq / 1e6);
-            json += ",\"scan_count\":" + std::to_string(g_scanner.scan_count);
-            json += ",\"signals\":[";
-
-            for (size_t i = 0; i < g_scanner.signals.size(); i++) {
-                if (i > 0) json += ",";
-                const auto& sig = g_scanner.signals[i];
-                json += "{\"freq\":" + std::to_string(sig.frequency / 1e6);
-                json += ",\"power\":" + std::to_string(sig.power_dbm);
-                json += ",\"bw\":" + std::to_string(sig.bandwidth_hz);
-                json += ",\"hits\":" + std::to_string(sig.hit_count) + "}";
-            }
-            json += "]}";
-
-            mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s", json.c_str());
-        }
-        // Clear Scanner Results
-        else if (mg_strcmp(hm->uri, mg_str("/clear_scanner")) == 0) {
-            std::lock_guard<std::mutex> lock(g_scanner.mutex);
-            g_scanner.signals.clear();
-            g_scanner.scan_count = 0;
-            mg_http_reply(c, 200, "Content-Type: application/json\r\n",
-                         "{\"status\":\"ok\"}");
-        }
         // UDP Stream Relay Endpoint
         else if (mg_strcmp(hm->uri, mg_str("/stream_udp_relay")) == 0) {
             // Parse JSON body using mg_json_get
@@ -14369,13 +14015,6 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         else if (mg_strcmp(hm->uri, mg_str("/js/settings.js")) == 0) {
             std::string js_content = read_js_file("server/web_assets/js/settings.js");
-            mg_http_reply(c, 200,
-                "Content-Type: text/javascript; charset=utf-8\r\n"
-                "Cache-Control: no-cache\r\n",
-                "%s", js_content.c_str());
-        }
-        else if (mg_strcmp(hm->uri, mg_str("/js/scanner_enhanced.js")) == 0) {
-            std::string js_content = read_js_file("server/web_assets/js/scanner_enhanced.js");
             mg_http_reply(c, 200,
                 "Content-Type: text/javascript; charset=utf-8\r\n"
                 "Cache-Control: no-cache\r\n",

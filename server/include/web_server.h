@@ -98,34 +98,6 @@ struct DoAResult {
                   confidence(0), snr_db(0), coherence(0), has_ambiguity(true) {}
 };
 
-// Detected signal entry from frequency scanner
-struct DetectedSignal {
-    uint64_t frequency;         // Center frequency in Hz
-    float power_dbm;            // Peak power in dBm
-    float bandwidth_hz;         // Estimated bandwidth in Hz
-    uint64_t first_seen;        // Timestamp when first detected (ms)
-    uint64_t last_seen;         // Timestamp when last seen (ms)
-    uint32_t hit_count;         // Number of times detected
-};
-
-// Frequency scanner state
-struct ScannerState {
-    bool active;                            // Scanner running flag
-    uint64_t start_freq;                    // Start frequency in Hz
-    uint64_t stop_freq;                     // Stop frequency in Hz
-    uint64_t step_size;                     // Step size in Hz (typically bandwidth)
-    uint64_t current_freq;                  // Current scanning frequency
-    float threshold_dbm;                    // Detection threshold in dBm
-    uint32_t dwell_ms;                      // Dwell time per frequency in ms
-    std::vector<DetectedSignal> signals;    // List of detected signals
-    uint32_t scan_count;                    // Number of complete scans
-    std::mutex mutex;                       // Mutex for thread-safe access
-
-    ScannerState() : active(false), start_freq(400000000), stop_freq(6000000000),
-                     step_size(40000000), current_freq(400000000), threshold_dbm(-80.0f),
-                     dwell_ms(100), scan_count(0) {}
-};
-
 // Classified signal entry
 struct ClassifiedSignal {
     uint64_t frequency_hz;      // Signal frequency in Hz
@@ -177,7 +149,6 @@ extern IQBuffer g_iq_data;
 extern XCorrBuffer g_xcorr_data;
 extern LinkQuality g_link_quality;
 extern DoAResult g_doa_result;
-extern ScannerState g_scanner;
 extern ClassificationBuffer g_classifications;
 extern GPSPosition g_gps_position;
 

@@ -30,13 +30,6 @@ const Settings = {
         direction_show_history: true,
         direction_history_length: 20,
 
-        // SCANNER workspace
-        scanner_start_freq: 400,
-        scanner_stop_freq: 6000,
-        scanner_step: 40,
-        scanner_threshold: -80,
-        scanner_dwell: 100,
-
         // Stream out
         stream_endpoint: '127.0.0.1',
         stream_port: 8089,

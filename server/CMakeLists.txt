@@ -29,7 +29,8 @@ set(SOURCES
     src/df_processing.cpp
     src/recording.cpp
     src/config_validation.cpp
-    src/scanner.cpp
+    src/telemetry.cpp
+    src/pipeline.cpp
 )
 
 # Optional: Add mongoose support

@@ -6,7 +6,8 @@
 #include "df_processing.h"
 #include "recording.h"
 #include "config_validation.h"
-#include "scanner.h"
+#include "telemetry.h"
+#include "pipeline.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -41,38 +42,19 @@ std::atomic<uint32_t> g_gain_rx2{GAIN_RX2};           // Current RX2 gain (dB)
 std::atomic<bool> g_params_changed{false};            // Configuration change pending flag
 std::mutex g_config_mutex;                            // Mutex for configuration updates
 
+// Watchdog state for RX thread health monitoring
+std::atomic<uint64_t> g_rx_heartbeat{0};              // Incremented by RX thread each cycle
+std::atomic<bool> g_watchdog_enabled{true};           // Watchdog monitoring enabled flag
+
 // Direction finding bin range selection (0 = entire spectrum)
 std::atomic<uint32_t> g_df_start_bin{0};              // DF start bin (0 = use entire spectrum)
 std::atomic<uint32_t> g_df_end_bin{0};                // DF end bin (0 = use entire spectrum)
 
-// FFTW plans and buffers for FFT computation
-// These are shared between threads and must be accessed carefully
-fftwf_plan fft_plan_ch1 = nullptr;                    // FFT plan for channel 1
-fftwf_plan fft_plan_ch2 = nullptr;                    // FFT plan for channel 2
-std::vector<fftwf_complex> fft_in_ch1(FFT_SIZE);      // Channel 1 FFT input buffer
-std::vector<fftwf_complex> fft_in_ch2(FFT_SIZE);      // Channel 2 FFT input buffer
-std::vector<fftwf_complex> fft_out_ch1(FFT_SIZE);     // Channel 1 FFT output buffer
-std::vector<fftwf_complex> fft_out_ch2(FFT_SIZE);     // Channel 2 FFT output buffer
-
-// IQ processing state
-DCOffsetState g_dc_offset;                            // DC offset correction state
-OverlapState g_overlap;                               // Overlap-add state for smoother spectrum
-
-// Automatic gain control (AGC) state
-AGCState g_agc;
-
-// Noise floor estimation state
-NoiseFloorState g_noise_floor;
-
-// FFT window function state
+// FFT window function state (used for initial pipeline setup only)
 uint32_t g_window_type = WINDOW_HAMMING;              // Current window function type
-std::vector<float> g_window;                          // Precomputed window coefficients
 
-// FFT averaging state for noise reduction
-uint32_t g_averaging_frames = 1;                      // Number of frames to average (1 = disabled)
-std::vector<std::vector<uint8_t>> g_avg_buffer_ch1;  // Channel 1 averaging buffer
-std::vector<std::vector<uint8_t>> g_avg_buffer_ch2;  // Channel 2 averaging buffer
-uint32_t g_avg_index = 0;                             // Current averaging buffer index
+// Global noise floor state (shared for web server reporting)
+NoiseFloorState g_noise_floor;
 
 // Last valid DoA result (hold when confidence is too low)
 LastValidDoA g_last_valid_doa = {
@@ -200,10 +182,16 @@ int main(int argc, char *argv[]) {
     std::cout << "bladeRF Sensor Server" << std::endl;
     std::cout << "=====================" << std::endl;
 
+    // Initialize telemetry
+    std::cout << "Initializing telemetry..." << std::endl;
+    init_telemetry();
+
+    // Initialize global noise floor state (for web server reporting)
+    std::cout << "Initializing noise floor estimation..." << std::endl;
+    init_noise_floor(g_noise_floor, FFT_SIZE);
+
     // Initialize FFTW with wisdom for fast startup
     std::cout << "Initializing FFTW..." << std::endl;
-
-    // Try to load wisdom file for optimized plans
     const char* wisdom_file = "fftw_wisdom.dat";
     if (fftwf_import_wisdom_from_filename(wisdom_file)) {
         std::cout << "Loaded FFTW wisdom from " << wisdom_file << std::endl;
@@ -211,42 +199,63 @@ int main(int argc, char *argv[]) {
         std::cout << "No FFTW wisdom file found, will create plans from scratch" << std::endl;
     }
 
-    // Create FFT plans (FFTW_MEASURE will take time on first run, but wisdom speeds it up)
-    fft_plan_ch1 = fftwf_plan_dft_1d(FFT_SIZE, fft_in_ch1.data(), fft_out_ch1.data(),
-                                     FFTW_FORWARD, FFTW_MEASURE);
-    fft_plan_ch2 = fftwf_plan_dft_1d(FFT_SIZE, fft_in_ch2.data(), fft_out_ch2.data(),
-                                     FFTW_FORWARD, FFTW_MEASURE);
+    // Initialize pipeline infrastructure
+    std::cout << "Initializing pipeline queues..." << std::endl;
+    auto sample_queue = new LockFreeQueue<SampleBuffer>(PipelineConfig::SAMPLE_QUEUE_SIZE);
+    auto fft_queue = new LockFreeQueue<FFTBuffer>(PipelineConfig::FFT_QUEUE_SIZE);
 
-    // Export wisdom for future runs
+    // Create pipeline context
+    PipelineContext pipeline_ctx;
+    pipeline_ctx.sample_queue = sample_queue;
+    pipeline_ctx.fft_queue = fft_queue;
+    pipeline_ctx.running = &g_running;
+    pipeline_ctx.center_freq = &g_center_freq;
+    pipeline_ctx.sample_rate = &g_sample_rate;
+    pipeline_ctx.bandwidth = &g_bandwidth;
+    pipeline_ctx.gain_rx1 = &g_gain_rx1;
+    pipeline_ctx.gain_rx2 = &g_gain_rx2;
+    pipeline_ctx.params_changed = &g_params_changed;
+    pipeline_ctx.config_mutex = &g_config_mutex;
+    pipeline_ctx.df_start_bin = &g_df_start_bin;
+    pipeline_ctx.df_end_bin = &g_df_end_bin;
+
+    // Initialize processing state (owned by processing thread)
+    init_dc_offset(pipeline_ctx.dc_offset);
+    init_overlap(pipeline_ctx.overlap, FFT_SIZE);
+    init_noise_floor(pipeline_ctx.noise_floor, FFT_SIZE);
+    pipeline_ctx.global_noise_floor = &g_noise_floor;
+    generate_window(g_window_type, FFT_SIZE, pipeline_ctx.window);
+
+    // Allocate FFT buffers for processing thread (using raw allocation since fftwf_complex is float[2])
+    pipeline_ctx.fft_in_ch1 = (fftwf_complex*)malloc(sizeof(fftwf_complex) * FFT_SIZE);
+    pipeline_ctx.fft_in_ch2 = (fftwf_complex*)malloc(sizeof(fftwf_complex) * FFT_SIZE);
+    pipeline_ctx.fft_out_ch1 = (fftwf_complex*)malloc(sizeof(fftwf_complex) * FFT_SIZE);
+    pipeline_ctx.fft_out_ch2 = (fftwf_complex*)malloc(sizeof(fftwf_complex) * FFT_SIZE);
+    pipeline_ctx.fft_size = FFT_SIZE;
+
+    // Create FFT plans for processing thread
+    pipeline_ctx.fft_plan_ch1 = fftwf_plan_dft_1d(FFT_SIZE, pipeline_ctx.fft_in_ch1,
+                                                   pipeline_ctx.fft_out_ch1,
+                                                   FFTW_FORWARD, FFTW_MEASURE);
+    pipeline_ctx.fft_plan_ch2 = fftwf_plan_dft_1d(FFT_SIZE, pipeline_ctx.fft_in_ch2,
+                                                   pipeline_ctx.fft_out_ch2,
+                                                   FFTW_FORWARD, FFTW_MEASURE);
+
+    // Save wisdom for future runs
     if (fftwf_export_wisdom_to_filename(wisdom_file)) {
         std::cout << "Saved FFTW wisdom to " << wisdom_file << std::endl;
     }
 
-    // Initialize window function (default: Hamming)
-    std::cout << "Initializing window function..." << std::endl;
-    generate_window(g_window_type, FFT_SIZE, g_window);
-
-    // Initialize averaging (default: no averaging)
-    std::cout << "Initializing FFT averaging..." << std::endl;
-    init_averaging(1, FFT_SIZE, g_avg_buffer_ch1, g_avg_buffer_ch2);
-
-    // Initialize AGC
-    std::cout << "Initializing AGC..." << std::endl;
-    init_agc(g_agc, GAIN_RX1, GAIN_RX2);
-
-    // Initialize IQ processing states
-    std::cout << "Initializing DC offset correction..." << std::endl;
-    init_dc_offset(g_dc_offset);
-    std::cout << "Initializing overlap-add buffers..." << std::endl;
-    init_overlap(g_overlap, FFT_SIZE);
-    std::cout << "Initializing noise floor estimation..." << std::endl;
-    init_noise_floor(g_noise_floor, FFT_SIZE);
+    std::cout << "Pipeline infrastructure initialized" << std::endl;
 
     // Initialize bladeRF
     status = initialize_bladerf(&dev);
     if (status != 0) {
         return 1;
     }
+
+    // Attach device to pipeline context
+    pipeline_ctx.device = dev;
 
     // Configure RX channels
     std::cout << "\nConfiguring RX channels..." << std::endl;
@@ -300,340 +309,77 @@ int main(int argc, char *argv[]) {
     // Calculate sleep time between updates
     auto sleep_duration = std::chrono::microseconds(1000000 / UPDATE_RATE_HZ);
 
+    // Start watchdog thread to monitor RX thread health
+    std::thread watchdog_thread([&]() {
+        std::cout << "*** WATCHDOG THREAD STARTED ***" << std::endl;
+        uint64_t last_heartbeat = 0;
+        uint32_t stall_count = 0;
+        constexpr uint32_t STALL_THRESHOLD = 3;  // Alert after 3 seconds of no progress
+
+        while (g_running && g_watchdog_enabled) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            uint64_t current_heartbeat = g_rx_heartbeat.load();
+            if (current_heartbeat == last_heartbeat) {
+                stall_count++;
+                if (stall_count >= STALL_THRESHOLD) {
+                    std::cerr << "*** WATCHDOG ALERT: RX thread appears stalled (no heartbeat for "
+                              << stall_count << " seconds) ***" << std::endl;
+                    if (stall_count >= 10) {
+                        std::cerr << "*** WATCHDOG CRITICAL: RX thread hung for 10+ seconds - triggering shutdown ***" << std::endl;
+                        g_running = false;
+                    }
+                }
+            } else {
+                if (stall_count > 0) {
+                    std::cout << "WATCHDOG: RX thread recovered after " << stall_count << " second stall" << std::endl;
+                }
+                stall_count = 0;
+                last_heartbeat = current_heartbeat;
+            }
+        }
+        std::cout << "*** WATCHDOG THREAD STOPPED ***" << std::endl;
+    });
+
     std::cout << "\n========================================" << std::endl;
-    std::cout << "Starting continuous RX capture..." << std::endl;
+    std::cout << "Starting 3-stage pipeline..." << std::endl;
     std::cout << "Web interface: http://localhost:" << WEB_SERVER_PORT << std::endl;
     std::cout << "========================================\n" << std::endl;
 
-    // Main RX loop runs continuously independent of clients
-    std::thread rx_thread([&]() {
-        std::cout << "*** RX THREAD STARTED ***" << std::endl;
-
-        // Dedicated RX buffer for this thread (avoid conflicts with client loop)
-        std::vector<int16_t> thread_rx_buffer(BUFFER_SIZE * 4);
-
-        // FPS tracking for link quality monitoring
-        uint32_t frame_count = 0;
-        auto fps_update_time = std::chrono::steady_clock::now();
-
-        while (g_running) {
-            // Check if parameters changed
-            if (g_params_changed.load()) {
-                std::lock_guard<std::mutex> lock(g_config_mutex);
-                g_params_changed = false;
-
-                std::cout << "Applying parameter changes..." << std::endl;
-
-                // Validate parameters before applying
-                const uint64_t freq = g_center_freq.load();
-                const uint32_t sample_rate = g_sample_rate.load();
-                const uint32_t bandwidth = g_bandwidth.load();
-                const uint32_t gain_rx1 = g_gain_rx1.load();
-                const uint32_t gain_rx2 = g_gain_rx2.load();
-
-                std::cout << "  New frequency: " << (freq / 1e6) << " MHz" << std::endl;
-                std::cout << "  New sample rate: " << (sample_rate / 1e6) << " MHz" << std::endl;
-                std::cout << "  New bandwidth: " << (bandwidth / 1e6) << " MHz" << std::endl;
-                std::cout << "  New gain RX1: " << gain_rx1 << " dB" << std::endl;
-                std::cout << "  New gain RX2: " << gain_rx2 << " dB" << std::endl;
-
-                if (!validate_frequency(freq) || !validate_gain(gain_rx1) || !validate_gain(gain_rx2)) {
-                    std::cerr << "Invalid parameters - ignoring change request" << std::endl;
-                    continue;
-                }
-
-                // Disable modules before reconfiguration
-                bladerf_enable_module(dev, BLADERF_CHANNEL_RX(0), false);
-                bladerf_enable_module(dev, BLADERF_CHANNEL_RX(1), false);
-
-                // Reconfigure channels (now includes sample rate and bandwidth)
-                int status = configure_channel(dev, BLADERF_CHANNEL_RX(0), freq, gain_rx1, sample_rate, bandwidth);
-                if (status == 0) {
-                    status = configure_channel(dev, BLADERF_CHANNEL_RX(1), freq, gain_rx2, sample_rate, bandwidth);
-                }
-
-                // Reconfigure sync RX (required after disabling modules)
-                if (status == 0) {
-                    status = bladerf_sync_config(dev,
-                                                BLADERF_RX_X2,
-                                                BLADERF_FORMAT_SC16_Q11,
-                                                NUM_BUFFERS,
-                                                BUFFER_SIZE,
-                                                NUM_TRANSFERS,
-                                                3500);
-                }
-
-                // ALWAYS re-enable modules (even if config failed)
-                bladerf_enable_module(dev, BLADERF_CHANNEL_RX(0), true);
-                bladerf_enable_module(dev, BLADERF_CHANNEL_RX(1), true);
-
-                if (status == 0) {
-                    std::cout << "Parameters updated successfully" << std::endl;
-                } else {
-                    std::cerr << "Failed to update parameters - keeping previous settings" << std::endl;
-                }
-            }
-
-            const auto start_time = std::chrono::steady_clock::now();
-
-            // Receive samples
-            int status = bladerf_sync_rx(dev, thread_rx_buffer.data(), BUFFER_SIZE, nullptr, 5000);
-            if (status != 0) {
-                std::cerr << "RX failed: " << bladerf_strerror(status) << std::endl;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-
-            // Write samples to recording file if active
-            write_samples_to_file(thread_rx_buffer.data(), BUFFER_SIZE * 2);
-
-            // ===== IQ PROCESSING PIPELINE =====
-            // Process IQ samples through complete pipeline: overlap-add, DC removal, window, FFT, magnitude
-            uint8_t ch1_mag[FFT_SIZE], ch2_mag[FFT_SIZE];
-            IQProcessingResult iq_result = process_iq_to_fft(
-                thread_rx_buffer.data(),
-                BUFFER_SIZE * 2,
-                FFT_SIZE,
-                g_center_freq.load(),
-                fft_in_ch1.data(),
-                fft_in_ch2.data(),
-                fft_out_ch1.data(),
-                fft_out_ch2.data(),
-                ch1_mag,
-                ch2_mag,
-                g_dc_offset,
-                g_overlap,
-                g_window,
-                fft_plan_ch1,
-                fft_plan_ch2
-            );
-
-            // Reset held DoA on frequency change
-            if (iq_result.freq_changed) {
-                g_last_valid_doa.has_valid = false;
-            }
-
-            // Debug: Print peak sample every 60 frames
-            static int web_sample_debug_counter = 0;
-            web_sample_debug_counter++;
-            if (web_sample_debug_counter % 60 == 0) {
-                float saturation_pct = (std::abs(iq_result.peak_sample) / 32768.0f) * 100.0f;
-                std::cout << "Peak ADC sample: " << iq_result.peak_sample << " ("
-                          << std::fixed << std::setprecision(1) << saturation_pct
-                          << "% of full scale) [Gain=" << g_gain_rx1.load() << "dB]" << std::endl;
-            }
-
-            // Apply time-domain averaging
-            apply_averaging(ch1_mag, ch2_mag, FFT_SIZE, g_averaging_frames,
-                           g_avg_buffer_ch1, g_avg_buffer_ch2, g_avg_index);
-
-            // Update AGC
-            uint32_t gain_rx1 = g_gain_rx1.load();
-            uint32_t gain_rx2 = g_gain_rx2.load();
-            bool params_changed = false;
-            update_agc(g_agc, ch1_mag, ch2_mag, FFT_SIZE, gain_rx1, gain_rx2, params_changed);
-            if (params_changed) {
-                g_gain_rx1.store(gain_rx1);
-                g_gain_rx2.store(gain_rx2);
-                g_params_changed.store(true);
-            }
-
-            // Update noise floor estimation (15th percentile, 0.1 smoothing factor)
-            update_noise_floor(g_noise_floor, ch1_mag, ch2_mag, FFT_SIZE, 15.0f, 0.1f);
-
-            // Remove DC offset spike/dip at center frequency
-            remove_dc_offset(ch1_mag, FFT_SIZE);
-            remove_dc_offset(ch2_mag, FFT_SIZE);
-
-            // Update waterfall buffer for web interface
-            update_waterfall(ch1_mag, ch2_mag, FFT_SIZE);
-
-            // Decimate IQ samples for constellation display
-            static_assert(FFT_SIZE >= 256 && FFT_SIZE % 256 == 0, "FFT_SIZE must be >= 256 and divisible by 256");
-            constexpr int decimation_step = FFT_SIZE / 256;
-            int16_t ch1_iq[256][2], ch2_iq[256][2];
-            for (int i = 0; i < 256; i++) {
-                const size_t idx = i * decimation_step;
-                ch1_iq[i][0] = static_cast<int16_t>(fft_in_ch1[idx][0] * 32767.0f);
-                ch1_iq[i][1] = static_cast<int16_t>(fft_in_ch1[idx][1] * 32767.0f);
-                ch2_iq[i][0] = static_cast<int16_t>(fft_in_ch2[idx][0] * 32767.0f);
-                ch2_iq[i][1] = static_cast<int16_t>(fft_in_ch2[idx][1] * 32767.0f);
-            }
-            // Update IQ data with FFT output for frequency-domain filtering
-            update_iq_data(reinterpret_cast<int16_t*>(ch1_iq), reinterpret_cast<int16_t*>(ch2_iq), 256,
-                          fft_out_ch1.data(), fft_out_ch2.data(), FFT_SIZE);
-
-            // Compute and update cross-correlation data
-            float xcorr_mag[FFT_SIZE], xcorr_phase[FFT_SIZE];
-            compute_cross_correlation(fft_out_ch1.data(), fft_out_ch2.data(), xcorr_mag, xcorr_phase, FFT_SIZE);
-            update_xcorr_data(xcorr_mag, xcorr_phase, FFT_SIZE);
-
-            // ===== DIRECTION OF ARRIVAL (DoA) CALCULATION =====
-            // Phase-based 2-channel interferometry using FFT output (frequency domain)
-            // Theory: Δφ = (2π * d * sin(θ)) / λ
-            //
-            // FREQUENCY-DOMAIN APPROACH:
-            // - Compute phase difference per frequency bin
-            // - Focus on bins with strong signals (better SNR)
-            // - Can isolate individual signals and reject interference
-            // - Standard method for correlative interferometry
-
-            // ===== DIRECTION FINDING =====
-            // Determine bin range for DF processing
-            // If g_df_start_bin and g_df_end_bin are both 0, use entire spectrum
-            const uint32_t df_start = g_df_start_bin.load();
-            const uint32_t df_end = g_df_end_bin.load();
-            const size_t bin_start = (df_start == 0 && df_end == 0) ? 0 : std::min(static_cast<size_t>(df_start), static_cast<size_t>(FFT_SIZE - 1));
-            const size_t bin_end = (df_start == 0 && df_end == 0) ? FFT_SIZE - 1 : std::min(static_cast<size_t>(df_end), static_cast<size_t>(FFT_SIZE - 1));
-            const size_t bin_count = bin_end - bin_start + 1;
-
-            // Get current noise floor estimates for improved CFAR and SNR
-            float nf_ch1, nf_ch2;
-            get_noise_floor(g_noise_floor, nf_ch1, nf_ch2);
-
-            // Perform complete direction finding analysis with dynamic noise floor
-            DFResult df_result = compute_direction_finding(
-                fft_out_ch1.data(), fft_out_ch2.data(),
-                ch1_mag, ch2_mag,
-                FFT_SIZE, bin_start, bin_end,
-                g_center_freq.load(),
-                g_last_valid_doa,
-                nf_ch1, nf_ch2
-            );
-
-            // Debug output every 60 frames
-            static int df_debug_counter = 0;
-            df_debug_counter++;
-            if (df_debug_counter % 60 == 0) {
-                std::cout << "CFAR: " << df_result.num_signals << " signals, "
-                          << df_result.num_bins << " bins";
-                if (bin_start > 0 || bin_end < FFT_SIZE - 1) {
-                    std::cout << " [" << bin_start << "-" << bin_end << "/" << bin_count << "]";
-                }
-
-                // Calculate mean and peak for debug output
-                uint32_t magnitude_sum = 0;
-                uint8_t peak_mag = 0;
-                for (size_t i = bin_start; i <= bin_end; i++) {
-                    const uint8_t avg_mag = (ch1_mag[i] + ch2_mag[i]) / 2;
-                    magnitude_sum += avg_mag;
-                    if (avg_mag > peak_mag) peak_mag = avg_mag;
-                }
-                const uint8_t mean_mag = magnitude_sum / bin_count;
-
-                std::cout << " (mean=" << static_cast<int>(mean_mag)
-                          << ", peak=" << static_cast<int>(peak_mag) << ") | "
-                          << "Phase: " << std::fixed << std::setprecision(1)
-                          << df_result.phase_diff_deg << "° ± " << df_result.phase_std_deg << "° | "
-                          << "Az: " << df_result.azimuth << "°";
-                if (df_result.is_holding) {
-                    std::cout << " [HOLD]";
-                }
-                std::cout << " | SNR: " << df_result.snr_db << " dB | "
-                          << "Conf: " << df_result.confidence << "%" << std::endl;
-            }
-
-            // Update DoA result buffer for web interface
-            update_doa_result(df_result.azimuth, df_result.back_azimuth,
-                            df_result.phase_diff_deg, df_result.phase_std_deg,
-                            df_result.confidence, df_result.snr_db, df_result.coherence);
-
-
-            // ===== FREQUENCY SCANNER =====
-            // Scan across frequency range and detect signals above threshold
-            {
-                std::lock_guard<std::mutex> lock(g_scanner.mutex);
-                if (g_scanner.active) {
-                    // Analyze spectrum to extract signal characteristics
-                    SignalCharacteristics signal = analyze_spectrum(
-                        ch1_mag,
-                        FFT_SIZE,
-                        g_center_freq.load(),
-                        g_sample_rate.load()
-                    );
-
-                    // If above threshold, add or update signal
-                    if (signal.power_dbm > g_scanner.threshold_dbm) {
-                        // Check if signal already exists (within 1 MHz tolerance)
-                        bool found = false;
-                        const int64_t tolerance = 1000000; // 1 MHz
-                        for (auto& sig : g_scanner.signals) {
-                            if (std::abs(static_cast<int64_t>(sig.frequency) - static_cast<int64_t>(signal.frequency)) < tolerance) {
-                                // Update existing signal
-                                sig.power_dbm = std::max(sig.power_dbm, signal.power_dbm);
-                                sig.bandwidth_hz = std::max(sig.bandwidth_hz, signal.bandwidth_hz);
-                                sig.last_seen = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch()).count();
-                                sig.hit_count++;
-                                found = true;
-                                break;
-                            }
-                        }
-
-                        // Add new signal if not found
-                        if (!found && g_scanner.signals.size() < 1000) { // Limit to 1000 signals
-                            DetectedSignal new_sig;
-                            new_sig.frequency = signal.frequency;
-                            new_sig.power_dbm = signal.power_dbm;
-                            new_sig.bandwidth_hz = signal.bandwidth_hz;
-                            const uint64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count();
-                            new_sig.first_seen = now_ms;
-                            new_sig.last_seen = now_ms;
-                            new_sig.hit_count = 1;
-                            g_scanner.signals.push_back(new_sig);
-                        }
-                    }
-
-                    // Move to next frequency after dwell time
-                    static auto last_scan_step = std::chrono::steady_clock::now();
-                    const auto scan_now = std::chrono::steady_clock::now();
-                    const auto scan_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(scan_now - last_scan_step);
-                    if (scan_elapsed.count() >= g_scanner.dwell_ms) {
-                        // Step to next frequency
-                        g_scanner.current_freq += g_scanner.step_size;
-                        if (g_scanner.current_freq > g_scanner.stop_freq) {
-                            g_scanner.current_freq = g_scanner.start_freq;
-                            g_scanner.scan_count++;
-                        }
-
-                        // Update hardware frequency
-                        g_center_freq.store(g_scanner.current_freq);
-                        g_params_changed.store(true);
-
-                        last_scan_step = scan_now;
-                    }
-                }
-            }
-
-            // Update FPS tracking
-            frame_count++;
-
-            // Update link quality every second
-            const auto now = std::chrono::steady_clock::now();
-            const auto fps_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - fps_update_time);
-            if (fps_elapsed.count() >= 1000) {
-                const float actual_fps = static_cast<float>(frame_count) * 1000.0f / fps_elapsed.count();
-                // Get actual HTTP bytes sent (automatically resets counter)
-                uint64_t actual_bytes_sent = get_and_reset_http_bytes();
-                update_link_quality(actual_fps, actual_bytes_sent);
-                frame_count = 0;
-                fps_update_time = now;
-            }
-
-            // Rate limiting
-            const auto end_time = std::chrono::steady_clock::now();
-            const auto elapsed = end_time - start_time;
-            if (elapsed < sleep_duration) {
-                std::this_thread::sleep_for(sleep_duration - elapsed);
-            }
-        }
+    // Launch 3-stage pipeline threads
+    std::thread acquisition_thread([&]() {
+        acquisition_thread_func(&pipeline_ctx);
     });
 
-    // Wait for threads to finish (run until g_running becomes false)
-    if (rx_thread.joinable()) {
-        std::cout << "Waiting for RX thread to finish..." << std::endl;
-        rx_thread.join();
+    std::thread processing_thread([&]() {
+        processing_thread_func(&pipeline_ctx);
+    });
+
+    std::thread analysis_thread([&]() {
+        analysis_thread_func(&pipeline_ctx);
+    });
+
+    // Wait for pipeline threads to finish (run until g_running becomes false)
+    std::cout << "Waiting for pipeline threads to finish..." << std::endl;
+
+    if (acquisition_thread.joinable()) {
+        std::cout << "  Waiting for acquisition thread..." << std::endl;
+        acquisition_thread.join();
+    }
+
+    if (processing_thread.joinable()) {
+        std::cout << "  Waiting for processing thread..." << std::endl;
+        processing_thread.join();
+    }
+
+    if (analysis_thread.joinable()) {
+        std::cout << "  Waiting for analysis thread..." << std::endl;
+        analysis_thread.join();
+    }
+
+    if (watchdog_thread.joinable()) {
+        std::cout << "  Waiting for watchdog thread..." << std::endl;
+        watchdog_thread.join();
     }
 
     // Server shutting down - cleanup
@@ -641,23 +387,33 @@ int main(int argc, char *argv[]) {
     std::cout << "Server shutdown initiated" << std::endl;
     std::cout << "========================================\n" << std::endl;
 
-    std::cout << "[1/6] Stopping web server..." << std::endl;
+    std::cout << "[1/8] Stopping web server..." << std::endl;
     stop_web_server();
 
-    std::cout << "[2/6] Disabling RX channel 1..." << std::endl;
+    std::cout << "[2/8] Disabling RX channel 1..." << std::endl;
     bladerf_enable_module(dev, BLADERF_CHANNEL_RX(0), false);
 
-    std::cout << "[3/6] Disabling RX channel 2..." << std::endl;
+    std::cout << "[3/8] Disabling RX channel 2..." << std::endl;
     bladerf_enable_module(dev, BLADERF_CHANNEL_RX(1), false);
 
-    std::cout << "[4/6] Closing bladeRF device..." << std::endl;
+    std::cout << "[4/8] Closing bladeRF device..." << std::endl;
     bladerf_close(dev);
 
-    std::cout << "[5/6] Destroying FFTW plans..." << std::endl;
-    fftwf_destroy_plan(fft_plan_ch1);
-    fftwf_destroy_plan(fft_plan_ch2);
+    std::cout << "[5/8] Destroying pipeline FFTW plans..." << std::endl;
+    fftwf_destroy_plan(pipeline_ctx.fft_plan_ch1);
+    fftwf_destroy_plan(pipeline_ctx.fft_plan_ch2);
 
-    std::cout << "[6/6] Cleaning up FFTW..." << std::endl;
+    std::cout << "[6/8] Freeing pipeline FFT buffers..." << std::endl;
+    free(pipeline_ctx.fft_in_ch1);
+    free(pipeline_ctx.fft_in_ch2);
+    free(pipeline_ctx.fft_out_ch1);
+    free(pipeline_ctx.fft_out_ch2);
+
+    std::cout << "[7/8] Deleting pipeline queues..." << std::endl;
+    delete sample_queue;
+    delete fft_queue;
+
+    std::cout << "[8/8] Cleaning up FFTW..." << std::endl;
     fftwf_cleanup();
 
     std::cout << "\n========================================" << std::endl;

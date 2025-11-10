@@ -109,10 +109,6 @@ void compute_fft(fftwf_complex *in, fftwf_complex *out, fftwf_plan plan) {
 }
 
 void compute_magnitude_db(fftwf_complex *fft_out, uint8_t *mag_out, size_t size) {
-    static int debug_counter = 0;
-    float min_db = 1000.0f;
-    float max_db = -1000.0f;
-
     constexpr float DB_SCALE = 10.0f;
     constexpr float DB_OFFSET = 100.0f;
     constexpr float DB_RANGE = 120.0f;
@@ -127,14 +123,9 @@ void compute_magnitude_db(fftwf_complex *fft_out, uint8_t *mag_out, size_t size)
         float power = magnitude * magnitude;
         float db = DB_SCALE * std::log10(std::max(power, MIN_POWER));
 
-        if (db < min_db) min_db = db;
-        if (db > max_db) max_db = db;
-
         float normalized = (db + DB_OFFSET) * NORM_SCALE;
         mag_out[i] = static_cast<uint8_t>(std::clamp(normalized, 0.0f, 255.0f));
     }
-
-    // Debug output disabled (was printing FFT dB range every 60 frames)
 }
 
 void remove_dc_offset(uint8_t *magnitude, size_t size) {

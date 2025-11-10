@@ -134,11 +134,7 @@ void compute_magnitude_db(fftwf_complex *fft_out, uint8_t *mag_out, size_t size)
         mag_out[i] = static_cast<uint8_t>(std::clamp(normalized, 0.0f, 255.0f));
     }
 
-    debug_counter++;
-    if (debug_counter % 60 == 0) {
-        std::cout << "FFT dB range: " << std::fixed << std::setprecision(1)
-                  << min_db << " to " << max_db << " dB" << std::endl;
-    }
+    // Debug output disabled (was printing FFT dB range every 60 frames)
 }
 
 void remove_dc_offset(uint8_t *magnitude, size_t size) {

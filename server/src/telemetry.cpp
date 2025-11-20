@@ -23,6 +23,9 @@ void init_telemetry() {
     g_telemetry.buffer_reallocations.store(0);
     g_telemetry.http_requests.store(0);
     g_telemetry.http_bytes_sent.store(0);
+    g_telemetry.compression_raw_bytes.store(0);
+    g_telemetry.compression_compressed_bytes.store(0);
+    g_telemetry.compression_frames.store(0);
 
     // Set initial timestamp
     auto now = std::chrono::system_clock::now();
@@ -47,6 +50,9 @@ std::string get_telemetry_json() {
     uint64_t buf_realloc = g_telemetry.buffer_reallocations.load();
     uint64_t http_reqs = g_telemetry.http_requests.load();
     uint64_t http_bytes = g_telemetry.http_bytes_sent.load();
+    uint64_t comp_raw = g_telemetry.compression_raw_bytes.load();
+    uint64_t comp_compressed = g_telemetry.compression_compressed_bytes.load();
+    uint64_t comp_frames = g_telemetry.compression_frames.load();
 
     // Calculate averages (avoid division by zero)
     double avg_fft_us = (frames > 0) ? static_cast<double>(fft_time) / frames : 0.0;
@@ -55,6 +61,8 @@ std::string get_telemetry_json() {
     double avg_proc_us = (frames > 0) ? static_cast<double>(proc_time) / frames : 0.0;
     double drop_rate = (frames > 0) ? 100.0 * dropped / frames : 0.0;
     double usb_error_rate = (usb_xfers > 0) ? 100.0 * usb_errs / usb_xfers : 0.0;
+    double compression_ratio = (comp_compressed > 0) ? static_cast<double>(comp_raw) / comp_compressed : 1.0;
+    double bandwidth_savings_pct = (comp_raw > 0) ? 100.0 * (1.0 - static_cast<double>(comp_compressed) / comp_raw) : 0.0;
 
     // Update timestamp
     auto now = std::chrono::system_clock::now();
@@ -97,6 +105,13 @@ std::string get_telemetry_json() {
     json << "  \"http\": {\n";
     json << "    \"requests\": " << http_reqs << ",\n";
     json << "    \"bytes_sent\": " << http_bytes << "\n";
+    json << "  },\n";
+    json << "  \"compression\": {\n";
+    json << "    \"raw_bytes\": " << comp_raw << ",\n";
+    json << "    \"compressed_bytes\": " << comp_compressed << ",\n";
+    json << "    \"frames\": " << comp_frames << ",\n";
+    json << "    \"compression_ratio\": " << compression_ratio << ",\n";
+    json << "    \"bandwidth_savings_pct\": " << bandwidth_savings_pct << "\n";
     json << "  },\n";
     json << "  \"timestamp_ms\": " << g_telemetry.last_update_ms.load() << "\n";
     json << "}";

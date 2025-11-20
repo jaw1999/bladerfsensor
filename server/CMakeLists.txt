@@ -10,6 +10,7 @@ pkg_check_modules(LIBBLADERF REQUIRED libbladeRF)
 pkg_check_modules(FFTW3 REQUIRED fftw3f)
 find_package(Threads REQUIRED)
 find_library(LIQUID_LIB liquid REQUIRED)
+find_package(ZLIB REQUIRED)
 
 # Include directories
 include_directories(
@@ -31,6 +32,7 @@ set(SOURCES
     src/config_validation.cpp
     src/telemetry.cpp
     src/pipeline.cpp
+    src/compression.cpp
 )
 
 # Optional: Add mongoose support
@@ -56,6 +58,7 @@ target_link_libraries(bladerf_server
     ${FFTW3_LIBRARIES}
     ${LIQUID_LIB}
     Threads::Threads
+    ZLIB::ZLIB
     m
 )
 

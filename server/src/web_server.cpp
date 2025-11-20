@@ -57,6 +57,7 @@ void mg_http_reply(struct mg_connection *c, int code, const char *headers, const
 WaterfallBuffer g_waterfall;                         // Waterfall spectrum history buffer
 IQBuffer g_iq_data;                                  // IQ constellation data buffer
 XCorrBuffer g_xcorr_data;                            // Cross-correlation data buffer
+
 LinkQuality g_link_quality;                          // Link quality metrics buffer
 DoAResult g_doa_result;                              // Direction of Arrival result buffer
 ClassificationBuffer g_classifications;              // Signal classification buffer
@@ -574,7 +575,7 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
                 mg_http_reply(c, 404, "Content-Type: text/plain\r\n", "404 Not Found");
             }
         }
-        // FFT data request
+        // FFT data request (uncompressed)
         else if (mg_strcmp(hm->uri, mg_str("/fft")) == 0) {
             char channel_str[8] = "1";
             mg_http_get_var(&hm->query, "ch", channel_str, sizeof(channel_str));
@@ -584,7 +585,7 @@ void web_server_handler(struct mg_connection *c, int ev, void *ev_data) {
             const auto& history = (channel == 1) ? g_waterfall.ch1_history : g_waterfall.ch2_history;
             int latest_idx = (g_waterfall.write_index - 1 + WATERFALL_HEIGHT) % WATERFALL_HEIGHT;
 
-            // Send raw magnitude data as binary
+            // Send raw uncompressed data
             mg_printf(c, "HTTP/1.1 200 OK\r\n"
                         "Content-Type: application/octet-stream\r\n"
                         "Cache-Control: no-cache\r\n"

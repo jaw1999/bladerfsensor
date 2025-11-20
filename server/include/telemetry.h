@@ -35,6 +35,11 @@ struct TelemetryCounters {
     std::atomic<uint64_t> http_requests{0};             // Total HTTP requests served
     std::atomic<uint64_t> http_bytes_sent{0};           // Total bytes sent via HTTP
 
+    // Compression metrics
+    std::atomic<uint64_t> compression_raw_bytes{0};     // Total uncompressed bytes
+    std::atomic<uint64_t> compression_compressed_bytes{0}; // Total compressed bytes sent
+    std::atomic<uint64_t> compression_frames{0};        // Total frames compressed
+
     // Last update timestamp
     std::atomic<uint64_t> last_update_ms{0};            // Last telemetry update time
 };
